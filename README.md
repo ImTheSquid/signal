@@ -25,16 +25,17 @@ The device connection drops every ≤300s (Vercel Hobby function duration cap) �
 ```sh
 BASE=https://<your-app>.vercel.app
 AUTH="Authorization: Bearer tl_<id>_<secret>"
+JSON="Content-Type: application/json"   # required — form content types are CSRF-blocked
 
 # Take the lock (duration capped per key; omit duration_s for your max)
-curl -X POST $BASE/v1/lock -H "$AUTH" -d '{"duration_s": 120}'
+curl -X POST $BASE/v1/lock -H "$AUTH" -H "$JSON" -d '{"duration_s": 120}'
 # → 201 {"expiresAt": ...} | 409 {"error":"locked","holder":"amy","expiresAt":...}
 
 # Keys minted with the override flag may steal the lock (explicit opt-in):
-curl -X POST $BASE/v1/lock -H "$AUTH" -d '{"duration_s": 60, "override": true}'
+curl -X POST $BASE/v1/lock -H "$AUTH" -H "$JSON" -d '{"duration_s": 60, "override": true}'
 
 # Run a script (must hold the lock; max 16KB; ≤20 submissions/min)
-curl -X POST $BASE/v1/script -H "$AUTH" \
+curl -X POST $BASE/v1/script -H "$AUTH" -H "$JSON" \
   -d '{"script": "loop { set_lights(true,false,false); sleep(500); set_lights(false,false,false); sleep(500); }"}'
 # → 202 {"jobId":..., "ttl_ms":...} | 422 {"error":"Unexpected ...","line":1,"col":9}
 
