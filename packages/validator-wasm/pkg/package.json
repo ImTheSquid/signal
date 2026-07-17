@@ -1,0 +1,11 @@
+{
+  "name": "validator",
+  "version": "0.1.0",
+  "files": [
+    "validator_bg.wasm",
+    "validator.js",
+    "validator.d.ts"
+  ],
+  "main": "validator.js",
+  "types": "validator.d.ts"
+}

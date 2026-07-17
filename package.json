@@ -1,0 +1,9 @@
+{
+  "name": "traffic-light",
+  "private": true,
+  "scripts": {
+    "dev": "pnpm --filter web dev",
+    "build": "pnpm -r build",
+    "build:wasm": "wasm-pack build crates/validator --target nodejs --out-dir ../../packages/validator-wasm/pkg --release && rm -f packages/validator-wasm/pkg/.gitignore"
+  }
+}

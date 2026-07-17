@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = ["crates/script-env", "crates/validator"]
+# Different toolchain (xtensa) and build env; built from firmware/ directly.
+exclude = ["firmware"]
+
+[workspace.dependencies]
+# Restriction features shared by validator and firmware so both sides parse
+# the same language. `no_time` keeps the wasm32-unknown-unknown build free of
+# Instant, which doesn't exist on that target.
+rhai = { version = "1", features = ["only_i64", "no_closure", "no_module", "no_float", "no_time"] }

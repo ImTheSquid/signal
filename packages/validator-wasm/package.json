@@ -1,0 +1,10 @@
+{
+  "name": "@traffic-light/validator-wasm",
+  "version": "0.1.0",
+  "private": true,
+  "main": "pkg/validator.js",
+  "types": "pkg/validator.d.ts",
+  "files": [
+    "pkg"
+  ]
+}
