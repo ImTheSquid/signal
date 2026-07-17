@@ -19,7 +19,7 @@
 		jobId: string;
 		start: number;
 		end: number | null;
-		result: 'ok' | 'error' | 'aborted' | 'deadline' | 'preempted' | 'running';
+		result: 'ok' | 'error' | 'aborted' | 'deadline' | 'preempted' | 'running' | 'lost';
 		error?: string;
 	}
 
@@ -27,6 +27,7 @@
 		lock: Lock | null;
 		device: Device | null;
 		online: boolean;
+		historyPublic: boolean;
 		history: HistoryEntry[];
 	}
 
@@ -173,6 +174,8 @@
 				<h2>history</h2>
 				{#if status === null}
 					<p class="muted">connecting…</p>
+				{:else if !status.historyPublic}
+					<p class="muted">history is private</p>
 				{:else if status.history.length === 0}
 					<p class="muted">no runs yet</p>
 				{:else}
@@ -483,6 +486,11 @@
 		color: #5cc8ff;
 		border-color: color-mix(in srgb, #5cc8ff 40%, transparent);
 		animation: pulse 1.6s ease-in-out infinite;
+	}
+	.chip.lost {
+		color: #7a8494;
+		border-color: #3a4557;
+		border-style: dashed;
 	}
 
 	@keyframes pulse {

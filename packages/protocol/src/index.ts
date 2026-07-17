@@ -23,9 +23,15 @@ export const REDIS = {
   idle: "idle",
   device: "device",
   history: "history",
+  settings: "settings",
   rateLimit: (keyId: string) => `rl:${keyId}`,
   eventsChannel: "events",
 } as const;
+
+export const SettingsSchema = z.object({
+  historyPublic: z.boolean().default(true),
+});
+export type Settings = z.infer<typeof SettingsSchema>;
 
 // ---- Stored JSON shapes ----
 
@@ -72,7 +78,7 @@ export const HistoryEntrySchema = z.object({
   jobId: z.string(),
   start: z.number(),
   end: z.number().nullable(),
-  result: z.enum(["ok", "error", "aborted", "deadline", "preempted", "running"]),
+  result: z.enum(["ok", "error", "aborted", "deadline", "preempted", "running", "lost"]),
   error: z.string().optional(),
 });
 export type HistoryEntry = z.infer<typeof HistoryEntrySchema>;

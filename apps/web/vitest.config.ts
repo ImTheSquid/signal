@@ -5,6 +5,8 @@ import { defineConfig } from 'vitest/config';
 export default defineConfig({
 	test: {
 		include: ['src/lib/server/**/*.test.ts'],
-		testTimeout: 15_000
+		testTimeout: 15_000,
+		// Test files share one Redis and flush it in beforeEach.
+		fileParallelism: false
 	}
 });

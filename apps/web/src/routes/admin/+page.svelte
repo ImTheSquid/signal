@@ -29,6 +29,22 @@
 	function expiry(ts: number): string {
 		return new Date(ts).toLocaleTimeString();
 	}
+
+	function relative(ts: number): string {
+		const s = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+		if (s < 60) return `${s}s ago`;
+		const m = Math.floor(s / 60);
+		if (m < 60) return `${m}m ago`;
+		const h = Math.floor(m / 60);
+		if (h < 24) return `${h}h ago`;
+		return `${Math.floor(h / 24)}d ago`;
+	}
+
+	function duration(start: number, end: number): string {
+		const s = Math.max(0, Math.round((end - start) / 1000));
+		if (s < 60) return `${s}s`;
+		return `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, '0')}s`;
+	}
 </script>
 
 <svelte:head>
@@ -91,6 +107,49 @@
 				>
 					<button class="danger" type="submit">force release / kill script</button>
 				</form>
+			</section>
+
+			<section class="panel">
+				<h2>history</h2>
+				<form method="POST" action="?/setHistoryVisibility" use:enhance={keepValues}>
+					<label class="checkbox">
+						<input
+							type="checkbox"
+							name="historyPublic"
+							checked={data.historyPublic}
+							onchange={(e) => e.currentTarget.form?.requestSubmit()}
+						/>
+						show history on public dashboard
+					</label>
+				</form>
+				{#if data.history.length === 0}
+					<p class="muted">no runs yet</p>
+				{:else}
+					<ul class="history">
+						{#each data.history as h (h.jobId)}
+							<li>
+								<div class="row">
+									<span class="name">{h.name}</span>
+									<span class="chip {h.result}">{h.result}</span>
+									<span class="when">{relative(h.start)}</span>
+									{#if h.end !== null}
+										<span class="dur">{duration(h.start, h.end)}</span>
+									{/if}
+								</div>
+								{#if h.error}
+									<p class="err">{h.error}</p>
+								{/if}
+							</li>
+						{/each}
+					</ul>
+					<form
+						method="POST"
+						action="?/clearHistory"
+						use:enhance={confirmGuard('Clear all history entries?')}
+					>
+						<button class="danger small" type="submit">clear history</button>
+					</form>
+				{/if}
 			</section>
 
 			<section class="panel">
@@ -426,6 +485,95 @@
 	.create-key {
 		border-top: 1px solid var(--border);
 		padding-top: 1rem;
+	}
+
+	.history {
+		list-style: none;
+		margin: 0.75rem 0 1rem;
+		padding: 0;
+		display: flex;
+		flex-direction: column;
+	}
+
+	.history li {
+		padding: 0.6rem 0;
+		border-top: 1px solid var(--border);
+	}
+
+	.row {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: baseline;
+		gap: 0.6rem;
+	}
+
+	.name {
+		font-weight: 600;
+		font-size: 0.9rem;
+	}
+
+	.when,
+	.dur {
+		font-size: 0.78rem;
+		color: var(--muted);
+		font-variant-numeric: tabular-nums;
+	}
+
+	.when {
+		margin-left: auto;
+	}
+
+	.chip {
+		font-size: 0.7rem;
+		padding: 0.15em 0.6em;
+		border-radius: 999px;
+		border: 1px solid;
+		text-transform: lowercase;
+	}
+
+	.chip.ok {
+		color: var(--green);
+		border-color: color-mix(in srgb, var(--green) 40%, transparent);
+	}
+	.chip.error {
+		color: var(--red);
+		border-color: color-mix(in srgb, var(--red) 40%, transparent);
+	}
+	.chip.aborted {
+		color: #9aa5b4;
+		border-color: #3a4557;
+	}
+	.chip.deadline {
+		color: #ffb347;
+		border-color: color-mix(in srgb, #ffb347 40%, transparent);
+	}
+	.chip.preempted {
+		color: #b48cff;
+		border-color: color-mix(in srgb, #b48cff 40%, transparent);
+	}
+	.chip.running {
+		color: #5cc8ff;
+		border-color: color-mix(in srgb, #5cc8ff 40%, transparent);
+		animation: pulse 1.6s ease-in-out infinite;
+	}
+	.chip.lost {
+		color: #7a8494;
+		border-color: #3a4557;
+		border-style: dashed;
+	}
+
+	@keyframes pulse {
+		50% {
+			opacity: 0.5;
+		}
+	}
+
+	.err {
+		margin: 0.3rem 0 0;
+		font-size: 0.78rem;
+		color: var(--red);
+		font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+		overflow-wrap: anywhere;
 	}
 
 	textarea {

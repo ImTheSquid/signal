@@ -6,6 +6,7 @@ import {
 	verifyPassword,
 	verifySessionToken
 } from '$lib/server/auth';
+import { clearHistory, getHistory, getSettings, setSettings } from '$lib/server/history';
 import { createKey, revokeKey } from '$lib/server/keys';
 import { forceRelease, getLock } from '$lib/server/locks';
 import { redis } from '$lib/server/redis';
@@ -25,7 +26,16 @@ function authed(cookies: { get: (name: string) => string | undefined }): boolean
 }
 
 export const load: PageServerLoad = async ({ cookies }) => {
-	if (!authed(cookies)) return { authed: false as const, keys: [], idle: null, lock: null };
+	if (!authed(cookies)) {
+		return {
+			authed: false as const,
+			keys: [],
+			idle: null,
+			lock: null,
+			history: [],
+			historyPublic: true
+		};
+	}
 
 	const r = redis();
 	const ids = await r.smembers(REDIS.keys);
@@ -43,8 +53,10 @@ export const load: PageServerLoad = async ({ cookies }) => {
 	);
 	const idle = await r.get<Idle>(REDIS.idle);
 	const lock: Lock | null = await getLock(r);
+	const history = await getHistory(r);
+	const { historyPublic } = await getSettings(r);
 
-	return { authed: true as const, keys, idle: idle?.script ?? '', lock };
+	return { authed: true as const, keys, idle: idle?.script ?? '', lock, history, historyPublic };
 };
 
 export const actions: Actions = {
@@ -115,6 +127,19 @@ export const actions: Actions = {
 		const r = redis();
 		await forceRelease(r);
 		await r.publish(REDIS.eventsChannel, JSON.stringify({ type: 'abort' }));
+		return { ok: true };
+	},
+
+	clearHistory: async ({ cookies }) => {
+		if (!authed(cookies)) return fail(401, { error: 'not logged in' });
+		await clearHistory(redis());
+		return { ok: true };
+	},
+
+	setHistoryVisibility: async ({ request, cookies }) => {
+		if (!authed(cookies)) return fail(401, { error: 'not logged in' });
+		const form = await request.formData();
+		await setSettings(redis(), { historyPublic: form.get('historyPublic') === 'on' });
 		return { ok: true };
 	}
 };
