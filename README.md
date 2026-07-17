@@ -81,7 +81,7 @@ pnpm run build:wasm                              # rebuild validator (commit pkg
 ## Deploying (Vercel Hobby)
 
 1. Create the Vercel project with **Root Directory = `apps/web`** (Fluid compute on, default). WebSocket support is public beta and required.
-2. Add **Upstash Redis** from the Vercel Marketplace (free tier). The dashboard/API use the REST vars; the websocket function needs the **TCP** URL.
+2. Add **Upstash Redis** from the Vercel Marketplace (free tier), **or self-host Redis on your own box** — see [deploy/home-redis/](deploy/home-redis/). The dashboard/API use the REST vars; the websocket function needs the **TCP** URL.
 3. Environment variables:
    - `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN` (from the marketplace integration)
    - `REDIS_URL` — the `rediss://…` TCP connection string
