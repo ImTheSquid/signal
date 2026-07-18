@@ -78,7 +78,7 @@ impl Runner {
             .stack_size(SCRIPT_STACK_BYTES)
             .spawn(move || {
                 let deadline = ttl.map(|t| Instant::now() + t);
-                let outcome = run_script(&script, deadline, &abort, &lights);
+                let outcome = run_script(&script, kind, deadline, &abort, &lights);
                 let _ = tx.send(AppEvent::ScriptDone {
                     run_gen,
                     kind,
@@ -93,12 +93,18 @@ impl Runner {
 
 fn run_script(
     script: &str,
+    kind: RunKind,
     deadline: Option<Instant>,
     abort: &Arc<AtomicBool>,
     lights: &Arc<Lights>,
 ) -> Outcome {
     let mut engine = script_env::rhai::Engine::new();
     script_env::apply_limits(&mut engine);
+    if kind == RunKind::Idle {
+        // The idle script runs once per idle transition and may loop forever
+        // by design (admin-authored); the abort flag remains its kill switch.
+        engine.set_max_operations(0);
+    }
 
     let start = Instant::now();
     script_env::register_api(

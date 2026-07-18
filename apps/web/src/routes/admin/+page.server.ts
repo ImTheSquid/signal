@@ -183,14 +183,18 @@ export const actions: Actions = {
 
 	clearHistory: async ({ cookies }) => {
 		if (!authed(cookies)) return fail(401, { error: 'not logged in' });
-		await clearHistory(redis());
+		const r = redis();
+		await clearHistory(r);
+		await r.publish(REDIS.eventsChannel, JSON.stringify({ type: 'update' }));
 		return { ok: true };
 	},
 
 	setHistoryVisibility: async ({ request, cookies }) => {
 		if (!authed(cookies)) return fail(401, { error: 'not logged in' });
 		const form = await request.formData();
-		await setSettings(redis(), { historyPublic: form.get('historyPublic') === 'on' });
+		const r = redis();
+		await setSettings(r, { historyPublic: form.get('historyPublic') === 'on' });
+		await r.publish(REDIS.eventsChannel, JSON.stringify({ type: 'update' }));
 		return { ok: true };
 	}
 };

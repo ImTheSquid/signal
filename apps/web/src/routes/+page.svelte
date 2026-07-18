@@ -41,9 +41,13 @@
 		try {
 			const res = await fetch('/v1/status');
 			if (!res.ok) throw new Error(`status ${res.status}`);
-			status = await res.json();
+			const snapshot = await res.json();
+			// A live socket outranks a poll that resolved late.
+			if (ws?.readyState === WebSocket.OPEN) return;
+			status = snapshot;
 			unreachable = false;
 		} catch {
+			if (ws?.readyState === WebSocket.OPEN) return;
 			unreachable = true;
 		}
 	}
@@ -51,6 +55,7 @@
 	let poll: ReturnType<typeof setInterval> | undefined;
 
 	function startPolling() {
+		if (poll) return;
 		refresh();
 		poll = setInterval(refresh, POLL_MS);
 	}
@@ -60,17 +65,82 @@
 		poll = undefined;
 	}
 
-	// Polling pauses while the tab is hidden and resumes (with an immediate
-	// fetch) on return — keeps idle tabs off the Redis free tier.
+	// Live updates come over a websocket; the 10s polling runs only while the
+	// socket is connecting or backing off. Everything stops while the tab is
+	// hidden — keeps idle tabs off the Redis free tier.
+	let ws: WebSocket | undefined;
+	let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+	let backoffMs = 1000;
+	// False while hidden or after teardown; gates connects and reconnects.
+	let active = false;
+
+	function wsUrl(): string {
+		if (import.meta.env.DEV) return 'ws://localhost:3002';
+		const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+		return `${proto}://${location.host}/api/live`;
+	}
+
+	function connect() {
+		if (!active || ws) return;
+		const socket = new WebSocket(wsUrl());
+		ws = socket;
+		socket.onopen = () => {
+			if (ws !== socket) return;
+			backoffMs = 1000;
+			stopPolling();
+		};
+		socket.onmessage = (event) => {
+			if (ws !== socket) return;
+			try {
+				status = JSON.parse(event.data);
+				unreachable = false;
+			} catch {
+				// ignore malformed frames
+			}
+		};
+		socket.onclose = () => {
+			if (ws !== socket) return;
+			ws = undefined;
+			if (!active) return;
+			// The platform drops connections every ≤300s; poll while
+			// reconnecting with backoff.
+			startPolling();
+			reconnectTimer = setTimeout(connect, backoffMs);
+			backoffMs = Math.min(backoffMs * 2, 30_000);
+		};
+	}
+
+	function disconnect() {
+		clearTimeout(reconnectTimer);
+		reconnectTimer = undefined;
+		const socket = ws;
+		ws = undefined; // trips the handlers' identity guards before close fires
+		socket?.close();
+	}
+
 	function onVisibility() {
-		stopPolling();
-		if (!document.hidden) startPolling();
+		if (document.hidden) {
+			active = false;
+			disconnect();
+			stopPolling();
+		} else {
+			active = true;
+			backoffMs = 1000;
+			startPolling();
+			connect();
+		}
 	}
 
 	$effect(() => {
-		if (!document.hidden) startPolling();
+		if (!document.hidden) {
+			active = true;
+			startPolling();
+			connect();
+		}
 		const tick = setInterval(() => (now = Date.now()), 1000);
 		return () => {
+			active = false;
+			disconnect();
 			stopPolling();
 			clearInterval(tick);
 		};

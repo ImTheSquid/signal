@@ -89,6 +89,10 @@ export const EventSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("job"), jobId: z.string() }),
   z.object({ type: z.literal("abort") }),
   z.object({ type: z.literal("idle") }),
+  // Public status changed for a reason the device doesn't care about
+  // (lock acquired, device state written, history edited) — tells the
+  // live-dashboard function to push a fresh snapshot.
+  z.object({ type: z.literal("update") }),
 ]);
 export type Event = z.infer<typeof EventSchema>;
 

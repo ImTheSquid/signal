@@ -2,6 +2,9 @@
   "functions": {
     "api/device.ts": {
       "maxDuration": 300
+    },
+    "api/live.ts": {
+      "maxDuration": 300
     }
   }
 }

@@ -58,6 +58,8 @@ Scripts are Rhai with integers only (no floats/maps/modules/eval) and these func
 
 The script is killed when your lock expires (`sleep` wakes every 50ms to check). Busy loops without `sleep` die early against the 5M-operation cap — use `sleep`. Runtime errors (wrong arity, unknown function) surface in the dashboard history, not at submit time; only parse errors are caught at `POST /v1/script`.
 
+The **idle script** (admin-set, runs when nobody holds a lock) has different semantics: it runs **once per idle transition** with no operation cap — a one-shot script sets a state and the lamps hold it; write your own `loop { … }` for an animation. If it errors, the built-in cycle takes over.
+
 ## Development
 
 ```sh
@@ -69,7 +71,9 @@ pnpm install && pnpm -r build
 cd apps/web && cp .env.example .env && pnpm dev
 # terminal 2: device websocket function
 cd apps/web && DEVICE_TOKEN=dev-device-token REDIS_URL=redis://localhost:6379 pnpm exec tsx api/device.ts
-# terminal 3: fake traffic light (no hardware needed)
+# terminal 3: live-dashboard websocket function
+cd apps/web && REDIS_URL=redis://localhost:6379 pnpm exec tsx api/live.ts
+# terminal 4: fake traffic light (no hardware needed)
 cd apps/web && pnpm exec tsx scripts/fake-device.ts
 
 pnpm exec tsx scripts/seed-dev.ts amy            # mint a dev API key (prints token)

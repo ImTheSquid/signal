@@ -29,7 +29,8 @@ const IDLE_RESTART_PAUSE: Duration = Duration::from_millis(500);
 const FW_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// What the light does when nobody holds a lock and no idle script is set
-/// (or the stored one is broken).
+/// (or the stored one is broken). Idle scripts run once per idle transition
+/// with no operation cap — loop yourself if you want an animation.
 const BUILTIN_IDLE: &str = r#"
 loop {
     set_lights(false, false, true);
@@ -143,11 +144,17 @@ impl App {
                 }
                 if run_gen == self.run_gen {
                     // The active run ended on its own (not superseded).
-                    if kind == RunKind::Idle {
-                        self.idle_restart_at = Some(Instant::now() + IDLE_RESTART_PAUSE);
-                        self.running_id = None;
-                    } else {
-                        self.start_idle();
+                    match (kind, &outcome) {
+                        // One-shot idle scripts run once per idle transition;
+                        // the lamps hold whatever they set.
+                        (RunKind::Idle, Outcome::Ok) => {}
+                        // A failed idle script must not freeze the light —
+                        // restart (now marked broken → built-in cycle).
+                        (RunKind::Idle, _) => {
+                            self.idle_restart_at = Some(Instant::now() + IDLE_RESTART_PAUSE);
+                            self.running_id = None;
+                        }
+                        (RunKind::Job, _) => self.start_idle(),
                     }
                 }
             }

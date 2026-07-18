@@ -79,6 +79,7 @@ async function writeDeviceState(state: Omit<DeviceState, 'ts'>): Promise<void> {
 	await redis.set(REDIS.device, JSON.stringify(full), 'PX', DEVICE_KEY_TTL_MS);
 	lastDeviceWrite = Date.now();
 	lastWritten = fingerprint;
+	await redis.publish(REDIS.eventsChannel, JSON.stringify({ type: 'update' }));
 }
 
 async function recordJobDone(msg: {
@@ -102,6 +103,7 @@ async function recordJobDone(msg: {
 	if (raw && (JSON.parse(raw) as Job).jobId === msg.id) {
 		await redis.del(REDIS.jobCurrent);
 	}
+	await redis.publish(REDIS.eventsChannel, JSON.stringify({ type: 'update' }));
 }
 
 async function ensureSubscribed(): Promise<void> {

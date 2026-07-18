@@ -47,6 +47,9 @@ export const POST: RequestHandler = async ({ request }) => {
 		});
 	}
 
+	// Lock changes don't concern the device, but the live dashboard cares.
+	await r.publish(REDIS.eventsChannel, JSON.stringify({ type: 'update' }));
+
 	const expiresAt = Date.now() + durationMs;
 	return json({ expiresAt, preempted: result.status === 'preempted' }, { status: 201 });
 };
