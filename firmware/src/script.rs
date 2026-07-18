@@ -11,8 +11,10 @@ use crate::lights::Lights;
 use crate::AppEvent;
 
 /// Rhai needs far more stack than the ESP-IDF pthread default — it's a
-/// recursive interpreter.
-const SCRIPT_STACK_BYTES: usize = 64 * 1024;
+/// recursive interpreter. Sized to the engine's max_expr_depths/call_levels;
+/// kept lean because this allocation exists whenever any script (incl. idle)
+/// is running and the board lives close to the heap floor.
+const SCRIPT_STACK_BYTES: usize = 32 * 1024;
 /// Abort latency bound: sleep() wakes at least this often to check the flag.
 const SLEEP_CHUNK: Duration = Duration::from_millis(50);
 
@@ -73,7 +75,9 @@ impl Runner {
         let abort = Arc::new(AtomicBool::new(false));
         self.abort = abort.clone();
 
-        let handle = std::thread::Builder::new()
+        let job_id_on_fail = job_id.clone();
+        let tx_on_fail = tx.clone();
+        let spawned = std::thread::Builder::new()
             .name("rhai".into())
             .stack_size(SCRIPT_STACK_BYTES)
             .spawn(move || {
@@ -85,9 +89,21 @@ impl Runner {
                     job_id,
                     outcome,
                 });
-            })
-            .expect("spawning script thread");
-        self.handle = Some(handle);
+            });
+        match spawned {
+            Ok(handle) => self.handle = Some(handle),
+            // Usually heap exhaustion — never worth a panic-reset. Report it
+            // like a script failure so the main loop keeps its invariants.
+            Err(e) => {
+                log::error!("script thread spawn failed: {e}");
+                let _ = tx_on_fail.send(AppEvent::ScriptDone {
+                    run_gen,
+                    kind,
+                    job_id: job_id_on_fail,
+                    outcome: Outcome::Error(format!("device out of memory: {e}")),
+                });
+            }
+        }
     }
 }
 

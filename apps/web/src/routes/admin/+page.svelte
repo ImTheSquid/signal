@@ -10,17 +10,25 @@
 	let draft = $state<string | null>(null);
 	const script = $derived(draft ?? data.idle ?? '');
 
-	function confirmGuard(message: string): SubmitFunction {
+	// Which form was submitted last — the `form` result is global to the page,
+	// so this routes success feedback to the right form.
+	let lastAction = $state<string | null>(null);
+
+	function submit(
+		action: string,
+		opts: { confirm?: string; keep?: boolean } = {}
+	): SubmitFunction {
 		return ({ cancel }) => {
-			if (!confirm(message)) cancel();
+			if (opts.confirm && !confirm(opts.confirm)) {
+				cancel();
+				return;
+			}
+			lastAction = action;
+			// keep: default enhance behavior minus the form reset, so a failed
+			// submit (e.g. a Rhai compile error) doesn't wipe the fields.
+			if (opts.keep) return ({ update }) => update({ reset: false });
 		};
 	}
-
-	// Default enhance behavior minus the form reset, so a failed save
-	// (e.g. a Rhai compile error) doesn't wipe the editor.
-	const keepValues: SubmitFunction = () => {
-		return ({ update }) => update({ reset: false });
-	};
 
 	function minutes(ms: number): number {
 		return Math.round(ms / 60_000);
@@ -52,6 +60,14 @@
 </svelte:head>
 
 <div class="page">
+	{#snippet done(action: string, message: string)}
+		{#if form?.ok && lastAction === action}
+			{#key form}
+				<span class="done" role="status">✓ {message}</span>
+			{/key}
+		{/if}
+	{/snippet}
+
 	{#if !data.authed}
 		<div class="login-wrap">
 			<form class="panel login" method="POST" action="?/login" use:enhance>
@@ -101,18 +117,24 @@
 				<form
 					method="POST"
 					action="?/kill"
-					use:enhance={confirmGuard(
-						'Force release the lock and kill any running script. Continue?'
-					)}
+					use:enhance={submit('kill', {
+						confirm: 'Force release the lock and kill any running script. Continue?'
+					})}
 				>
 					<button class="danger" type="submit">force release / kill script</button>
+					{@render done('kill', 'released')}
 				</form>
 			</section>
 
 			<section class="panel">
 				<h2>lamp test</h2>
 				<p class="caption">holds the lamps for 60s, then the idle script resumes</p>
-				<form method="POST" action="?/testLights" use:enhance={keepValues}>
+				{#if !data.online}
+					<p class="warn">
+						device is offline — the test job will wait for it to reconnect and may expire first
+					</p>
+				{/if}
+				<form method="POST" action="?/testLights" use:enhance={submit('testLights', { keep: true })}>
 					<div class="lamp-toggles">
 						<label class="checkbox">
 							<input type="checkbox" name="r" />
@@ -131,15 +153,22 @@
 						</label>
 					</div>
 					<button class="primary" type="submit">send to light</button>
+					{@render done('testLights', 'sent to light')}
 				</form>
-				<form class="end-test" method="POST" action="?/endTest" use:enhance>
+				<form class="end-test" method="POST" action="?/endTest" use:enhance={submit('endTest')}>
 					<button class="ghost" type="submit">end test</button>
+					{@render done('endTest', 'test ended')}
 				</form>
 			</section>
 
 			<section class="panel">
 				<h2>history</h2>
-				<form method="POST" action="?/setHistoryVisibility" use:enhance={keepValues}>
+				<form
+					class="history-toggle"
+					method="POST"
+					action="?/setHistoryVisibility"
+					use:enhance={submit('setHistoryVisibility', { keep: true })}
+				>
 					<label class="checkbox">
 						<input
 							type="checkbox"
@@ -149,9 +178,13 @@
 						/>
 						show history on public dashboard
 					</label>
+					{@render done('setHistoryVisibility', 'saved')}
 				</form>
 				{#if data.history.length === 0}
-					<p class="muted">no runs yet</p>
+					<p class="muted">
+						no runs yet
+						{@render done('clearHistory', 'cleared')}
+					</p>
 				{:else}
 					<ul class="history">
 						{#each data.history as h (h.jobId)}
@@ -173,7 +206,7 @@
 					<form
 						method="POST"
 						action="?/clearHistory"
-						use:enhance={confirmGuard('Clear all history entries?')}
+						use:enhance={submit('clearHistory', { confirm: 'Clear all history entries?' })}
 					>
 						<button class="danger small" type="submit">clear history</button>
 					</form>
@@ -211,11 +244,15 @@
 												<form
 													method="POST"
 													action="?/revokeKey"
-													use:enhance={confirmGuard(`Revoke key "${key.name}"?`)}
+													use:enhance={submit(`revokeKey:${key.id}`, {
+														confirm: `Revoke key "${key.name}"?`
+													})}
 												>
 													<input type="hidden" name="id" value={key.id} />
 													<button class="danger small" type="submit">revoke</button>
 												</form>
+											{:else}
+												{@render done(`revokeKey:${key.id}`, 'revoked')}
 											{/if}
 										</td>
 									</tr>
@@ -249,7 +286,10 @@
 			<section class="panel">
 				<h2>idle script</h2>
 				<p class="caption">what the light runs when nobody holds a lock</p>
-				<form method="POST" action="?/setIdle" use:enhance={keepValues}>
+				{#if !data.online}
+					<p class="warn">device is offline — a saved script applies when it reconnects</p>
+				{/if}
+				<form method="POST" action="?/setIdle" use:enhance={submit('setIdle', { keep: true })}>
 					<textarea
 						name="script"
 						rows="14"
@@ -257,6 +297,7 @@
 						bind:value={() => script, (v) => (draft = v)}
 					></textarea>
 					<button class="primary" type="submit">save idle script</button>
+					{@render done('setIdle', 'saved — the light picks it up immediately')}
 				</form>
 			</section>
 		</main>
@@ -362,6 +403,31 @@
 		margin: 0 0 0.75rem;
 		font-size: 0.78rem;
 		color: var(--muted);
+	}
+
+	.warn {
+		margin: 0 0 0.75rem;
+		font-size: 0.78rem;
+		color: #ffb347;
+	}
+
+	.done {
+		margin-left: 0.6rem;
+		font-size: 0.8rem;
+		color: var(--green);
+		animation: fade-done 0.4s ease 2.6s forwards;
+	}
+
+	@keyframes fade-done {
+		to {
+			opacity: 0;
+		}
+	}
+
+	.history-toggle {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
 	}
 
 	.banner {

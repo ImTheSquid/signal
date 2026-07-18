@@ -1,5 +1,5 @@
 import { fail } from '@sveltejs/kit';
-import { REDIS, type Idle, type Lock } from '@traffic-light/protocol';
+import { REDIS, type DeviceState, type Idle, type Lock } from '@traffic-light/protocol';
 import {
 	SESSION_COOKIE,
 	createSessionToken,
@@ -39,7 +39,8 @@ export const load: PageServerLoad = async ({ cookies }) => {
 			idle: null,
 			lock: null,
 			history: [],
-			historyPublic: true
+			historyPublic: true,
+			online: false
 		};
 	}
 
@@ -61,8 +62,17 @@ export const load: PageServerLoad = async ({ cookies }) => {
 	const lock: Lock | null = await getLock(r);
 	const history = await getHistory(r);
 	const { historyPublic } = await getSettings(r);
+	const device = await r.get<DeviceState>(REDIS.device);
 
-	return { authed: true as const, keys, idle: idle?.script ?? '', lock, history, historyPublic };
+	return {
+		authed: true as const,
+		keys,
+		idle: idle?.script ?? '',
+		lock,
+		history,
+		historyPublic,
+		online: device !== null
+	};
 };
 
 export const actions: Actions = {
