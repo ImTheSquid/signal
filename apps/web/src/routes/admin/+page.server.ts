@@ -6,9 +6,9 @@ import {
 	verifyPassword,
 	verifySessionToken
 } from '$lib/server/auth';
-import { clearHistory, getHistory, getSettings, setSettings } from '$lib/server/history';
+import { clearHistory, getHistory, getSettings, pushHistory, setSettings } from '$lib/server/history';
 import { createKey, revokeKey } from '$lib/server/keys';
-import { forceRelease, getLock } from '$lib/server/locks';
+import { acquireLock, forceRelease, getLock, releaseLock, submitJob } from '$lib/server/locks';
 import { redis } from '$lib/server/redis';
 import { validateScript } from '$lib/server/validate';
 import type { Actions, PageServerLoad } from './$types';
@@ -24,6 +24,12 @@ export interface AdminKeyRow {
 function authed(cookies: { get: (name: string) => string | undefined }): boolean {
 	return verifySessionToken(cookies.get(SESSION_COOKIE));
 }
+
+// Lamp tests ride the normal lock/job pipeline under a pseudo-key (real key
+// ids are hex, so no collision). The device sees an ordinary job.
+const TEST_KEY_ID = 'admin:test';
+const TEST_KEY_NAME = 'admin (lamp test)';
+const TEST_DURATION_MS = 60_000;
 
 export const load: PageServerLoad = async ({ cookies }) => {
 	if (!authed(cookies)) {
@@ -127,6 +133,51 @@ export const actions: Actions = {
 		const r = redis();
 		await forceRelease(r);
 		await r.publish(REDIS.eventsChannel, JSON.stringify({ type: 'abort' }));
+		return { ok: true };
+	},
+
+	testLights: async ({ request, cookies }) => {
+		if (!authed(cookies)) return fail(401, { error: 'not logged in' });
+		const form = await request.formData();
+		const [r_, y, g] = ['r', 'y', 'g'].map((lamp) => form.get(lamp) === 'on');
+
+		const r = redis();
+		const acquired = await acquireLock(r, {
+			keyId: TEST_KEY_ID,
+			name: TEST_KEY_NAME,
+			durationMs: TEST_DURATION_MS,
+			override: false
+		});
+		if (acquired.status === 'conflict') {
+			return fail(409, {
+				error: `lock held by ${acquired.prev.name} — force release it first`
+			});
+		}
+
+		const script = `set_lights(${r_}, ${y}, ${g});\nsleep(${TEST_DURATION_MS});`;
+		const jobId = crypto.randomUUID();
+		const result = await submitJob(r, TEST_KEY_ID, { jobId, keyId: TEST_KEY_ID, script });
+		if (result.status !== 'ok') return fail(500, { error: `job submit failed: ${result.status}` });
+
+		await r.publish(REDIS.eventsChannel, JSON.stringify({ type: 'job', jobId }));
+		await pushHistory(r, {
+			keyId: TEST_KEY_ID,
+			name: TEST_KEY_NAME,
+			jobId,
+			start: Date.now(),
+			end: null,
+			result: 'running'
+		});
+		return { ok: true };
+	},
+
+	endTest: async ({ cookies }) => {
+		if (!authed(cookies)) return fail(401, { error: 'not logged in' });
+		const r = redis();
+		const { status } = await releaseLock(r, TEST_KEY_ID);
+		if (status === 'released') {
+			await r.publish(REDIS.eventsChannel, JSON.stringify({ type: 'abort' }));
+		}
 		return { ok: true };
 	},
 

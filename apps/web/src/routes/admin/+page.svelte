@@ -110,6 +110,34 @@
 			</section>
 
 			<section class="panel">
+				<h2>lamp test</h2>
+				<p class="caption">holds the lamps for 60s, then the idle script resumes</p>
+				<form method="POST" action="?/testLights" use:enhance={keepValues}>
+					<div class="lamp-toggles">
+						<label class="checkbox">
+							<input type="checkbox" name="r" />
+							<span class="lamp-dot red"></span>
+							red
+						</label>
+						<label class="checkbox">
+							<input type="checkbox" name="y" />
+							<span class="lamp-dot yellow"></span>
+							yellow
+						</label>
+						<label class="checkbox">
+							<input type="checkbox" name="g" />
+							<span class="lamp-dot green"></span>
+							green
+						</label>
+					</div>
+					<button class="primary" type="submit">send to light</button>
+				</form>
+				<form class="end-test" method="POST" action="?/endTest" use:enhance>
+					<button class="ghost" type="submit">end test</button>
+				</form>
+			</section>
+
+			<section class="panel">
 				<h2>history</h2>
 				<form method="POST" action="?/setHistoryVisibility" use:enhance={keepValues}>
 					<label class="checkbox">
@@ -485,6 +513,38 @@
 	.create-key {
 		border-top: 1px solid var(--border);
 		padding-top: 1rem;
+	}
+
+	.lamp-toggles {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 1.25rem;
+		margin-bottom: 0.9rem;
+	}
+
+	.lamp-dot {
+		width: 0.7em;
+		height: 0.7em;
+		border-radius: 50%;
+	}
+
+	.lamp-dot.red {
+		background: var(--red);
+		box-shadow: 0 0 6px color-mix(in srgb, var(--red) 60%, transparent);
+	}
+
+	.lamp-dot.yellow {
+		background: var(--yellow);
+		box-shadow: 0 0 6px color-mix(in srgb, var(--yellow) 60%, transparent);
+	}
+
+	.lamp-dot.green {
+		background: var(--green);
+		box-shadow: 0 0 6px color-mix(in srgb, var(--green) 60%, transparent);
+	}
+
+	.end-test {
+		margin-top: 0.6rem;
 	}
 
 	.history {

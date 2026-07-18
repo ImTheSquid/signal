@@ -14,7 +14,7 @@ friend ──HTTP──▶ SvelteKit /v1/* (Vercel) ──▶ Upstash Redis ◀�
 - **crates/script-env** — the single source of truth for the Rhai language surface and sandbox limits, used by both the validator and the firmware.
 - **crates/validator** → **packages/validator-wasm** — `Engine::compile` compiled to WASM; `POST /v1/script` rejects scripts that won't parse, with line/col errors.
 - **packages/protocol** — zod schemas + constants for the wire protocol and Redis keys.
-- **firmware** — Rust (esp-idf) for an ESP32-WROOM-32E: wifi → SNTP → websocket, Rhai engine in a dedicated thread, three relay GPIOs (25/26/27 = R/Y/G).
+- **firmware** — Rust (esp-idf) for an ESP32-WROOM-32E: wifi → SNTP → websocket, Rhai engine in a dedicated thread, three relay GPIOs (32/33/25 = R/Y/G).
 
 Locking: one lock at a time, `SET NX PX` + owner-checked Lua. Lock expiry is enforced *on the device* via relative TTLs, so the light returns to its idle script even if wifi dies mid-script. When nobody holds the lock the device runs an admin-editable idle script (falling back to a built-in green/yellow/red cycle).
 
@@ -100,4 +100,4 @@ cargo build                    # first build downloads ESP-IDF
 cargo run                      # flashes + monitors via espflash
 ```
 
-Wiring: relays on GPIO 25 (red), 26 (yellow), 27 (green) — non-strap pins, driven low at boot; set `active_low = true` in cfg.toml if your relay board switches on LOW.
+Wiring: relays on GPIO 32 (red), 33 (yellow), 25 (green) — non-strap pins, driven low at boot; set `active_low = true` in cfg.toml if your relay board switches on LOW.

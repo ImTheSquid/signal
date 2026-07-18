@@ -263,9 +263,9 @@ fn main() -> Result<()> {
 
     // Relays on non-strap pins, driven to "off" immediately.
     let lights = Arc::new(Lights::new(
+        peripherals.pins.gpio32.degrade_output(),
+        peripherals.pins.gpio33.degrade_output(),
         peripherals.pins.gpio25.degrade_output(),
-        peripherals.pins.gpio26.degrade_output(),
-        peripherals.pins.gpio27.degrade_output(),
         CONFIG.active_low,
     )?);
 
