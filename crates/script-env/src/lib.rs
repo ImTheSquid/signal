@@ -42,7 +42,8 @@ pub fn apply_limits(engine: &mut Engine) {
     engine.set_max_expr_depths(32, 16);
     engine.set_max_string_size(4 * 1024);
     engine.set_max_array_size(1024);
-    engine.set_max_map_size(0);
+    // NB: 0 would mean "no limit" in rhai, not "no maps".
+    engine.set_max_map_size(64);
     engine.disable_symbol("eval");
     engine.set_strict_variables(true);
 }
@@ -53,6 +54,40 @@ pub fn register_api(engine: &mut Engine, handlers: Handlers) {
     engine.register_fn("set_lights", move |r: bool, y: bool, g: bool| set_lights(r, y, g));
     engine.register_fn("sleep", move |ms: i64| sleep(ms));
     engine.register_fn("millis", move || millis());
+}
+
+/// Info about the last key holder, exposed to idle scripts.
+pub struct LastHolder {
+    pub name: String,
+    /// "ok" | "error" | "aborted" | "deadline"
+    pub result: String,
+    pub ended_ms_ago: i64,
+}
+
+/// Extra API available ONLY in idle scripts. `get_last_holder()` returns
+/// `#{ name, result, ended_ms_ago }` — empty name / -1 when nobody has held
+/// the light since boot. User scripts calling it compile (function lookup is
+/// runtime in Rhai) but fail on-device, which is the intended restriction.
+pub fn register_idle_api(
+    engine: &mut Engine,
+    get_last_holder: Box<dyn Fn() -> Option<LastHolder> + Send + Sync>,
+) {
+    engine.register_fn("get_last_holder", move || -> rhai::Map {
+        let mut map = rhai::Map::new();
+        match get_last_holder() {
+            Some(h) => {
+                map.insert("name".into(), h.name.into());
+                map.insert("result".into(), h.result.into());
+                map.insert("ended_ms_ago".into(), h.ended_ms_ago.into());
+            }
+            None => {
+                map.insert("name".into(), "".into());
+                map.insert("result".into(), "".into());
+                map.insert("ended_ms_ago".into(), (-1_i64).into());
+            }
+        }
+        map
+    });
 }
 
 /// A fully configured engine with stub handlers, for validation.
@@ -93,6 +128,35 @@ mod tests {
     fn unknown_function_compiles() {
         let engine = validation_engine();
         assert!(engine.compile("launch_missiles();").is_ok());
+    }
+
+    #[test]
+    fn idle_api_reports_last_holder() {
+        let mut engine = validation_engine();
+        register_idle_api(
+            &mut engine,
+            Box::new(|| {
+                Some(LastHolder {
+                    name: "amy".into(),
+                    result: "ok".into(),
+                    ended_ms_ago: 1234,
+                })
+            }),
+        );
+        let out: String = engine
+            .eval(r#"let h = get_last_holder(); h.name + ":" + h.result"#)
+            .unwrap();
+        assert_eq!(out, "amy:ok");
+    }
+
+    #[test]
+    fn idle_api_empty_when_no_holder_yet() {
+        let mut engine = validation_engine();
+        register_idle_api(&mut engine, Box::new(|| None));
+        let out: i64 = engine
+            .eval(r#"let h = get_last_holder(); h.ended_ms_ago"#)
+            .unwrap();
+        assert_eq!(out, -1);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -9,6 +9,16 @@ use script_env::Handlers;
 
 use crate::lights::Lights;
 use crate::AppEvent;
+
+/// The last completed job's holder, shared with idle-script engines so
+/// `get_last_holder()` can report it.
+pub struct LastHolderInfo {
+    pub name: String,
+    pub result: String,
+    pub ended: Instant,
+}
+
+pub type SharedLastHolder = Arc<Mutex<Option<LastHolderInfo>>>;
 
 /// Rhai needs far more stack than the ESP-IDF pthread default — it's a
 /// recursive interpreter. Sized to the engine's max_expr_depths/call_levels;
@@ -61,14 +71,17 @@ impl Runner {
 
     /// Run a script in a fresh thread; the outcome arrives on `tx` tagged
     /// with `run_gen` so the main loop can tell stale completions from current.
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         &mut self,
         run_gen: u64,
         kind: RunKind,
         job_id: Option<String>,
+        holder: Option<String>,
         script: String,
         ttl: Option<Duration>,
         lights: Arc<Lights>,
+        last_holder: SharedLastHolder,
         tx: Sender<AppEvent>,
     ) {
         self.stop();
@@ -76,17 +89,19 @@ impl Runner {
         self.abort = abort.clone();
 
         let job_id_on_fail = job_id.clone();
+        let holder_on_fail = holder.clone();
         let tx_on_fail = tx.clone();
         let spawned = std::thread::Builder::new()
             .name("rhai".into())
             .stack_size(SCRIPT_STACK_BYTES)
             .spawn(move || {
                 let deadline = ttl.map(|t| Instant::now() + t);
-                let outcome = run_script(&script, kind, deadline, &abort, &lights);
+                let outcome = run_script(&script, kind, deadline, &abort, &lights, &last_holder);
                 let _ = tx.send(AppEvent::ScriptDone {
                     run_gen,
                     kind,
                     job_id,
+                    holder,
                     outcome,
                 });
             });
@@ -100,6 +115,7 @@ impl Runner {
                     run_gen,
                     kind,
                     job_id: job_id_on_fail,
+                    holder: holder_on_fail,
                     outcome: Outcome::Error(format!("device out of memory: {e}")),
                 });
             }
@@ -113,6 +129,7 @@ fn run_script(
     deadline: Option<Instant>,
     abort: &Arc<AtomicBool>,
     lights: &Arc<Lights>,
+    last_holder: &SharedLastHolder,
 ) -> Outcome {
     let mut engine = script_env::rhai::Engine::new();
     script_env::apply_limits(&mut engine);
@@ -120,6 +137,16 @@ fn run_script(
         // The idle script runs once per idle transition and may loop forever
         // by design (admin-authored); the abort flag remains its kill switch.
         engine.set_max_operations(0);
+        script_env::register_idle_api(&mut engine, {
+            let last_holder = last_holder.clone();
+            Box::new(move || {
+                last_holder.lock().unwrap().as_ref().map(|h| script_env::LastHolder {
+                    name: h.name.clone(),
+                    result: h.result.clone(),
+                    ended_ms_ago: h.ended.elapsed().as_millis() as i64,
+                })
+            })
+        });
     }
 
     let start = Instant::now();

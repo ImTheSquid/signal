@@ -45,6 +45,8 @@ export type Lock = z.infer<typeof LockSchema>;
 export const JobSchema = z.object({
   jobId: z.string(),
   keyId: z.string(),
+  /** Key holder's display name — the device exposes it to idle scripts. */
+  holder: z.string().default(""),
   script: z.string(),
   expiresAt: z.number(),
 });
@@ -101,6 +103,7 @@ export type Event = z.infer<typeof EventSchema>;
 export const JobMsgSchema = z.object({
   t: z.literal("job"),
   id: z.string(),
+  holder: z.string().default(""),
   script: z.string(),
   ttl_ms: z.number(),
 });

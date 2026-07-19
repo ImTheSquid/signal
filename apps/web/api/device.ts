@@ -53,7 +53,7 @@ async function currentJobMsg(): Promise<ServerMsg | null> {
 	const job = JSON.parse(raw) as Job;
 	const ttl = job.expiresAt - Date.now();
 	if (ttl <= 0) return null;
-	return { t: 'job', id: job.jobId, script: job.script, ttl_ms: ttl };
+	return { t: 'job', id: job.jobId, holder: job.holder ?? '', script: job.script, ttl_ms: ttl };
 }
 
 async function getIdle(): Promise<Idle | null> {
@@ -65,7 +65,10 @@ async function sendHello(): Promise<void> {
 	const [job, idle] = await Promise.all([currentJobMsg(), getIdle()]);
 	send({
 		t: 'hello',
-		job: job && job.t === 'job' ? { id: job.id, script: job.script, ttl_ms: job.ttl_ms } : null,
+		job:
+			job && job.t === 'job'
+				? { id: job.id, holder: job.holder, script: job.script, ttl_ms: job.ttl_ms }
+				: null,
 		idle
 	});
 }

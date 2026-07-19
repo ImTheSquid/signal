@@ -33,7 +33,7 @@ export const POST: RequestHandler = async ({ request }) => {
 	if (invalid) return json(invalid, { status: 422 });
 
 	const jobId = crypto.randomUUID();
-	const result = await submitJob(r, key.id, { jobId, keyId: key.id, script });
+	const result = await submitJob(r, key.id, { jobId, keyId: key.id, holder: key.name, script });
 	if (result.status !== 'ok') {
 		const error =
 			result.status === 'nolock' ? 'no lock held — POST /v1/lock first' : 'lock held by another key';

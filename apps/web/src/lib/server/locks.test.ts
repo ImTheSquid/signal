@@ -69,7 +69,7 @@ describe('locks', () => {
 
 	it('override preempts and clears the pending job', async () => {
 		await acquireLock(r, { keyId: 'a', name: 'A', durationMs: 5_000, override: false });
-		await submitJob(r, 'a', { jobId: 'job-a', keyId: 'a', script: 'sleep(1)' });
+		await submitJob(r, 'a', { jobId: 'job-a', keyId: 'a', holder: 'A', script: 'sleep(1)' });
 
 		const b = await acquireLock(r, { keyId: 'b', name: 'B', durationMs: 5_000, override: true });
 		expect(b.status).toBe('preempted');
@@ -88,20 +88,20 @@ describe('locks', () => {
 
 describe('job submission', () => {
 	it('requires a lock', async () => {
-		const result = await submitJob(r, 'a', { jobId: 'j', keyId: 'a', script: 'sleep(1)' });
+		const result = await submitJob(r, 'a', { jobId: 'j', keyId: 'a', holder: 'A', script: 'sleep(1)' });
 		expect(result.status).toBe('nolock');
 	});
 
 	it('rejects a non-holder', async () => {
 		await acquireLock(r, { keyId: 'a', name: 'A', durationMs: 5_000, override: false });
-		const result = await submitJob(r, 'b', { jobId: 'j', keyId: 'b', script: 'sleep(1)' });
+		const result = await submitJob(r, 'b', { jobId: 'j', keyId: 'b', holder: 'B', script: 'sleep(1)' });
 		expect(result.status).toBe('notyours');
 	});
 
 	it('clamps job TTL to the lock remaining time', async () => {
 		await acquireLock(r, { keyId: 'a', name: 'A', durationMs: 2_000, override: false });
 		await sleep(300);
-		const result = await submitJob(r, 'a', { jobId: 'j', keyId: 'a', script: 'sleep(1)' });
+		const result = await submitJob(r, 'a', { jobId: 'j', keyId: 'a', holder: 'A', script: 'sleep(1)' });
 		expect(result.status).toBe('ok');
 		if (result.status === 'ok') {
 			expect(result.ttlMs).toBeGreaterThan(1_000);

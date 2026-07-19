@@ -12,6 +12,8 @@ pub enum ServerMsg {
     #[serde(rename = "job")]
     Job {
         id: String,
+        #[serde(default)]
+        holder: String,
         script: String,
         ttl_ms: u64,
     },
@@ -28,6 +30,8 @@ pub enum ServerMsg {
 #[derive(Debug, Deserialize)]
 pub struct JobPayload {
     pub id: String,
+    #[serde(default)]
+    pub holder: String,
     pub script: String,
     pub ttl_ms: u64,
 }

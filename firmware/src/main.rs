@@ -20,7 +20,7 @@ use esp_idf_svc::ws::FrameType;
 
 use crate::config::CONFIG;
 use crate::lights::Lights;
-use crate::script::{Outcome, RunKind, Runner};
+use crate::script::{LastHolderInfo, Outcome, RunKind, Runner, SharedLastHolder};
 use crate::wsproto::{DeviceMsg, LightsJson, ServerMsg};
 
 const HEARTBEAT: Duration = Duration::from_secs(20);
@@ -49,6 +49,7 @@ pub enum AppEvent {
         run_gen: u64,
         kind: RunKind,
         job_id: Option<String>,
+        holder: Option<String>,
         outcome: Outcome,
     },
 }
@@ -61,15 +62,16 @@ struct App {
     idle_restart_at: Option<Instant>,
     runner: Runner,
     lights: Arc<Lights>,
+    last_holder: SharedLastHolder,
     tx: Sender<AppEvent>,
 }
 
 impl App {
-    fn start_job(&mut self, id: String, script: String, ttl_ms: u64) {
+    fn start_job(&mut self, id: String, holder: String, script: String, ttl_ms: u64) {
         if self.running_id.as_deref() == Some(id.as_str()) {
             return; // duplicate delivery (two server instances during recycle)
         }
-        log::info!("starting job {id} (ttl {ttl_ms}ms)");
+        log::info!("starting job {id} for {holder} (ttl {ttl_ms}ms)");
         self.run_gen += 1;
         self.idle_restart_at = None;
         self.running_id = Some(id.clone());
@@ -77,9 +79,11 @@ impl App {
             self.run_gen,
             RunKind::Job,
             Some(id),
+            Some(holder),
             script,
             Some(Duration::from_millis(ttl_ms)),
             self.lights.clone(),
+            self.last_holder.clone(),
             self.tx.clone(),
         );
     }
@@ -96,9 +100,11 @@ impl App {
             self.run_gen,
             RunKind::Idle,
             None,
+            None,
             script,
             None,
             self.lights.clone(),
+            self.last_holder.clone(),
             self.tx.clone(),
         );
     }
@@ -126,6 +132,7 @@ impl App {
                 run_gen,
                 kind,
                 job_id,
+                holder,
                 outcome,
             } => {
                 log::info!("script done ({kind:?}): {outcome:?}");
@@ -137,6 +144,11 @@ impl App {
                         Outcome::Deadline => ("deadline", None),
                     };
                     send(client, &DeviceMsg::JobDone { id: &id, result, error });
+                    *self.last_holder.lock().unwrap() = Some(LastHolderInfo {
+                        name: holder.unwrap_or_default(),
+                        result: result.to_string(),
+                        ended: Instant::now(),
+                    });
                 }
                 if kind == RunKind::Idle && matches!(outcome, Outcome::Error(_)) {
                     log::warn!("idle script failed; falling back to built-in cycle");
@@ -168,7 +180,7 @@ impl App {
                     self.set_idle_script(idle.script);
                 }
                 match job {
-                    Some(job) => self.start_job(job.id, job.script, job.ttl_ms),
+                    Some(job) => self.start_job(job.id, job.holder, job.script, job.ttl_ms),
                     None => {
                         if self.running_id.is_some() {
                             // Lock is gone (expired/released while we were away).
@@ -177,7 +189,12 @@ impl App {
                     }
                 }
             }
-            ServerMsg::Job { id, script, ttl_ms } => self.start_job(id, script, ttl_ms),
+            ServerMsg::Job {
+                id,
+                holder,
+                script,
+                ttl_ms,
+            } => self.start_job(id, holder, script, ttl_ms),
             ServerMsg::Abort => {
                 if self.running_id.is_some() {
                     self.runner.request_abort();
@@ -286,6 +303,7 @@ fn main() -> Result<()> {
         idle_restart_at: None,
         runner: Runner::new(),
         lights: lights.clone(),
+        last_holder: SharedLastHolder::default(),
         tx: tx.clone(),
     };
     // Show the built-in cycle from boot, before the network is even up.

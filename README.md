@@ -5,12 +5,15 @@ A real three-lamp traffic signal on the internet. Friends, apps, and trinkets ge
 ## Architecture
 
 ```
-friend ──HTTP──▶ SvelteKit /v1/* (Vercel) ──▶ Upstash Redis ◀── pub/sub ── api/device.ts (Vercel WS fn)
-                    │                                                        ▲ websocket
-                    └─ validates scripts via Rhai→WASM                       └── ESP32 (runs Rhai on-device)
+friend ──HTTP──▶ SvelteKit /v1/* (Vercel) ──▶ Redis ◀────── pub/sub ────── api/device.ts (Vercel WS fn)
+                    │                          ▲                             ▲ websocket
+                    └─ validates scripts       │ pub/sub                     └── ESP32 (runs Rhai on-device)
+                       via Rhai→WASM       api/live.ts (Vercel WS fn)
+                                               ▲ websocket
+                                            dashboard (live updates)
 ```
 
-- **apps/web** — SvelteKit app: public dashboard, admin panel, `/v1` JSON API, and the standalone websocket function `api/device.ts` (SvelteKit can't upgrade websockets on Vercel; the root `api/` directory can — which is also why the JSON API lives at `/v1`, not `/api`).
+- **apps/web** — SvelteKit app: public dashboard (live over websocket, 10s polling as fallback), admin panel (keys, idle script editor, lamp test, history controls, kill switch), the `/v1` JSON API, and two standalone websocket functions: `api/device.ts` (the ESP32) and `api/live.ts` (browsers). SvelteKit can't upgrade websockets on Vercel; the root `api/` directory can — which is also why the JSON API lives at `/v1`, not `/api`.
 - **crates/script-env** — the single source of truth for the Rhai language surface and sandbox limits, used by both the validator and the firmware.
 - **crates/validator** → **packages/validator-wasm** — `Engine::compile` compiled to WASM; `POST /v1/script` rejects scripts that won't parse, with line/col errors.
 - **packages/protocol** — zod schemas + constants for the wire protocol and Redis keys.
@@ -23,7 +26,7 @@ The device connection drops every ≤300s (Vercel Hobby function duration cap) �
 ## API (for key holders)
 
 ```sh
-BASE=https://<your-app>.vercel.app
+BASE=https://signal.jackhogan.me
 AUTH="Authorization: Bearer tl_<id>_<secret>"
 JSON="Content-Type: application/json"   # required — form content types are CSRF-blocked
 
@@ -44,6 +47,11 @@ curl -X DELETE $BASE/v1/lock -H "$AUTH"
 
 # Public status (no auth)
 curl $BASE/v1/status
+
+# Live status stream (no auth): a websocket that pushes the same JSON shape
+# as /v1/status on every change. Reconnect on close — the platform recycles
+# connections every ≤300s.
+#   wss://signal.jackhogan.me/api/live
 ```
 
 ### Script environment
@@ -59,6 +67,16 @@ Scripts are Rhai with integers only (no floats/maps/modules/eval) and these func
 The script is killed when your lock expires (`sleep` wakes every 50ms to check). Busy loops without `sleep` die early against the 5M-operation cap — use `sleep`. Runtime errors (wrong arity, unknown function) surface in the dashboard history, not at submit time; only parse errors are caught at `POST /v1/script`.
 
 The **idle script** (admin-set, runs when nobody holds a lock) has different semantics: it runs **once per idle transition** with no operation cap — a one-shot script sets a state and the lamps hold it; write your own `loop { … }` for an animation. If it errors, the built-in cycle takes over.
+
+Idle scripts (and only idle scripts) also get `get_last_holder()`, returning `#{ name, result, ended_ms_ago }` for the most recent job (`name: ""`, `ended_ms_ago: -1` if nobody has held the light since boot):
+
+```rhai
+let h = get_last_holder();
+if h.result == "error" {
+    // shame blink for whoever crashed their script
+    loop { set_lights(true, false, false); sleep(300); set_lights(false, false, false); sleep(300); }
+}
+```
 
 ## Development
 
@@ -93,7 +111,8 @@ pnpm run build:wasm                              # rebuild validator (commit pkg
    - `DEVICE_TOKEN` — long random string the ESP32 presents
    - `ADMIN_PASSWORD_HASH` — from `scripts/hash-password.ts`
    - `SESSION_SECRET` — long random string
-4. Redis budget note: the status endpoint is CDN-cached 10s and the dashboard pauses polling in hidden tabs — that keeps 24/7 operation around ~165K of the 500K free commands/month. Don't add fast polling.
+4. Connect the GitHub repo to the Vercel project — pushes to `main` deploy production. A custom domain is a CNAME to vercel-dns in project settings (this deployment: `signal.jackhogan.me`).
+5. Redis budget note (Upstash free tier only): the status endpoint is CDN-cached 10s and the dashboard pauses its fallback polling in hidden tabs — that keeps 24/7 operation around ~165K of the 500K free commands/month. Self-hosted Redis has no such limit.
 
 ## Firmware
 

@@ -166,7 +166,12 @@ export const actions: Actions = {
 
 		const script = `set_lights(${r_}, ${y}, ${g});\nsleep(${TEST_DURATION_MS});`;
 		const jobId = crypto.randomUUID();
-		const result = await submitJob(r, TEST_KEY_ID, { jobId, keyId: TEST_KEY_ID, script });
+		const result = await submitJob(r, TEST_KEY_ID, {
+			jobId,
+			keyId: TEST_KEY_ID,
+			holder: TEST_KEY_NAME,
+			script
+		});
 		if (result.status !== 'ok') return fail(500, { error: `job submit failed: ${result.status}` });
 
 		await r.publish(REDIS.eventsChannel, JSON.stringify({ type: 'job', jobId }));

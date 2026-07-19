@@ -11,8 +11,23 @@
 	const script = $derived(draft ?? data.idle ?? '');
 
 	// Which form was submitted last — the `form` result is global to the page,
-	// so this routes success feedback to the right form.
+	// so this routes success and error feedback to the right form.
 	let lastAction = $state<string | null>(null);
+
+	// Actions whose errors render inline next to their form; the global banner
+	// is suppressed for these and kept for the rest (login, createKey).
+	const INLINE_ERRORS = [
+		'setIdle',
+		'testLights',
+		'endTest',
+		'setHistoryVisibility',
+		'clearHistory',
+		'kill'
+	];
+	const errorShownInline = $derived(
+		lastAction !== null &&
+			(INLINE_ERRORS.includes(lastAction) || lastAction.startsWith('revokeKey:'))
+	);
 
 	function submit(
 		action: string,
@@ -68,9 +83,15 @@
 		{/if}
 	{/snippet}
 
+	{#snippet err(action: string, mono: boolean = false)}
+		{#if form?.error && lastAction === action}
+			<span class="fail" class:mono role="alert">{form.error}</span>
+		{/if}
+	{/snippet}
+
 	{#if !data.authed}
 		<div class="login-wrap">
-			<form class="panel login" method="POST" action="?/login" use:enhance>
+			<form class="panel login" method="POST" action="?/login" use:enhance={submit('login')}>
 				<h1>admin</h1>
 				{#if form?.error}
 					<p class="error">{form.error}</p>
@@ -85,12 +106,12 @@
 	{:else}
 		<header>
 			<h1>traffic light admin</h1>
-			<form method="POST" action="?/logout" use:enhance>
+			<form method="POST" action="?/logout" use:enhance={submit('logout')}>
 				<button class="ghost" type="submit">log out</button>
 			</form>
 		</header>
 
-		{#if form?.error}
+		{#if form?.error && !errorShownInline}
 			<div class="banner error">{form.error}</div>
 		{/if}
 
@@ -123,6 +144,7 @@
 				>
 					<button class="danger" type="submit">force release / kill script</button>
 					{@render done('kill', 'released')}
+					{@render err('kill')}
 				</form>
 			</section>
 
@@ -154,10 +176,12 @@
 					</div>
 					<button class="primary" type="submit">send to light</button>
 					{@render done('testLights', 'sent to light')}
+					{@render err('testLights')}
 				</form>
 				<form class="end-test" method="POST" action="?/endTest" use:enhance={submit('endTest')}>
 					<button class="ghost" type="submit">end test</button>
 					{@render done('endTest', 'test ended')}
+					{@render err('endTest')}
 				</form>
 			</section>
 
@@ -179,6 +203,7 @@
 						show history on public dashboard
 					</label>
 					{@render done('setHistoryVisibility', 'saved')}
+					{@render err('setHistoryVisibility')}
 				</form>
 				{#if data.history.length === 0}
 					<p class="muted">
@@ -209,6 +234,7 @@
 						use:enhance={submit('clearHistory', { confirm: 'Clear all history entries?' })}
 					>
 						<button class="danger small" type="submit">clear history</button>
+						{@render err('clearHistory')}
 					</form>
 				{/if}
 			</section>
@@ -250,6 +276,7 @@
 												>
 													<input type="hidden" name="id" value={key.id} />
 													<button class="danger small" type="submit">revoke</button>
+													{@render err(`revokeKey:${key.id}`)}
 												</form>
 											{:else}
 												{@render done(`revokeKey:${key.id}`, 'revoked')}
@@ -262,7 +289,7 @@
 					</div>
 				{/if}
 
-				<form class="create-key" method="POST" action="?/createKey" use:enhance>
+				<form class="create-key" method="POST" action="?/createKey" use:enhance={submit('createKey')}>
 					<h3>create key</h3>
 					<div class="fields">
 						<label>
@@ -298,6 +325,7 @@
 					></textarea>
 					<button class="primary" type="submit">save idle script</button>
 					{@render done('setIdle', 'saved — the light picks it up immediately')}
+					{@render err('setIdle', true)}
 				</form>
 			</section>
 		</main>
@@ -422,6 +450,20 @@
 		to {
 			opacity: 0;
 		}
+	}
+
+	.fail {
+		margin-left: 0.6rem;
+		font-size: 0.8rem;
+		color: var(--red);
+		overflow-wrap: anywhere;
+		white-space: pre-wrap;
+	}
+
+	.fail.mono {
+		display: block;
+		margin: 0.5rem 0 0;
+		font-family: ui-monospace, 'SF Mono', Menlo, monospace;
 	}
 
 	.history-toggle {
