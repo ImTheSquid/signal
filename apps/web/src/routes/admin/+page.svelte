@@ -45,6 +45,31 @@
 		};
 	}
 
+	let tokenEl = $state<HTMLElement | undefined>();
+	let copyState = $state<'idle' | 'copied' | 'manual'>('idle');
+	let copyTimer: ReturnType<typeof setTimeout> | undefined;
+
+	async function copyToken(token: string) {
+		clearTimeout(copyTimer);
+		try {
+			await navigator.clipboard.writeText(token);
+			copyState = 'copied';
+			copyTimer = setTimeout(() => (copyState = 'idle'), 2000);
+		} catch {
+			// No clipboard access (non-secure context / permission): select the
+			// code block so a manual ⌘C works.
+			if (tokenEl) {
+				const range = document.createRange();
+				range.selectNodeContents(tokenEl);
+				const selection = window.getSelection();
+				selection?.removeAllRanges();
+				selection?.addRange(range);
+			}
+			copyState = 'manual';
+			copyTimer = setTimeout(() => (copyState = 'idle'), 4000);
+		}
+	}
+
 	function minutes(ms: number): number {
 		return Math.round(ms / 60_000);
 	}
@@ -113,14 +138,6 @@
 
 		{#if form?.error && !errorShownInline}
 			<div class="banner error">{form.error}</div>
-		{/if}
-
-		{#if form?.token}
-			<div class="banner token">
-				<strong>API key created.</strong>
-				<span>Copy it now — it won't be shown again.</span>
-				<code>{form.token}</code>
-			</div>
 		{/if}
 
 		<main>
@@ -308,6 +325,23 @@
 					</div>
 					<button class="primary" type="submit">create</button>
 				</form>
+
+				{#if form?.token}
+					<div class="banner token">
+						<strong>API key created.</strong>
+						<span>Copy it now — it won't be shown again.</span>
+						<div class="token-row">
+							<code bind:this={tokenEl}>{form.token}</code>
+							<button class="ghost" type="button" onclick={() => copyToken(form?.token ?? '')}>
+								{copyState === 'copied'
+									? '✓ copied'
+									: copyState === 'manual'
+										? 'select + ⌘C'
+										: 'copy'}
+							</button>
+						</div>
+					</div>
+				{/if}
 			</section>
 
 			<section class="panel">
@@ -498,6 +532,7 @@
 		display: flex;
 		flex-direction: column;
 		gap: 0.4rem;
+		margin-top: 1rem;
 		color: var(--green);
 		border-color: color-mix(in srgb, var(--green) 40%, transparent);
 		background: color-mix(in srgb, var(--green) 8%, transparent);
@@ -506,6 +541,22 @@
 	.banner.token span {
 		font-size: 0.8rem;
 		color: var(--yellow);
+	}
+
+	.token-row {
+		display: flex;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: 0.5rem;
+	}
+
+	.token-row code {
+		flex: 1;
+		min-width: 0;
+	}
+
+	.token-row button {
+		white-space: nowrap;
 	}
 
 	.banner.token code {
