@@ -10,6 +10,7 @@ import { timingSafeEqual } from 'node:crypto';
 import { Redis } from 'ioredis';
 import { WebSocketServer, WebSocket } from 'ws';
 import {
+	COLLAPSE_HISTORY_LUA,
 	DEVICE_KEY_TTL_MS,
 	DEVICE_WRITE_MIN_INTERVAL_MS,
 	DeviceMsgSchema,
@@ -98,6 +99,8 @@ async function recordJobDone(msg: {
 			entry.result = msg.result;
 			if (msg.error) entry.error = msg.error;
 			await redis.lset(REDIS.history, i, JSON.stringify(entry));
+			// Now terminal — merge into a same-key streak if adjacent.
+			await redis.eval(COLLAPSE_HISTORY_LUA, 1, REDIS.history);
 			break;
 		}
 	}

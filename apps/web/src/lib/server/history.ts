@@ -1,4 +1,5 @@
 import {
+	COLLAPSE_HISTORY_LUA,
 	HISTORY_LENGTH,
 	REDIS,
 	SettingsSchema,
@@ -6,6 +7,11 @@ import {
 	type Settings
 } from '@traffic-light/protocol';
 import type { Redis } from '@upstash/redis';
+
+/** Merge adjacent terminal same-key entries (see COLLAPSE_HISTORY_LUA). */
+export async function collapseHistory(r: Redis): Promise<void> {
+	await r.eval(COLLAPSE_HISTORY_LUA, [REDIS.history], []);
+}
 
 export async function getSettings(r: Redis): Promise<Settings> {
 	const raw = await r.get(REDIS.settings);
@@ -24,6 +30,8 @@ export async function clearHistory(r: Redis): Promise<void> {
 export async function pushHistory(r: Redis, entry: HistoryEntry): Promise<void> {
 	await r.lpush(REDIS.history, JSON.stringify(entry));
 	await r.ltrim(REDIS.history, 0, HISTORY_LENGTH - 1);
+	// Terminal entries (e.g. "preempted") may extend a same-key streak.
+	if (entry.result !== 'running') await collapseHistory(r);
 }
 
 export async function getHistory(r: Redis): Promise<HistoryEntry[]> {
@@ -54,6 +62,7 @@ export async function healLostEntries(
 	deviceRunning: string | undefined
 ): Promise<void> {
 	const grace = 15_000; // delivery window between submit and device pickup
+	let healed = false;
 	for (const entry of history) {
 		if (
 			entry.result === 'running' &&
@@ -64,6 +73,9 @@ export async function healLostEntries(
 			entry.result = 'lost';
 			entry.end = Date.now();
 			await r.eval(CLOSE_LOST, [REDIS.history], [entry.jobId, String(entry.end)]);
+			healed = true;
 		}
 	}
+	// A healed entry is now terminal and may extend a same-key streak.
+	if (healed) await collapseHistory(r);
 }

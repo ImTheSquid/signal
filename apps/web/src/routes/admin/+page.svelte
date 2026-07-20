@@ -233,6 +233,9 @@
 							<li>
 								<div class="row">
 									<span class="name">{h.name}</span>
+									{#if h.runs && h.runs > 1}
+										<span class="runs">×{h.runs}</span>
+									{/if}
 									<span class="chip {h.result}">{h.result}</span>
 									<span class="when">{relative(h.start)}</span>
 									{#if h.end !== null}
@@ -729,6 +732,12 @@
 	.name {
 		font-weight: 600;
 		font-size: 0.9rem;
+	}
+
+	.runs {
+		font-size: 0.75rem;
+		color: var(--muted);
+		font-variant-numeric: tabular-nums;
 	}
 
 	.when,

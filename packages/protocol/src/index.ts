@@ -82,8 +82,46 @@ export const HistoryEntrySchema = z.object({
   end: z.number().nullable(),
   result: z.enum(["ok", "error", "aborted", "deadline", "preempted", "running", "lost"]),
   error: z.string().optional(),
+  /** Collapsed consecutive runs by the same key (absent = 1). */
+  runs: z.number().optional(),
 });
 export type HistoryEntry = z.infer<typeof HistoryEntrySchema>;
+
+/**
+ * Merge adjacent terminal (non-running) entries from the same key into one
+ * aggregate row so a single chatty key can't flood the history window.
+ * Newest entry of a streak wins (name/jobId/result/end); start stretches to
+ * the oldest, `runs` accumulates. Idempotent full-pass; atomic via EVAL.
+ * KEYS[1] = history list. Returns number of entries merged away.
+ */
+export const COLLAPSE_HISTORY_LUA = `
+local key = KEYS[1]
+local n = redis.call('LLEN', key)
+if n < 2 then return 0 end
+local entries = {}
+for i = 0, n - 1 do
+  entries[i + 1] = cjson.decode(redis.call('LINDEX', key, i))
+end
+local out = {}
+for i = 1, n do
+  local e = entries[i]
+  local last = out[#out]
+  if last ~= nil and last.keyId == e.keyId
+     and last.result ~= 'running' and e.result ~= 'running' then
+    last.runs = (last.runs or 1) + (e.runs or 1)
+    if e.start < last.start then last.start = e.start end
+    if last.error == nil and e.error ~= nil then last.error = e.error end
+  else
+    out[#out + 1] = e
+  end
+end
+if #out == n then return 0 end
+redis.call('DEL', key)
+for i = #out, 1, -1 do
+  redis.call('LPUSH', key, cjson.encode(out[i]))
+end
+return n - #out
+`;
 
 // ---- Pub/sub events (API routes -> WS function) ----
 
