@@ -1,8 +1,7 @@
 /**
  * Public read-only websocket for the dashboard. Browsers connect here and
  * receive the same snapshot shape as GET /v1/status, pushed whenever anything
- * changes (any message on the Redis `events` channel). Connections close at
- * Vercel's maxDuration (300s on Hobby); clients reconnect.
+ * changes (any message on the Redis `events` channel).
  */
 import http from 'node:http';
 import { Redis } from 'ioredis';
@@ -19,6 +18,8 @@ import {
 const MAX_CLIENTS = 64;
 /** Collapse event bursts (job + update + state) into one snapshot push. */
 const DEBOUNCE_MS = 100;
+/** Ping cadence; a client that misses one round trip is dropped. */
+const HEARTBEAT_MS = 30_000;
 
 const redisUrl = process.env.REDIS_URL ?? 'redis://localhost:6379';
 const redis = new Redis(redisUrl, { maxRetriesPerRequest: null, lazyConnect: true });
@@ -45,6 +46,9 @@ async function snapshot(): Promise<string> {
 }
 
 const wss = new WebSocketServer({ noServer: true, maxPayload: 1024 });
+
+/** Clients that answered the last heartbeat ping. */
+const alive = new WeakSet<WebSocket>();
 
 let pushTimer: NodeJS.Timeout | null = null;
 
@@ -87,15 +91,25 @@ server.on('upgrade', (req, socket, head) => {
 
 wss.on('connection', async (ws) => {
 	ws.on('error', () => ws.close());
+	alive.add(ws);
+	ws.on('pong', () => alive.add(ws));
 	if (redis.status === 'wait') await redis.connect();
 	await ensureSubscribed();
 	ws.send(await snapshot());
 });
 
-// Local dev: `pnpm exec tsx api/live.ts` — Vercel ignores this and uses the export.
-if (!process.env.VERCEL) {
-	const port = Number(process.env.LIVE_WS_PORT ?? 3002);
-	server.listen(port, () => console.log(`live ws listening on :${port}`));
-}
+// Browsers that vanish (laptop lid, dropped wifi) never send a close frame;
+// without this they occupy MAX_CLIENTS slots indefinitely.
+setInterval(() => {
+	for (const client of wss.clients) {
+		if (!alive.has(client)) {
+			client.terminate();
+			continue;
+		}
+		alive.delete(client);
+		client.ping();
+	}
+}, HEARTBEAT_MS).unref();
 
-export default server;
+const port = Number(process.env.LIVE_WS_PORT ?? 3002);
+server.listen(port, () => console.log(`live ws listening on :${port}`));

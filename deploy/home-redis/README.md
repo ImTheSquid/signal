@@ -1,7 +1,11 @@
-# Self-hosted Redis (Ubuntu + nginx) instead of Upstash
+# Self-hosted Redis (Ubuntu + nginx)
 
 Same stack the dev environment uses: Redis + [SRH](https://github.com/hiett/serverless-redis-http)
 (an Upstash-compatible REST proxy). The app code is unchanged — only env vars differ.
+
+> When the app runs on this box ([../home-app/](../home-app/)) only step 1
+> applies — it reaches Redis over the docker network. The nginx/TLS/DNS steps
+> below are for a remote app.
 
 Two things get exposed through nginx:
 
@@ -46,21 +50,20 @@ curl -s https://redis.example.com -H "Authorization: Bearer $SRH_TOKEN" \
 redis-cli --tls -h redis.example.com -p 6380 -a "$REDIS_PASSWORD" ping   # PONG
 ```
 
-## Point Vercel at it
+## Point a remote app at it
 
-```sh
-vercel env add UPSTASH_REDIS_REST_URL production    # https://redis.example.com
-vercel env add UPSTASH_REDIS_REST_TOKEN production  # the SRH_TOKEN value
-vercel env add REDIS_URL production                 # rediss://:<REDIS_PASSWORD>@redis.example.com:6380
-vercel deploy
+```
+UPSTASH_REDIS_REST_URL=https://redis.example.com
+UPSTASH_REDIS_REST_TOKEN=<the SRH_TOKEN value>
+REDIS_URL=rediss://:<REDIS_PASSWORD>@redis.example.com:6380
 ```
 
 Certbot renewals: nginx reload on renew re-reads the certs for both listeners
 automatically (the deploy hook that ships with certbot's nginx plugin handles it).
 
 Notes:
-- The Upstash 500K commands/month budget concern disappears; the CDN caching on
-  /v1/status stays anyway (it's still good manners to your uplink).
+- No hosted-Redis command budget to stay under; the caching on /v1/status stays
+  anyway (it's still good manners to your uplink).
 - `noeviction` + 64MB is deliberate: this dataset is a few KB; if Redis ever
   hits that limit something is wrong, and evicting a live lock would be worse
   than erroring.

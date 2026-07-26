@@ -1,0 +1,58 @@
+# The app stack. Redis + SRH stay in their own compose project (deploy/home-redis)
+# so their data volume is untouched by app redeploys; we join that network by name.
+name: traffic-light-app
+
+services:
+  web:
+    image: traffic-light:latest
+    build:
+      context: ../..
+    restart: unless-stopped
+    command: ["node", "build/index.js"]
+    environment:
+      PORT: 3000
+      # SvelteKit needs the public origin to pass its CSRF check behind a proxy.
+      ORIGIN: https://signal.jackhogan.me
+      UPSTASH_REDIS_REST_URL: http://srh:80
+      UPSTASH_REDIS_REST_TOKEN: ${SRH_TOKEN}
+      DEVICE_TOKEN: ${DEVICE_TOKEN}
+      ADMIN_PASSWORD_HASH: ${ADMIN_PASSWORD_HASH}
+      SESSION_SECRET: ${SESSION_SECRET}
+    ports:
+      - "127.0.0.1:3000:3000"
+    networks:
+      - redis
+
+  device-ws:
+    image: traffic-light:latest
+    restart: unless-stopped
+    command: ["pnpm", "exec", "tsx", "api/device.ts"]
+    environment:
+      DEVICE_WS_PORT: 3001
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+      DEVICE_TOKEN: ${DEVICE_TOKEN}
+    ports:
+      - "127.0.0.1:3001:3001"
+    depends_on:
+      - web
+    networks:
+      - redis
+
+  live-ws:
+    image: traffic-light:latest
+    restart: unless-stopped
+    command: ["pnpm", "exec", "tsx", "api/live.ts"]
+    environment:
+      LIVE_WS_PORT: 3002
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+    ports:
+      - "127.0.0.1:3002:3002"
+    depends_on:
+      - web
+    networks:
+      - redis
+
+networks:
+  redis:
+    external: true
+    name: traffic-light-redis_default

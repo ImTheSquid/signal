@@ -5,15 +5,17 @@ A real three-lamp traffic signal on the internet. Friends, apps, and trinkets ge
 ## Architecture
 
 ```
-friend ──HTTP──▶ SvelteKit /v1/* (Vercel) ──▶ Redis ◀────── pub/sub ────── api/device.ts (Vercel WS fn)
+friend ──HTTP──▶ SvelteKit /v1/* ──────────▶ Redis ◀────── pub/sub ────── api/device.ts
                     │                          ▲                             ▲ websocket
                     └─ validates scripts       │ pub/sub                     └── ESP32 (runs Rhai on-device)
-                       via Rhai→WASM       api/live.ts (Vercel WS fn)
+                       via Rhai→WASM       api/live.ts
                                                ▲ websocket
                                             dashboard (live updates)
 ```
 
-- **apps/web** — SvelteKit app: public dashboard (live over websocket, 10s polling as fallback), admin panel (keys, idle script editor, lamp test, history controls, kill switch), the `/v1` JSON API, and two standalone websocket functions: `api/device.ts` (the ESP32) and `api/live.ts` (browsers). SvelteKit can't upgrade websockets on Vercel; the root `api/` directory can — which is also why the JSON API lives at `/v1`, not `/api`.
+Everything runs on one box behind nginx — see [deploy/home-app/](deploy/home-app/).
+
+- **apps/web** — SvelteKit app: public dashboard (live over websocket, 10s polling as fallback), admin panel (keys, idle script editor, lamp test, history controls, kill switch), the `/v1` JSON API, and two standalone websocket servers: `api/device.ts` (the ESP32) and `api/live.ts` (browsers). SvelteKit routes can't upgrade websockets, so those run as their own processes — which is also why the JSON API lives at `/v1`, not `/api`.
 - **crates/script-env** — the single source of truth for the Rhai language surface and sandbox limits, used by both the validator and the firmware.
 - **crates/validator** → **packages/validator-wasm** — `Engine::compile` compiled to WASM; `POST /v1/script` rejects scripts that won't parse, with line/col errors.
 - **packages/protocol** — zod schemas + constants for the wire protocol and Redis keys.
@@ -21,7 +23,7 @@ friend ──HTTP──▶ SvelteKit /v1/* (Vercel) ──▶ Redis ◀───
 
 Locking: one lock at a time, `SET NX PX` + owner-checked Lua. Lock expiry is enforced *on the device* via relative TTLs, so the light returns to its idle script even if wifi dies mid-script. When nobody holds the lock the device runs an admin-editable idle script (falling back to a built-in green/yellow/red cycle).
 
-The device connection drops every ≤300s (Vercel Hobby function duration cap) — the firmware auto-reconnects and the server resyncs it with a `hello` message on every connect.
+The device holds one websocket open indefinitely; a 30s server-side ping drops half-open sockets. The firmware auto-reconnects and the server resyncs it with a `hello` message on every connect.
 
 ## API (for key holders)
 
@@ -49,8 +51,7 @@ curl -X DELETE $BASE/v1/lock -H "$AUTH"
 curl $BASE/v1/status
 
 # Live status stream (no auth): a websocket that pushes the same JSON shape
-# as /v1/status on every change. Reconnect on close — the platform recycles
-# connections every ≤300s.
+# as /v1/status on every change. Reconnect on close (redeploys drop it).
 #   wss://signal.jackhogan.me/api/live
 ```
 
@@ -87,9 +88,9 @@ pnpm install && pnpm -r build
 
 # terminal 1: web app
 cd apps/web && cp .env.example .env && pnpm dev
-# terminal 2: device websocket function
+# terminal 2: device websocket server
 cd apps/web && DEVICE_TOKEN=dev-device-token REDIS_URL=redis://localhost:6379 pnpm exec tsx api/device.ts
-# terminal 3: live-dashboard websocket function
+# terminal 3: live-dashboard websocket server
 cd apps/web && REDIS_URL=redis://localhost:6379 pnpm exec tsx api/live.ts
 # terminal 4: fake traffic light (no hardware needed)
 cd apps/web && pnpm exec tsx scripts/fake-device.ts
@@ -101,18 +102,13 @@ cargo test -p script-env                         # sandbox tests
 pnpm run build:wasm                              # rebuild validator (commit pkg/)
 ```
 
-## Deploying (Vercel Hobby)
+## Deploying
 
-1. Create the Vercel project with **Root Directory = `apps/web`** (Fluid compute on, default). WebSocket support is public beta and required.
-2. Add **Upstash Redis** from the Vercel Marketplace (free tier), **or self-host Redis on your own box** — see [deploy/home-redis/](deploy/home-redis/). The dashboard/API use the REST vars; the websocket function needs the **TCP** URL.
-3. Environment variables:
-   - `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN` (from the marketplace integration)
-   - `REDIS_URL` — the `rediss://…` TCP connection string
-   - `DEVICE_TOKEN` — long random string the ESP32 presents
-   - `ADMIN_PASSWORD_HASH` — from `scripts/hash-password.ts`
-   - `SESSION_SECRET` — long random string
-4. Connect the GitHub repo to the Vercel project — pushes to `main` deploy production. A custom domain is a CNAME to vercel-dns in project settings (this deployment: `signal.jackhogan.me`).
-5. Redis budget note (Upstash free tier only): the status endpoint is CDN-cached 10s and the dashboard pauses its fallback polling in hidden tabs — that keeps 24/7 operation around ~165K of the 500K free commands/month. Self-hosted Redis has no such limit.
+Self-hosted on one Ubuntu box: docker for the three app processes, nginx for
+TLS, Redis in its own compose project alongside.
+
+- [deploy/home-redis/](deploy/home-redis/) — Redis + an Upstash-compatible REST proxy
+- [deploy/home-app/](deploy/home-app/) — the app itself, nginx vhost, and the deploy steps
 
 ## Firmware
 

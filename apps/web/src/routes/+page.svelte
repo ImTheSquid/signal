@@ -105,8 +105,7 @@
 			if (ws !== socket) return;
 			ws = undefined;
 			if (!active) return;
-			// The platform drops connections every ≤300s; poll while
-			// reconnecting with backoff.
+			// Poll while reconnecting with backoff.
 			startPolling();
 			reconnectTimer = setTimeout(connect, backoffMs);
 			backoffMs = Math.min(backoffMs * 2, 30_000);
