@@ -23,7 +23,7 @@
 		"vitest": "^4.1.10"
 	},
 	"dependencies": {
-		"@sveltejs/adapter-vercel": "^6.3.4",
+		"@sveltejs/adapter-node": "^5.5.7",
 		"@traffic-light/protocol": "workspace:*",
 		"@traffic-light/validator-wasm": "workspace:*",
 		"@upstash/redis": "^1.38.0",

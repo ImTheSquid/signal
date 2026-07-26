@@ -31,8 +31,9 @@ export const GET: RequestHandler = async () => {
 		},
 		{
 			headers: {
-				// The CDN collapses all dashboard pollers into ≤1 origin hit/10s —
-				// load-bearing for the Upstash free tier, not an optimization.
+				// Collapses all dashboard pollers into ≤1 origin hit/10s. Needs a
+				// shared cache in front to mean anything — nginx does it in
+				// deploy/home-app/nginx-signal.conf.
 				'cache-control': 'public, s-maxage=10, stale-while-revalidate=20'
 			}
 		}

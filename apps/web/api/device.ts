@@ -1,9 +1,9 @@
 /**
- * Device websocket endpoint, deployed as a standalone Vercel Function
- * (SvelteKit routes cannot handle WS upgrades). The ESP32 keeps one
- * connection open; Vercel closes it at maxDuration (300s on Hobby) and the
- * device reconnects. Everything durable lives in Redis — instance recycling
- * is stateless-safe. API routes signal us via the `events` pub/sub channel.
+ * Device websocket endpoint, run as a standalone Node server (SvelteKit routes
+ * cannot handle WS upgrades). The ESP32 holds one connection open indefinitely
+ * and resyncs via `hello` on every connect. Everything durable lives in Redis,
+ * so a restart is stateless-safe. API routes signal us via the `events`
+ * pub/sub channel.
  */
 import http from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
@@ -26,12 +26,17 @@ import {
 } from '@traffic-light/protocol';
 
 const redisUrl = process.env.REDIS_URL ?? 'redis://localhost:6379';
-// maxRetriesPerRequest: null per Vercel's guidance for long-lived connections.
+// maxRetriesPerRequest: null so commands queue rather than fail across a
+// reconnect on this long-lived connection.
 const redis = new Redis(redisUrl, { maxRetriesPerRequest: null, lazyConnect: true });
 const subscriber = redis.duplicate();
 
+/** Ping cadence; a device that misses one round trip is treated as gone. */
+const HEARTBEAT_MS = 30_000;
+
 /** The single connected traffic light; a new connection supersedes the old. */
 let device: WebSocket | null = null;
+let deviceAlive = false;
 let lastDeviceWrite = 0;
 let lastWritten = '';
 
@@ -151,6 +156,10 @@ server.on('upgrade', (req, socket, head) => {
 wss.on('connection', async (ws) => {
 	device?.close(4000, 'superseded');
 	device = ws;
+	deviceAlive = true;
+	ws.on('pong', () => {
+		if (device === ws) deviceAlive = true;
+	});
 
 	ws.on('message', async (data) => {
 		let parsed;
@@ -182,10 +191,17 @@ wss.on('connection', async (ws) => {
 	await sendHello();
 });
 
-// Local dev: `pnpm exec tsx api/device.ts` — Vercel ignores this and uses the export.
-if (!process.env.VERCEL) {
-	const port = Number(process.env.DEVICE_WS_PORT ?? 3001);
-	server.listen(port, () => console.log(`device ws listening on :${port}`));
-}
+// Wifi can vanish without a FIN, leaving a half-open socket that silently
+// swallows jobs; the ping is what surfaces that.
+setInterval(() => {
+	if (!device) return;
+	if (!deviceAlive) {
+		device.terminate(); // 'close' clears `device`
+		return;
+	}
+	deviceAlive = false;
+	device.ping();
+}, HEARTBEAT_MS).unref();
 
-export default server;
+const port = Number(process.env.DEVICE_WS_PORT ?? 3001);
+server.listen(port, () => console.log(`device ws listening on :${port}`));

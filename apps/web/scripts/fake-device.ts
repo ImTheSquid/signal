@@ -20,7 +20,7 @@ let running = 'idle';
 let jobTimer: NodeJS.Timeout | null = null;
 let reconnectDelay = 1000;
 // Messages always go out on the live connection — a job may outlive the
-// socket it arrived on (the server recycles every ≤300s on Vercel).
+// socket it arrived on (a redeploy or dropped ping reconnects mid-job).
 let currentWs: WebSocket | null = null;
 
 function log(...args: unknown[]) {
