@@ -7,3 +7,9 @@ ws_url = "ws://192.168.1.100:3001"
 device_token = "dev-device-token"
 # Set true if your relay board switches on LOW
 active_low = false
+# Minimum ms a lamp holds a state before its relay may move again. 100ms (~10Hz)
+# leaves roughly 6x margin over a mechanical relay's operate+release time.
+min_lamp_dwell_ms = 100
+# UDP port dmx_recv() listens on. Not 6454 (Art-Net) or 5568 (sACN) so a
+# DMX-adjacent LAN can't reach it by accident.
+dmx_port = 49500

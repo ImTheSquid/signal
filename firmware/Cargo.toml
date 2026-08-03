@@ -1,6 +1,6 @@
 [package]
 name = "firmware"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Jack Hogan <jackhogan11@gmail.com>"]
 edition = "2021"
 resolver = "2"
@@ -27,6 +27,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml-cfg = "0.2"
 script-env = { path = "../crates/script-env" }
+wsframe = { path = "../crates/wsframe" }
 
 [build-dependencies]
 embuild = "0.33"

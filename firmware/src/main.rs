@@ -1,4 +1,5 @@
 mod config;
+mod dmx;
 mod lights;
 mod script;
 mod wsproto;
@@ -21,7 +22,7 @@ use esp_idf_svc::ws::FrameType;
 use crate::config::CONFIG;
 use crate::lights::Lights;
 use crate::script::{LastHolderInfo, Outcome, RunKind, Runner, SharedLastHolder};
-use crate::wsproto::{DeviceMsg, LightsJson, ServerMsg};
+use crate::wsproto::{DeviceMsg, JsonFramer, LightsJson, ServerMsg};
 
 const HEARTBEAT: Duration = Duration::from_secs(20);
 const WIFI_CHECK: Duration = Duration::from_secs(10);
@@ -44,7 +45,9 @@ loop {
 
 pub enum AppEvent {
     WsConnected,
-    WsText(String),
+    /// Already parsed: the framer that reassembles fragments deserializes as it
+    /// goes, so there is no second parse here.
+    WsMsg(ServerMsg),
     ScriptDone {
         run_gen: u64,
         kind: RunKind,
@@ -124,10 +127,7 @@ impl App {
                 log::info!("websocket connected");
                 // The server sends `hello` for resync; nothing to do here.
             }
-            AppEvent::WsText(text) => match serde_json::from_str::<ServerMsg>(&text) {
-                Ok(msg) => self.handle_server_msg(msg),
-                Err(e) => log::warn!("unparseable server message: {e}"),
-            },
+            AppEvent::WsMsg(msg) => self.handle_server_msg(msg),
             AppEvent::ScriptDone {
                 run_gen,
                 kind,
@@ -219,6 +219,23 @@ impl App {
     }
 }
 
+/// Feed received bytes through the framer and forward whatever completes.
+fn deliver(
+    framer: &std::sync::Mutex<JsonFramer<ServerMsg>>,
+    tx: &Sender<AppEvent>,
+    bytes: &[u8],
+) {
+    let Ok(mut framer) = framer.lock() else { return };
+    for msg in framer.push(bytes) {
+        match msg {
+            Ok(msg) => {
+                let _ = tx.send(AppEvent::WsMsg(msg));
+            }
+            Err(e) => log::warn!("bad server message: {e}"),
+        }
+    }
+}
+
 fn send(client: &mut EspWebSocketClient<'_>, msg: &DeviceMsg<'_>) {
     if !client.is_connected() {
         return;
@@ -291,6 +308,7 @@ fn main() -> Result<()> {
         peripherals.pins.gpio33.degrade_output(),
         peripherals.pins.gpio25.degrade_output(),
         CONFIG.active_low,
+        Duration::from_millis(CONFIG.min_lamp_dwell_ms),
     )?);
 
     let (tx, rx): (Sender<AppEvent>, Receiver<AppEvent>) = mpsc::channel();
@@ -326,14 +344,46 @@ fn main() -> Result<()> {
     };
     let mut client = EspWebSocketClient::new(CONFIG.ws_url, &ws_config, Duration::from_secs(10), {
         let tx = tx.clone();
+        // Messages arrive in receive-buffer-sized chunks with no length info, so
+        // they have to be reframed before parsing. Mutex because the callback is
+        // Fn, not FnMut.
+        let framer: std::sync::Mutex<JsonFramer<ServerMsg>> =
+            std::sync::Mutex::new(JsonFramer::new());
         move |event: &Result<WebSocketEvent<'_>, esp_idf_svc::io::EspIOError>| {
             if let Ok(event) = event {
                 match &event.event_type {
                     WebSocketEventType::Connected => {
+                        // A fragment left over from the previous session would
+                        // corrupt the first message of this one.
+                        if let Ok(mut framer) = framer.lock() {
+                            framer.reset();
+                        }
                         let _ = tx.send(AppEvent::WsConnected);
                     }
+                    // Drop a partial as soon as the link goes, not just on the
+                    // next connect. A message cut in half by a network drop would
+                    // otherwise be held for the whole dead-connection window, and
+                    // a half-received 16KB job script is heap this device cannot
+                    // spare — free heap is ~33KB while any script is running.
+                    WebSocketEventType::Disconnected
+                    | WebSocketEventType::Close(_)
+                    | WebSocketEventType::Closed => {
+                        if let Ok(mut framer) = framer.lock() {
+                            if framer.is_partial() {
+                                log::warn!("link closed mid-message; discarding partial");
+                            }
+                            framer.reset();
+                        }
+                    }
+                    // Binary is the normal path: bytes arrive unvalidated, so a
+                    // multi-byte character split across chunks survives. Text is
+                    // still accepted so the server and firmware can be deployed
+                    // in either order.
+                    WebSocketEventType::Binary(bytes) => {
+                        deliver(&framer, &tx, bytes);
+                    }
                     WebSocketEventType::Text(text) => {
-                        let _ = tx.send(AppEvent::WsText(text.to_string()));
+                        deliver(&framer, &tx, text.as_bytes());
                     }
                     _ => {}
                 }

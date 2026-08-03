@@ -50,7 +50,12 @@ function authorized(req: http.IncomingMessage): boolean {
 }
 
 function send(msg: ServerMsg): void {
-	if (device?.readyState === WebSocket.OPEN) device.send(JSON.stringify(msg));
+	// Binary, not text. esp-idf-svc validates UTF-8 per receive-buffer chunk on a
+	// text frame and drops the chunk if a multi-byte character straddles the
+	// boundary, which voids the whole message — one em dash in a script comment is
+	// enough. Binary frames are handed to the firmware as raw bytes and validated
+	// once over the reassembled document.
+	if (device?.readyState === WebSocket.OPEN) device.send(Buffer.from(JSON.stringify(msg)));
 }
 
 async function currentJobMsg(): Promise<ServerMsg | null> {

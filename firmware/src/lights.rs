@@ -1,11 +1,13 @@
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use esp_idf_svc::hal::gpio::{AnyOutputPin, Output, PinDriver};
 
 const R: u8 = 1 << 0;
 const Y: u8 = 1 << 1;
 const G: u8 = 1 << 2;
+const MASKS: [u8; 3] = [R, Y, G];
 
 /// Relay driver for the three lamps. Shared between the script thread
 /// (writes) and the main loop (reads state for heartbeats).
@@ -14,6 +16,10 @@ pub struct Lights {
     state: AtomicU8,
     dirty: AtomicBool,
     active_low: bool,
+    /// Per-lamp time of the last physical transition, paired with `min_dwell`
+    /// to keep scripts from chattering the contacts.
+    last_change: Mutex<[Option<Instant>; 3]>,
+    min_dwell: Duration,
 }
 
 impl Lights {
@@ -22,6 +28,7 @@ impl Lights {
         yellow: AnyOutputPin<'static>,
         green: AnyOutputPin<'static>,
         active_low: bool,
+        min_dwell: Duration,
     ) -> anyhow::Result<Self> {
         let lights = Lights {
             pins: Mutex::new([
@@ -32,9 +39,31 @@ impl Lights {
             state: AtomicU8::new(0),
             dirty: AtomicBool::new(false),
             active_low,
+            last_change: Mutex::new([None; 3]),
+            min_dwell,
         };
         lights.set(false, false, false);
         Ok(lights)
+    }
+
+    /// When the relays may next move to `(r, y, g)`, or `None` if now.
+    /// Callers block on this instead of dropping writes, so the lamps always
+    /// reach the state the script asked for — just no faster than the
+    /// hardware can follow.
+    pub fn ready_at(&self, r: bool, y: bool, g: bool) -> Option<Instant> {
+        let changing = pack(r, y, g) ^ self.state.load(Ordering::SeqCst);
+        if changing == 0 {
+            return None;
+        }
+        let now = Instant::now();
+        let last = self.last_change.lock().unwrap();
+        MASKS
+            .iter()
+            .zip(last.iter())
+            .filter(|(mask, _)| changing & **mask != 0)
+            .filter_map(|(_, at)| at.map(|at| at + self.min_dwell))
+            .filter(|at| *at > now)
+            .max()
     }
 
     pub fn set(&self, r: bool, y: bool, g: bool) {
@@ -46,9 +75,17 @@ impl Lights {
                 log::warn!("gpio write failed: {e}");
             }
         }
-        let bits = (r as u8 * R) | (y as u8 * Y) | (g as u8 * G);
-        if self.state.swap(bits, Ordering::SeqCst) != bits {
+        let bits = pack(r, y, g);
+        let prev = self.state.swap(bits, Ordering::SeqCst);
+        if prev != bits {
             self.dirty.store(true, Ordering::SeqCst);
+            let now = Instant::now();
+            let mut last = self.last_change.lock().unwrap();
+            for (at, mask) in last.iter_mut().zip(MASKS) {
+                if (prev ^ bits) & mask != 0 {
+                    *at = Some(now);
+                }
+            }
         }
     }
 
@@ -61,4 +98,8 @@ impl Lights {
     pub fn take_dirty(&self) -> bool {
         self.dirty.swap(false, Ordering::SeqCst)
     }
+}
+
+fn pack(r: bool, y: bool, g: bool) -> u8 {
+    (r as u8 * R) | (y as u8 * Y) | (g as u8 * G)
 }

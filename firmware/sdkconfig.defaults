@@ -2,6 +2,13 @@
 # You might have to increase this further if you allocate large stack variables in the main task
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
 
+# NB: no partition table is set here, and none of the stock ones would fit.
+# Rhai plus the wifi/TLS stack builds to ~2.3MB, while single-app is 1M and
+# single-app-large is 1500K. This works because espflash ignores the IDF table
+# and writes its own 0x3F0000 (3.9MB) app layout — the app sits at ~57% of that.
+# Consequence: flash with espflash (`cargo run`). A plain `idf.py` build, or
+# passing --partition-table explicitly, will fail with "app partition too small".
+
 # wss:// cert validation against the built-in CA bundle
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 

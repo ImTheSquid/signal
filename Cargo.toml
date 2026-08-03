@@ -1,11 +1,25 @@
 [workspace]
 resolver = "2"
-members = ["crates/script-env", "crates/validator"]
-# Different toolchain (xtensa) and build env; built from firmware/ directly.
-exclude = ["firmware"]
+members = ["crates/script-env", "crates/validator", "crates/wsframe"]
+# Different toolchain (xtensa) and build env; built from their own dirs.
+exclude = ["firmware", "dmx-bridge"]
 
 [workspace.dependencies]
 # Restriction features shared by validator and firmware so both sides parse
 # the same language. `no_time` keeps the wasm32-unknown-unknown build free of
 # Instant, which doesn't exist on that target.
-rhai = { version = "1", features = ["only_i64", "no_closure", "no_module", "no_float", "no_time"] }
+#
+# `f32_float` rather than plain float support: rhai's FLOAT is f64 by default,
+# and both the ESP32 and the S3 have a single-precision FPU only, so f64 would
+# be software-emulated. f32 is what the hardware actually accelerates.
+#
+# `no_closure` stays on. Closures capture through shared cells (Rc/RefCell),
+# which is heap churn on a board already near its floor, and nothing in the
+# script API needs them — the DMX loop is straight-line integer and float math.
+rhai = { version = "1", features = [
+    "only_i64",
+    "no_closure",
+    "no_module",
+    "no_time",
+    "f32_float",
+] }

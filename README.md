@@ -20,6 +20,8 @@ Everything runs on one box behind nginx — see [deploy/home-app/](deploy/home-a
 - **crates/validator** → **packages/validator-wasm** — `Engine::compile` compiled to WASM; `POST /v1/script` rejects scripts that won't parse, with line/col errors.
 - **packages/protocol** — zod schemas + constants for the wire protocol and Redis keys.
 - **firmware** — Rust (esp-idf) for an ESP32-WROOM-32E: wifi → SNTP → websocket, Rhai engine in a dedicated thread, three relay GPIOs (32/33/25 = R/Y/G).
+- **dmx-bridge** — Rust (esp-idf) for an ESP32-S3 that presents FTDI descriptors over USB so **rekordbox lighting** drives the signal. It reassembles the DMX512 stream rekordbox writes and forwards raw channel values over LAN UDP to `dmx_recv()`. See `dmx-bridge/README.md`.
+- **scripts** — `follow.rhai` (the DMX-following job worth running) and `logcat.mjs` (collector for the bridge's UDP logs).
 
 Locking: one lock at a time, `SET NX PX` + owner-checked Lua. Lock expiry is enforced *on the device* via relative TTLs, so the light returns to its idle script even if wifi dies mid-script. When nobody holds the lock the device runs an admin-editable idle script (falling back to a built-in green/yellow/red cycle).
 
@@ -57,13 +59,61 @@ curl $BASE/v1/status
 
 ### Script environment
 
-Scripts are Rhai with integers only (no floats/maps/modules/eval) and these functions:
+Scripts are Rhai with `i64` integers and `f32` floats (no closures/modules/eval). Floats are
+single-precision deliberately: rhai's default `FLOAT` is `f64`, which the ESP32's
+single-precision FPU would have to emulate in software. Convert with `to_float()` — there is
+no `as float` cast. These functions are available:
 
 | fn | effect |
 |---|---|
 | `set_lights(r, y, g)` | set the three lamps (bools) |
 | `sleep(ms)` | pause; also how your script yields |
 | `millis()` | ms since your script started |
+| `dmx_recv(timeout_ms)` | `#{ ok, base, seq, ch }` — newest DMX frame from the bridge, or `ok: false` on timeout |
+
+The lamps are driven by mechanical relays, so `set_lights` enforces a minimum dwell per
+lamp (`min_lamp_dwell_ms`, default 100ms — about 10Hz). Asking for changes faster than
+that does not drop them: the call blocks until the relay may move, so a strobe script
+runs at the cap rather than doing something you didn't write. Blocked calls still honor
+your lock expiry. Above roughly 10Hz a relay can't mechanically follow anyway (operate
+plus release is around 15ms), and its timing variance is the floor on how tight any
+animation can be.
+
+`dmx_recv` receives DMX channel values forwarded by the **dmx-bridge** (see `dmx-bridge/`),
+which presents itself to rekordbox as an Enttec DMX interface. It binds a UDP socket
+(`dmx_port`, default 49500) on first call and drops it when your script ends, so the port
+is only open while a script is asking for it. Each call drains everything queued and
+returns only the newest frame — bursts are coalesced, never replayed. It blocks like
+`sleep`, so lock expiry and the kill switch still land within 50ms.
+
+The values are **raw**, deliberately: thresholding and the channel-to-lamp mapping are
+yours to decide, so they can change without reflashing anything.
+
+| field | meaning |
+|---|---|
+| `ok` | a frame arrived within the timeout |
+| `ch` | array of raw 0-255 channel values; `ch[0]` is channel `base` |
+| `base` | DMX channel number `ch[0]` holds, so you can locate a fixture without knowing how the bridge is configured |
+| `seq` | sender's frame counter; gaps mean dropped datagrams |
+
+On timeout `ok` is false and `ch` is **empty**, so a script that ignores `ok` gets an index
+error rather than quietly acting on an all-zero frame. If the socket cannot bind at all the
+call raises a script error instead of timing out forever, since a silent no-op looks
+identical to an idle sender.
+
+Patched as a 3-channel RGB fixture, channel 1 is red, 2 green, 3 blue — so blue drives the
+yellow lamp:
+
+```rhai
+loop {
+    let p = dmx_recv(50);
+    if p.ok { set_lights(p.ch[0] >= 128, p.ch[2] >= 128, p.ch[1] >= 128); }
+}
+```
+
+That literal version reads as "off most of the time" in practice — rekordbox drives the fixture
+only ~28% of a set, and a fixed 128 cut discards nearly half of that. `scripts/follow.rhai` is
+the version worth actually running; see `scripts/README.md` for the measurements behind it.
 
 The script is killed when your lock expires (`sleep` wakes every 50ms to check). Busy loops without `sleep` die early against the 5M-operation cap — use `sleep`. Runtime errors (wrong arity, unknown function) surface in the dashboard history, not at submit time; only parse errors are caught at `POST /v1/script`.
 

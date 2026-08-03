@@ -1,5 +1,10 @@
 //! Wire messages, mirroring packages/protocol (zod schemas are authoritative).
+//!
+//! Reassembly of fragmented frames lives in the `wsframe` crate, which exists so
+//! it can carry tests — see the note there.
 use serde::{Deserialize, Serialize};
+
+pub use wsframe::JsonFramer;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "t")]

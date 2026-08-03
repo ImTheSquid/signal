@@ -7,8 +7,19 @@ use std::time::{Duration, Instant};
 use script_env::rhai::{Dynamic, EvalAltResult};
 use script_env::Handlers;
 
+use crate::config::CONFIG;
+use crate::dmx::DmxSocket;
 use crate::lights::Lights;
 use crate::AppEvent;
+
+/// Bound on first use, and only once — retrying a failed bind on every call
+/// would hammer the port at the script's poll rate. The reason is kept so every
+/// subsequent call can report it.
+enum DmxState {
+    Unbound,
+    Bound(DmxSocket),
+    Failed(String),
+}
 
 /// The last completed job's holder, shared with idle-script engines so
 /// `get_last_holder()` can report it.
@@ -25,8 +36,9 @@ pub type SharedLastHolder = Arc<Mutex<Option<LastHolderInfo>>>;
 /// kept lean because this allocation exists whenever any script (incl. idle)
 /// is running and the board lives close to the heap floor.
 const SCRIPT_STACK_BYTES: usize = 32 * 1024;
-/// Abort latency bound: sleep() wakes at least this often to check the flag.
-const SLEEP_CHUNK: Duration = Duration::from_millis(50);
+/// Abort latency bound: blocking script calls wake at least this often to
+/// check the flag.
+pub(crate) const SLEEP_CHUNK: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RunKind {
@@ -155,7 +167,26 @@ fn run_script(
         Handlers {
             set_lights: Box::new({
                 let lights = lights.clone();
-                move |r, y, g| lights.set(r, y, g)
+                let abort = abort.clone();
+                move |r, y, g| {
+                    // Relays need dwell time between transitions. Make the
+                    // script wait rather than drop the write, so the lamps
+                    // still end up where it asked. Chunked like sleep() so a
+                    // throttled script stays killable.
+                    while let Some(until) = lights.ready_at(r, y, g) {
+                        if abort.load(Ordering::SeqCst)
+                            || deadline.is_some_and(|d| Instant::now() >= d)
+                        {
+                            return;
+                        }
+                        let now = Instant::now();
+                        if until <= now {
+                            break;
+                        }
+                        std::thread::sleep(SLEEP_CHUNK.min(until - now));
+                    }
+                    lights.set(r, y, g)
+                }
             }),
             sleep: Box::new({
                 let abort = abort.clone();
@@ -173,6 +204,46 @@ fn run_script(
                 }
             }),
             millis: Box::new(move || start.elapsed().as_millis() as i64),
+            dmx_recv: Box::new({
+                let abort = abort.clone();
+                // Bound lazily so a script that never calls dmx_recv never
+                // opens a port, and dropped with the run so the next one can
+                // rebind. Mutex because Handlers is Fn, not FnMut.
+                let state = Mutex::new(DmxState::Unbound);
+                move |timeout_ms| {
+                    let mut state = state.lock().unwrap();
+                    if matches!(*state, DmxState::Unbound) {
+                        *state = match DmxSocket::bind(CONFIG.dmx_port) {
+                            Ok(socket) => DmxState::Bound(socket),
+                            Err(e) => DmxState::Failed(format!(
+                                "cannot bind udp/{}: {e}",
+                                CONFIG.dmx_port
+                            )),
+                        };
+                    }
+                    let socket = match &mut *state {
+                        DmxState::Bound(socket) => socket,
+                        // Surface it every call: a script silently timing out
+                        // forever is indistinguishable from an idle sender.
+                        DmxState::Failed(why) => return Err(why.clone()),
+                        DmxState::Unbound => unreachable!("just initialised"),
+                    };
+                    Ok(socket
+                        .recv(
+                            Duration::from_millis(timeout_ms.max(0) as u64),
+                            SLEEP_CHUNK,
+                            &|| {
+                                abort.load(Ordering::SeqCst)
+                                    || deadline.is_some_and(|d| Instant::now() >= d)
+                            },
+                        )
+                        .map(|f| script_env::DmxFrame {
+                            seq: f.seq as i64,
+                            base: f.base as i64,
+                            channels: f.channels,
+                        }))
+                }
+            }),
         },
     );
 
