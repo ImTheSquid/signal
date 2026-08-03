@@ -37,7 +37,13 @@ Two implementation notes, both learned the hard way:
 ## `follow.rhai`
 
 The Rhai script the light runs to follow rekordbox lighting via **dmx-bridge**. It needs no
-firmware change, so tune it freely. `run-follow.sh` is the easy way to run it; by hand it is:
+firmware change, so tune it freely.
+
+**The file carries no comments and this section is its documentation.** Every byte is a heap
+transient on a device that reboots on a failed allocation, and the explanation is more useful
+here than inline; the design rationale below is the comment block that used to be at the top.
+
+`run-follow.sh` is the easy way to run it; by hand it is:
 
 ```sh
 BASE=https://signal.jackhogan.me
@@ -75,9 +81,26 @@ onsets. Onset intervals are octave-folded into 280-1000ms and fed to an agreemen
 giving a beat period and a phase anchor. Three disagreeing intervals in a row are read as a
 track change and taken as the new tempo.
 
-The pattern then renders on a quarter-beat grid inside the palette, choosing every 8 beats from
-six looks — pump, chase, stab, offbeat, energy-driven build, scatter — with each onset punching
-the whole palette through as an accent.
+The pattern then renders on a quarter-beat grid inside the palette, re-rolling `look` every
+`LOOK_BEATS` beats. Each onset punches the whole palette through for one dwell period as an
+accent, over whatever look is running.
+
+| `look` | name | what it does |
+|---|---|---|
+| 0 | pump | palette on the front half of every cycle; breathes |
+| 1 | chase | one palette lamp per half cycle, walking |
+| 2 | stab | two hits per cycle with gaps, so the off is as loud as the on |
+| 3 | offbeat | skips the downbeat entirely; syncopated against the track |
+| 4 | build | one lamp when quiet, whole palette flickering at quarter resolution when loud |
+| 5 | scatter | one or two palette lamps, re-rolled every quarter |
+
+The chase, build and scatter looks walk a slot count of **at least two**, where a slot past the
+end of the palette means all off. Without that, a colour lighting only one lamp made three of
+the six looks completely static — measured as 6 transitions across a 6s green-only passage.
+
+After `DEAD_MS` with no DMX at all the bridge is assumed gone and the light falls back to a slow
+wander. Deliberately neither a red-yellow-green sequence nor all three lamps at 1Hz: the first
+would read as an ordinary traffic light, the second is the firmware's fault signal.
 
 Two hardware facts shape the rendering:
 
@@ -103,18 +126,27 @@ quarter-beat grid of the tempo playing, versus the grid of a tempo that is not:
 | 128 BPM | 0.594 | 0.018 | 0.054 |
 | 100 BPM | 0.429 | 0.019 | 0.056 |
 
-Density measures 6.0 transitions/s against a 469ms beat, 4/s through the blackout.
+Density measures 6.2 transitions/s against a 469ms beat, 4/s through the blackout.
 
 ### Tuning
 
-The constants are at the top of the file with a comment each. The ones worth touching first:
+All of them are `let` bindings at the top of the file, in this order:
 
 | name | effect |
 |---|---|
 | `LAMP_CUT` | normalised level at which a lamp joins the palette; lower lights more lamps together |
 | `LOOK_BEATS` | beats before a new look is chosen; lower changes character more often |
-| `THR_MULT` | onset sensitivity; lower finds more onsets and more accents |
-| `PEAK_DECAY` | how fast the AGC ceiling falls; lower adapts quicker to a dimmer track |
+| `THR_MULT`, `THR_BIAS` | onset sensitivity against the adaptive floor; lower finds more onsets and more accents |
+| `PEAK_DECAY` | how fast the AGC ceiling falls, per step; lower adapts quicker to a dimmer track |
+| `PEAK_FLOOR` | raw floor under the AGC ceiling, so a dark passage cannot amplify noise |
+| `DARK` | normalised level below which a frame carries no colour and the palette latches |
+| `STEP` | decision cadence in ms; kept above the ~41Hz DMX rate |
+| `FLUX_SMOOTH`, `THR_SMOOTH` | EMA rates for the flux signal and its floor |
+| `REFRACT` | minimum ms between onsets |
+| `BEAT_MIN`, `BEAT_MAX` | the octave-folding window, 214 to 60 BPM |
+| `BEAT_GAP` | an onset interval longer than this says nothing about tempo |
+| `AGREE_PCT` | how far an interval may sit from the estimate and still be folded in |
+| `DEAD_MS` | DMX silence before the bridge is assumed gone |
 
 Re-run `cargo test -p script-env --test follow` after any change — the thresholds there are set
 from measurements, so a regression in density or dwell shows up immediately.
