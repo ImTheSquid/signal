@@ -32,6 +32,18 @@ pub struct Handlers {
     /// Deliberately raw: thresholding and the channel-to-lamp mapping are the
     /// script's business, so they can change without reflashing anything.
     pub dmx_recv: Box<dyn Fn(i64) -> Result<Option<DmxFrame>, String> + Send + Sync>,
+    /// A fresh uniformly-distributed u32 per call.
+    ///
+    /// Rhai ships no RNG, and the `no_time` pin leaves a script no clock to
+    /// improvise one from, so without this every run of a pattern is identical —
+    /// which is exactly what makes generated lighting read as mechanical.
+    pub random_u32: Box<dyn Fn() -> u32 + Send + Sync>,
+    /// The configured minimum relay dwell in ms.
+    ///
+    /// A script that asks for transitions faster than this gets throttled, which
+    /// silently distorts its timing. Exposing the number lets one pace itself to
+    /// the hardware it is actually running on instead of assuming.
+    pub lamp_dwell_ms: Box<dyn Fn() -> i64 + Send + Sync>,
 }
 
 /// A DMX frame as handed to a script.
@@ -51,6 +63,19 @@ impl Handlers {
             sleep: Box::new(|_| {}),
             millis: Box::new(|| 0),
             dmx_recv: Box::new(|_| Ok(None)),
+            // Deterministic for validation: a compile-only pass must not depend
+            // on entropy, and tests want reproducible sequences.
+            random_u32: Box::new(|| {
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static STATE: AtomicU32 = AtomicU32::new(0x9E37_79B9);
+                let mut x = STATE.load(Ordering::Relaxed);
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                STATE.store(x, Ordering::Relaxed);
+                x
+            }),
+            lamp_dwell_ms: Box::new(|| 0),
         }
     }
 }
@@ -58,7 +83,13 @@ impl Handlers {
 /// Apply the sandbox limits. Parse-time limits (expression depth) also make
 /// `Engine::compile` reject pathological inputs during validation.
 pub fn apply_limits(engine: &mut Engine) {
-    engine.set_max_operations(5_000_000);
+    // No operation cap. A script doing real signal analysis on a 40Hz DMX stream
+    // burns 5M operations in about ten minutes, so the cap ended shows rather
+    // than protecting anything. What actually bounds a run is the job TTL (which
+    // the lock's remaining time sets) and the abort flag; the progress callback
+    // still yields for the watchdog on every engine, so an unbounded count
+    // cannot starve the system. 0 means unlimited in rhai.
+    engine.set_max_operations(0);
     engine.set_max_call_levels(16);
     engine.set_max_expr_depths(32, 16);
     engine.set_max_string_size(4 * 1024);
@@ -71,10 +102,80 @@ pub fn apply_limits(engine: &mut Engine) {
 
 /// Register the script-facing API.
 pub fn register_api(engine: &mut Engine, handlers: Handlers) {
-    let Handlers { set_lights, sleep, millis, dmx_recv } = handlers;
+    let Handlers {
+        set_lights,
+        sleep,
+        millis,
+        dmx_recv,
+        random_u32,
+        lamp_dwell_ms,
+    } = handlers;
     engine.register_fn("set_lights", move |r: bool, y: bool, g: bool| set_lights(r, y, g));
-    engine.register_fn("sleep", move |ms: i64| sleep(ms));
-    engine.register_fn("millis", move || millis());
+
+    // sleep_until needs both, so they are shared rather than moved.
+    let sleep = std::sync::Arc::new(sleep);
+    let millis = std::sync::Arc::new(millis);
+    engine.register_fn("sleep", {
+        let sleep = sleep.clone();
+        move |ms: i64| sleep(ms)
+    });
+    engine.register_fn("millis", {
+        let millis = millis.clone();
+        move || millis()
+    });
+    // sleep_until(t) instead of sleep(period): a pattern built from relative
+    // sleeps accumulates every delay the work in between cost — and set_lights
+    // blocks for the relay dwell — so its period drifts long and it slides off
+    // the beat. Against an absolute target the error cannot accumulate.
+    engine.register_fn("sleep_until", {
+        let sleep = sleep.clone();
+        let millis = millis.clone();
+        move |target_ms: i64| {
+            let remaining = target_ms - millis();
+            if remaining > 0 {
+                sleep(remaining);
+            }
+        }
+    });
+
+    engine.register_fn("lamp_dwell_ms", move || lamp_dwell_ms());
+
+    // Random, because a pattern that repeats identically reads as mechanical.
+    // Two draws per value so the range math cannot overflow and a large range
+    // still gets full resolution.
+    let random_u32 = std::sync::Arc::new(random_u32);
+    let random_u64 = {
+        let random_u32 = random_u32.clone();
+        move || ((random_u32() as u64) << 32) | random_u32() as u64
+    };
+    let random_u64 = std::sync::Arc::new(random_u64);
+    // [0.0, 1.0). 24 bits, which is all an f32 mantissa holds.
+    engine.register_fn("rand_float", {
+        let random_u32 = random_u32.clone();
+        move || -> rhai::FLOAT { (random_u32() >> 8) as rhai::FLOAT / 16_777_216.0 }
+    });
+    // Inclusive on both ends, which is what a script wants for channel or lamp
+    // indices. Lemire's multiply-shift rather than a modulo, so the distribution
+    // isn't skewed toward the low end of the range.
+    engine.register_fn("rand_int", {
+        let random_u64 = random_u64.clone();
+        move |lo: i64, hi: i64| -> Result<i64, Box<rhai::EvalAltResult>> {
+            if hi < lo {
+                return Err(format!("rand_int: empty range {lo}..{hi}").into());
+            }
+            let span = (hi as i128 - lo as i128 + 1) as u128;
+            let scaled = ((random_u64() as u128) * span) >> 64;
+            Ok((lo as i128 + scaled as i128) as i64)
+        }
+    });
+    // rand_chance(0.25) reads better at a call site than rand_float() < 0.25,
+    // and clamps rather than surprising a script that computed p out of range.
+    engine.register_fn("rand_chance", {
+        let random_u32 = random_u32.clone();
+        move |p: rhai::FLOAT| -> bool {
+            (random_u32() >> 8) as rhai::FLOAT / 16_777_216.0 < p
+        }
+    });
     // Returns #{ ok, base, seq, ch }. `ch` holds raw 0-255 values, `base` is the
     // DMX channel ch[0] corresponds to. On timeout `ok` is false and `ch` is
     // empty, so a script that ignores `ok` gets an index error rather than
@@ -300,6 +401,198 @@ mod tests {
                 "loop { let p = dmx_recv(50); if p.ok {                  set_lights(p.ch[0] >= 128, p.ch[2] >= 128, p.ch[1] >= 128); } }"
             )
             .is_ok());
+    }
+
+    #[test]
+    fn rand_int_stays_in_range_and_covers_it() {
+        let engine = validation_engine();
+        let out: rhai::Array = engine
+            // Under set_max_array_size, so this cannot just be a big sample.
+            .eval("let a = []; for i in 0..900 { a.push(rand_int(1, 6)); } a")
+            .unwrap();
+        let vals: Vec<i64> = out.into_iter().map(|v| v.cast()).collect();
+        assert!(vals.iter().all(|v| (1..=6).contains(v)), "out of range");
+        for want in 1..=6 {
+            assert!(vals.contains(&want), "never produced {want}");
+        }
+    }
+
+    /// A single-value range must not be an error, and must not need special
+    /// casing at the call site.
+    #[test]
+    fn rand_int_single_value_range() {
+        let engine = validation_engine();
+        assert_eq!(engine.eval::<i64>("rand_int(7, 7)").unwrap(), 7);
+    }
+
+    #[test]
+    fn rand_int_rejects_empty_range() {
+        let engine = validation_engine();
+        let err = engine.eval::<i64>("rand_int(6, 1)").unwrap_err();
+        assert!(err.to_string().contains("empty range"), "{err}");
+    }
+
+    /// Negative bounds are the case an unsigned intermediate gets wrong.
+    #[test]
+    fn rand_int_handles_negative_bounds() {
+        let engine = validation_engine();
+        let out: rhai::Array = engine
+            .eval("let a = []; for i in 0..500 { a.push(rand_int(-5, -1)); } a")
+            .unwrap();
+        assert!(out
+            .into_iter()
+            .all(|v| (-5..=-1).contains(&v.cast::<i64>())));
+    }
+
+    /// The whole i64 range: the reason the range math goes through i128.
+    #[test]
+    fn rand_int_handles_full_range_without_overflow() {
+        let engine = validation_engine();
+        engine
+            .eval::<i64>("rand_int(-9223372036854775808, 9223372036854775807)")
+            .unwrap();
+    }
+
+    #[test]
+    fn rand_float_is_a_unit_interval() {
+        let engine = validation_engine();
+        let out: rhai::Array = engine
+            .eval("let a = []; for i in 0..1000 { a.push(rand_float()); } a")
+            .unwrap();
+        let vals: Vec<rhai::FLOAT> = out.into_iter().map(|v| v.cast()).collect();
+        assert!(vals.iter().all(|v| (0.0..1.0).contains(v)), "outside [0,1)");
+        let mean = vals.iter().sum::<rhai::FLOAT>() / vals.len() as rhai::FLOAT;
+        assert!((mean - 0.5).abs() < 0.05, "mean {mean} looks non-uniform");
+    }
+
+    #[test]
+    fn rand_chance_honors_its_probability() {
+        let engine = validation_engine();
+        let hits: i64 = engine
+            .eval("let n = 0; for i in 0..2000 { if rand_chance(0.25) { n += 1; } } n")
+            .unwrap();
+        assert!((400..=600).contains(&hits), "{hits}/2000 for p=0.25");
+    }
+
+    /// Out-of-range probabilities must be total, not surprising: p<=0 never
+    /// fires and p>=1 always does.
+    #[test]
+    fn rand_chance_clamps() {
+        let engine = validation_engine();
+        assert_eq!(
+            engine
+                .eval::<i64>("let n = 0; for i in 0..200 { if rand_chance(0.0) { n += 1; } } n")
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            engine
+                .eval::<i64>("let n = 0; for i in 0..200 { if rand_chance(1.0) { n += 1; } } n")
+                .unwrap(),
+            200
+        );
+    }
+
+    #[test]
+    fn lamp_dwell_is_visible_to_scripts() {
+        let mut engine = Engine::new();
+        apply_limits(&mut engine);
+        register_api(
+            &mut engine,
+            Handlers {
+                lamp_dwell_ms: Box::new(|| 120),
+                ..Handlers::stubs()
+            },
+        );
+        assert_eq!(engine.eval::<i64>("lamp_dwell_ms()").unwrap(), 120);
+    }
+
+    /// The point of sleep_until: it asks for the time *remaining* to an absolute
+    /// target, so work already done is absorbed instead of added on.
+    #[test]
+    fn sleep_until_subtracts_elapsed_time() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        use std::sync::Arc;
+
+        let clock = Arc::new(AtomicI64::new(0));
+        let slept = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let mut engine = Engine::new();
+        apply_limits(&mut engine);
+        register_api(
+            &mut engine,
+            Handlers {
+                millis: Box::new({
+                    let clock = clock.clone();
+                    move || clock.load(Ordering::SeqCst)
+                }),
+                sleep: Box::new({
+                    let clock = clock.clone();
+                    let slept = slept.clone();
+                    move |ms| {
+                        slept.lock().unwrap().push(ms);
+                        clock.fetch_add(ms, Ordering::SeqCst);
+                    }
+                }),
+                // 30ms of "work" per step, charged to the clock.
+                set_lights: Box::new({
+                    let clock = clock.clone();
+                    move |_, _, _| {
+                        clock.fetch_add(30, Ordering::SeqCst);
+                    }
+                }),
+                ..Handlers::stubs()
+            },
+        );
+
+        engine
+            .run(
+                "let t = 0;
+                 for i in 0..4 {
+                     t += 100;
+                     set_lights(true, false, false);
+                     sleep_until(t);
+                 }",
+            )
+            .unwrap();
+
+        // Four 100ms steps land at 400ms even though 120ms went to set_lights.
+        assert_eq!(clock.load(Ordering::SeqCst), 400);
+        assert_eq!(*slept.lock().unwrap(), vec![70, 70, 70, 70]);
+    }
+
+    /// Overrunning the target must not sleep negatively or wrap — it returns at
+    /// once and the pattern catches up on the next step.
+    #[test]
+    fn sleep_until_in_the_past_does_not_sleep() {
+        use std::sync::Arc;
+        let slept = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut engine = Engine::new();
+        apply_limits(&mut engine);
+        register_api(
+            &mut engine,
+            Handlers {
+                millis: Box::new(|| 500),
+                sleep: Box::new({
+                    let slept = slept.clone();
+                    move |ms| slept.lock().unwrap().push(ms)
+                }),
+                ..Handlers::stubs()
+            },
+        );
+        engine.run("sleep_until(200);").unwrap();
+        assert!(slept.lock().unwrap().is_empty());
+    }
+
+    /// The operation cap is off deliberately; the TTL and abort flag bound a run.
+    /// A busy loop that would have died at 5M operations must now survive.
+    #[test]
+    fn no_operation_cap() {
+        let engine = validation_engine();
+        let out: i64 = engine
+            .eval("let n = 0; for i in 0..2000000 { n += 1; } n")
+            .unwrap();
+        assert_eq!(out, 2_000_000);
     }
 
     #[test]

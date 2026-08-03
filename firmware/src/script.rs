@@ -38,7 +38,11 @@ pub type SharedLastHolder = Arc<Mutex<Option<LastHolderInfo>>>;
 const SCRIPT_STACK_BYTES: usize = 32 * 1024;
 /// Abort latency bound: blocking script calls wake at least this often to
 /// check the flag.
-pub(crate) const SLEEP_CHUNK: Duration = Duration::from_millis(50);
+///
+/// Also the poll granularity for `dmx_recv`, which is why it is 10ms and not
+/// more: DMX arrives at ~41Hz (24ms/frame), so a 50ms wake could only ever see
+/// every other frame — enough for a threshold, not enough for onset detection.
+pub(crate) const SLEEP_CHUNK: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RunKind {
@@ -146,9 +150,6 @@ fn run_script(
     let mut engine = script_env::rhai::Engine::new();
     script_env::apply_limits(&mut engine);
     if kind == RunKind::Idle {
-        // The idle script runs once per idle transition and may loop forever
-        // by design (admin-authored); the abort flag remains its kill switch.
-        engine.set_max_operations(0);
         script_env::register_idle_api(&mut engine, {
             let last_holder = last_holder.clone();
             Box::new(move || {
@@ -249,6 +250,10 @@ fn run_script(
                         }))
                 }
             }),
+            // Hardware RNG. A register read, so it is cheap enough to call per
+            // value and needs no seeding or state.
+            random_u32: Box::new(|| unsafe { esp_idf_svc::sys::esp_random() }),
+            lamp_dwell_ms: Box::new(|| CONFIG.min_lamp_dwell_ms as i64),
         },
     );
 
