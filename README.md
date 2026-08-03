@@ -197,3 +197,35 @@ cargo run                      # flashes + monitors via espflash
 ```
 
 Wiring: relays on GPIO 32 (red), 33 (yellow), 25 (green) — non-strap pins, driven low at boot; set `active_low = true` in cfg.toml if your relay board switches on LOW.
+
+### Relay wear budget
+
+The board is an ESP32-WROOM-32E carrier with four **Songle SRD-05VDC-SL-C** relays. Confirm
+against your own copy of the datasheet, but the figures that matter are:
+
+| | |
+|---|---|
+| mechanical endurance | 10<sup>7</sup> operations |
+| electrical endurance | 10<sup>5</sup> operations at rated load (10A 250VAC) |
+| max switching rate | 300 operations/min mechanical, **30/min electrical** |
+| operate / release | ≤10ms / ≤5ms |
+
+`scripts/follow.rhai` measures at **216 / 90 / 240 operations per minute** for red / yellow /
+green (`cargo test -p script-env --test follow -- --nocapture relay`). Against those figures:
+
+- **~700 hours** of running against mechanical endurance.
+- **~7 hours** against electrical endurance *at rated load* — but the lamps draw a small
+  fraction of 10A, so the true figure is far higher. How much higher depends on inrush, not
+  on steady current: these are AC LED modules with capacitive-input drivers, and the contacts
+  close at a random point in the AC cycle because there is no zero-cross switching. Inrush at
+  the wrong phase angle is what erodes contacts.
+- **8× over the 30/min electrical switching guidance**, which is the figure a denser pattern
+  makes worse.
+
+`min_lamp_dwell_ms` is the single knob: it caps transitions at `1000 / dwell` per second per
+lamp, so raising it from 100ms trades density for contact life linearly. Solid-state relays with
+zero-cross switching remove the constraint entirely and let `min_lamp_dwell_ms` go to 0, which
+also makes the fault signal a continuous 1Hz.
+
+The `ops` counters in device telemetry are the odometer for this, but they reset on boot — they
+measure a session, not a lifetime.

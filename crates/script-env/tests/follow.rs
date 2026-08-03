@@ -299,3 +299,44 @@ fn locks_to_the_tempo_that_is_playing() {
         );
     }
 }
+
+/// Relay wear. The lamps are switched by Songle SRD-05VDC-SL-C: 10^7 mechanical
+/// operations, but only 10^5 electrical at rated load, and the datasheet caps
+/// electrical switching at 30 operations/minute. Those are the numbers a lighting
+/// pattern spends, so the pattern's cost per lamp is a hardware budget and gets
+/// measured like one.
+#[test]
+fn relay_operations_per_lamp() {
+    let run = run_follow(BEAT_MS);
+    let mut ops = [0u32; 3];
+    let mut prev = (false, false, false);
+    for c in &run.changes {
+        if c.1 != prev.0 {
+            ops[0] += 1;
+        }
+        if c.2 != prev.1 {
+            ops[1] += 1;
+        }
+        if c.3 != prev.2 {
+            ops[2] += 1;
+        }
+        prev = (c.1, c.2, c.3);
+    }
+    let mins = run.end_ms as f64 / 60_000.0;
+    for (i, lamp) in ["red", "yellow", "green"].iter().enumerate() {
+        let per_min = ops[i] as f64 / mins;
+        let hours_to_1e5 = 100_000.0 / (per_min * 60.0);
+        println!(
+            "{lamp}: {} ops in {:.1} min = {per_min:.0}/min, \
+             {hours_to_1e5:.0}h to 10^5 electrical operations",
+            ops[i], mins
+        );
+        // The datasheet's mechanical switching ceiling. Exceeding it is not a
+        // lifetime question, it is asking the armature to move faster than it
+        // can, so this is a hard bound rather than a budget.
+        assert!(
+            per_min <= 300.0,
+            "{lamp}: {per_min:.0} ops/min exceeds the relay's 300/min mechanical limit"
+        );
+    }
+}
