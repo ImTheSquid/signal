@@ -1,0 +1,22 @@
+# Copy to cfg.toml (gitignored) and fill in. Read at compile time by toml-cfg.
+[dmx-bridge]
+wifi_ssid = "your-ssid"
+wifi_pass = "your-password"
+# Where log lines go once wifi is up. The USB console disappears when TinyUSB
+# claims the port, so this is the only way to see anything. Broadcast by
+# default so any machine on the LAN can listen without configuring an address.
+log_host = "255.255.255.255"
+log_port = 49510
+# First DMX channel of the traffic-light fixture (1-based), and how many
+# channels to forward. Three covers an RGB fixture; more lets a script react to
+# the rest of the show. Thresholding and the channel-to-lamp mapping live in the
+# Rhai script on the light, not here.
+dmx_base_channel = 1
+dmx_channel_count = 3
+# Where the traffic light listens. Give it a DHCP reservation so this stays put.
+light_host = "255.255.255.255"
+light_port = 49500
+keepalive_ms = 250
+# Grace period before TinyUSB claims the USB PHY, keeping USB-Serial-JTAG alive
+# long enough for espflash to reset and reflash. 0 for production.
+usb_start_delay_ms = 3000

@@ -1,0 +1,20 @@
+# Rust needs more main-task stack than C's 3K default.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
+
+# TinyUSB plus the wifi/TLS stack outgrows the default app partition.
+CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
+
+# These are also a bit small by default.
+CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
+CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=4096
+
+# One vendor-class interface (two bulk endpoints, no class protocol) — the shape
+# an FTDI device presents. Device and configuration descriptors are supplied at
+# runtime via tinyusb_config_t, so the Kconfig VID/PID options are unused.
+CONFIG_TINYUSB_VENDOR_COUNT=1
+
+# Console on UART0 only, which on this board leaves via the CH343 bridge and so
+# survives TinyUSB claiming the native USB PHY. The secondary USB-Serial-JTAG
+# console must be off: once OTG owns that PHY nothing drains its FIFO, and the
+# first write after USB init blocks forever — a silent, total hang.
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
