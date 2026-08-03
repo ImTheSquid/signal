@@ -9,6 +9,8 @@
 		lights: { r: boolean; y: boolean; g: boolean };
 		running: string;
 		heap: number;
+		heap_block?: number;
+		ops?: number[];
 		fw: string;
 		ts: number;
 	}
@@ -222,7 +224,11 @@
 			</svg>
 			{#if status?.device}
 				<p class="device-meta">
-					fw {status.device.fw} · heap {Math.round(status.device.heap / 1024)} KB
+					fw {status.device.fw} · heap {Math.round(status.device.heap / 1024)} KB{#if status.device.heap_block}
+						({Math.round(status.device.heap_block / 1024)} KB block){/if}
+					{#if status.device.ops}
+						<br />relay ops {status.device.ops.join(' / ')}
+					{/if}
 				</p>
 			{/if}
 		</div>

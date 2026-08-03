@@ -180,6 +180,8 @@ wss.on('connection', async (ws) => {
 				lights: msg.lights,
 				running: msg.running,
 				heap: msg.heap,
+				heap_block: msg.heap_block,
+				ops: msg.ops,
 				fw: msg.fw
 			});
 		} else if (msg.t === 'job_done') {

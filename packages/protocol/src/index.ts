@@ -169,11 +169,17 @@ export type ServerMsg = z.infer<typeof ServerMsgSchema>;
 // ---- WS messages: device -> server ----
 
 export const DeviceMsgSchema = z.discriminatedUnion("t", [
+  // Mirrors DeviceStateSchema minus `ts`, which the server stamps. heap_block
+  // and ops are optional so a device on older firmware still validates — but
+  // they must be *declared*, or zod strips them and the telemetry silently never
+  // reaches Redis.
   z.object({
     t: z.literal("state"),
     lights: LightsSchema,
     running: z.string(),
     heap: z.number(),
+    heap_block: z.number().optional(),
+    ops: z.array(z.number()).length(3).optional(),
     fw: z.string(),
   }),
   z.object({
