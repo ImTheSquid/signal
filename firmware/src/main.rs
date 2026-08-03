@@ -22,7 +22,7 @@ use esp_idf_svc::ws::FrameType;
 use crate::config::CONFIG;
 use crate::lights::Lights;
 use crate::script::{LastHolderInfo, Outcome, RunKind, Runner, SharedLastHolder};
-use crate::wsproto::{DeviceMsg, JsonFramer, LightsJson, ServerMsg};
+use crate::wsproto::{DeviceMsg, JsonFramer, LightsJson, ServerMsg, ServerMsgRaw};
 
 const HEARTBEAT: Duration = Duration::from_secs(20);
 const WIFI_CHECK: Duration = Duration::from_secs(10);
@@ -60,6 +60,27 @@ fn builtin_idle_lamps(elapsed: Duration) -> (bool, bool, bool) {
     }
 }
 
+/// A `job_done` that has not been handed to the server yet.
+///
+/// `send` drops the message if the socket is down or the write fails, and
+/// `job_done` was sent exactly once. A single transient disconnect at the moment
+/// a job ended therefore produced `running: "idle"` plus a history row that healed
+/// to `lost` — with no reboot and no dependence on script size, which is why it is
+/// an independent cause of the symptom we chased through the receive path.
+struct PendingDone {
+    id: String,
+    result: &'static str,
+    error: Option<String>,
+    since: Instant,
+    last_try: Option<Instant>,
+}
+
+/// How often to retry an unacknowledged `job_done`.
+const DONE_RETRY: Duration = Duration::from_millis(500);
+/// Stop retrying eventually; the server heals the row itself, and holding the
+/// strings forever on this heap is worse than a `lost` entry.
+const DONE_GIVE_UP: Duration = Duration::from_secs(300);
+
 /// How the light is filling idle time.
 enum Idle {
     /// The admin-set script is running through the interpreter.
@@ -90,6 +111,8 @@ struct App {
     /// Whether idle time is filled by the interpreter or the native cycle.
     idle: Idle,
     idle_restart_at: Option<Instant>,
+    /// Set when a job ends, cleared only once the server has it.
+    pending_done: Option<PendingDone>,
     runner: Runner,
     lights: Arc<Lights>,
     last_holder: SharedLastHolder,
@@ -150,6 +173,39 @@ impl App {
         }
     }
 
+    /// Try to hand a queued `job_done` to the server, rate-limited.
+    ///
+    /// Cleared only when the write succeeds. `client.send` returning Ok is not
+    /// proof of delivery, so `hello` is used as the reconciliation point: if the
+    /// server still names this job on reconnect, it never processed the result and
+    /// the retry re-arms.
+    fn flush_done(&mut self, client: &mut EspWebSocketClient<'_>) {
+        let Some(done) = self.pending_done.as_mut() else {
+            return;
+        };
+        if done.since.elapsed() > DONE_GIVE_UP {
+            log::warn!("giving up on job_done for {}", done.id);
+            self.pending_done = None;
+            return;
+        }
+        if done.last_try.is_some_and(|at| at.elapsed() < DONE_RETRY) {
+            return;
+        }
+        if !client.is_connected() {
+            return;
+        }
+        done.last_try = Some(Instant::now());
+
+        let msg = DeviceMsg::JobDone {
+            id: &done.id,
+            result: done.result,
+            error: done.error.as_deref(),
+        };
+        if send(client, &msg) {
+            self.pending_done = None;
+        }
+    }
+
     fn set_idle_script(&mut self, script: String) {
         self.idle_script = Some(script);
         self.idle_broken = false;
@@ -185,7 +241,14 @@ impl App {
                         Outcome::Aborted => ("aborted", None),
                         Outcome::Deadline => ("deadline", None),
                     };
-                    send(client, &DeviceMsg::JobDone { id: &id, result, error });
+                    self.pending_done = Some(PendingDone {
+                        id: id.clone(),
+                        result,
+                        error: error.map(str::to_owned),
+                        since: Instant::now(),
+                        last_try: None,
+                    });
+                    self.flush_done(client);
                     *self.last_holder.lock().unwrap() = Some(LastHolderInfo {
                         name: holder.unwrap_or_default(),
                         result: result.to_string(),
@@ -218,6 +281,16 @@ impl App {
     fn handle_server_msg(&mut self, msg: ServerMsg) {
         match msg {
             ServerMsg::Hello { job, idle } => {
+                // The server deletes job:current when it records a result, so a
+                // hello that no longer names our finished job proves it landed.
+                if let Some(done) = self.pending_done.as_ref() {
+                    let still_there = job.as_ref().is_some_and(|j| j.id == done.id);
+                    if !still_there {
+                        self.pending_done = None;
+                    } else if let Some(d) = self.pending_done.as_mut() {
+                        d.last_try = None; // re-arm: it never got through
+                    }
+                }
                 if let Some(idle) = idle {
                     self.set_idle_script(idle.script);
                 }
@@ -242,7 +315,7 @@ impl App {
                     self.runner.request_abort();
                 }
             }
-            ServerMsg::Idle { script, .. } => self.set_idle_script(script),
+            ServerMsg::Idle { script } => self.set_idle_script(script),
         }
     }
 
@@ -255,7 +328,7 @@ impl App {
             )
         } as u32;
         let (or_, oy, og) = self.lights.ops();
-        send(
+        let _ = send(
             client,
             &DeviceMsg::State {
                 lights: LightsJson { r, y, g },
@@ -271,13 +344,13 @@ impl App {
 
 /// Feed received bytes through the framer and forward whatever completes.
 fn deliver(
-    framer: &std::sync::Mutex<JsonFramer<ServerMsg>>,
+    framer: &std::sync::Mutex<JsonFramer<ServerMsgRaw>>,
     tx: &Sender<AppEvent>,
     bytes: &[u8],
 ) {
     let Ok(mut framer) = framer.lock() else { return };
     for msg in framer.push(bytes) {
-        match msg {
+        match msg.and_then(ServerMsg::try_from) {
             Ok(msg) => {
                 let _ = tx.send(AppEvent::WsMsg(msg));
             }
@@ -286,13 +359,19 @@ fn deliver(
     }
 }
 
-fn send(client: &mut EspWebSocketClient<'_>, msg: &DeviceMsg<'_>) {
+/// Returns whether the frame was handed to the client. Callers that must not
+/// lose a message (see `PendingDone`) keep it queued on `false`.
+fn send(client: &mut EspWebSocketClient<'_>, msg: &DeviceMsg<'_>) -> bool {
     if !client.is_connected() {
-        return;
+        return false;
     }
     let payload = serde_json::to_string(msg).expect("serializing device message");
-    if let Err(e) = client.send(FrameType::Text(false), payload.as_bytes()) {
-        log::warn!("ws send failed: {e}");
+    match client.send(FrameType::Text(false), payload.as_bytes()) {
+        Ok(_) => true,
+        Err(e) => {
+            log::warn!("ws send failed: {e}");
+            false
+        }
     }
 }
 
@@ -370,6 +449,7 @@ fn main() -> Result<()> {
         idle_broken: false,
         idle: Idle::Builtin { since: Instant::now() },
         idle_restart_at: None,
+        pending_done: None,
         runner: Runner::new(),
         lights: lights.clone(),
         last_holder: SharedLastHolder::default(),
@@ -398,7 +478,7 @@ fn main() -> Result<()> {
         // Messages arrive in receive-buffer-sized chunks with no length info, so
         // they have to be reframed before parsing. Mutex because the callback is
         // Fn, not FnMut.
-        let framer: std::sync::Mutex<JsonFramer<ServerMsg>> =
+        let framer: std::sync::Mutex<JsonFramer<ServerMsgRaw>> =
             std::sync::Mutex::new(JsonFramer::new());
         move |event: &Result<WebSocketEvent<'_>, esp_idf_svc::io::EspIOError>| {
             if let Ok(event) = event {
@@ -460,6 +540,8 @@ fn main() -> Result<()> {
                 lights.set(want.0, want.1, want.2);
             }
         }
+
+        app.flush_done(&mut client);
 
         if app.idle_restart_at.is_some_and(|at| Instant::now() >= at) {
             app.start_idle();

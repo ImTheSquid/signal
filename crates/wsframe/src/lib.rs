@@ -15,10 +15,20 @@ use serde::de::DeserializeOwned;
 /// taking the idle script with it.
 pub const DEFAULT_LIMIT: usize = 2 * 16 * 1024 + 4096;
 
-/// Capacity retained between messages. `String::drain` keeps the allocation, so
-/// without this a single large `hello` pinned tens of KB for the process
-/// lifetime — on a device with ~33KB free while a script runs.
-const KEEP_CAPACITY: usize = 2048;
+/// Capacity reserved up front and retained between messages.
+///
+/// Reserved at construction, while the heap is uncontended, so a typical message
+/// needs no growth at all later — growth is where the contiguous-allocation risk
+/// lives, since `Vec` doubles and must briefly hold both the old and new buffer.
+/// Sized above a realistic script (a 3.4KB script is ~3.5KB on the wire).
+///
+/// Deliberately not the full limit: that is ~36KB (a `hello` can carry two 16KB
+/// scripts), and 144KB idle minus 36KB reserved minus ~111KB for engine and stack
+/// is negative. Reserving everything would cause the failure it is meant to avoid.
+///
+/// Also the floor kept after draining: `drain` retains the allocation, so without
+/// a shrink one large `hello` would pin tens of KB for the process lifetime.
+const KEEP_CAPACITY: usize = 4096;
 
 /// Reassembles websocket text fragments into whole JSON messages.
 ///
@@ -72,7 +82,7 @@ impl<T: DeserializeOwned> JsonFramer<T> {
     /// without end.
     pub fn with_limit(limit: usize) -> Self {
         JsonFramer {
-            buf: Vec::new(),
+            buf: Vec::with_capacity(KEEP_CAPACITY.min(limit)),
             limit,
             _msg: PhantomData,
         }
@@ -363,6 +373,34 @@ mod tests {
         let h = got.into_iter().next().unwrap().expect("must parse");
         assert_eq!(h.t, "hello");
         assert!(h.job.is_some() && h.idle.is_some());
+    }
+
+    /// Reserved at construction, so a typical script needs no growth at all —
+    /// growth is where the contiguous-allocation risk lives.
+    #[test]
+    fn capacity_is_reserved_up_front() {
+        let f: JsonFramer<Msg> = JsonFramer::new();
+        assert!(
+            f.buf.capacity() >= 4096,
+            "reserved only {}",
+            f.buf.capacity()
+        );
+    }
+
+    #[test]
+    fn a_typical_script_needs_no_growth() {
+        let mut f: JsonFramer<Msg> = JsonFramer::new();
+        let before = f.buf.capacity();
+        // A 3.4KB script, the size actually submitted, in 1KB chunks.
+        let doc = job_doc(3400);
+        for chunk in doc.as_bytes().chunks(1024) {
+            f.push(chunk);
+        }
+        assert_eq!(
+            f.buf.capacity(),
+            before,
+            "buffer grew for a message that should fit the reservation"
+        );
     }
 
     /// A large message must not pin its buffer for the process lifetime: `drain`

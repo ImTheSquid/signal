@@ -6,30 +6,72 @@ use serde::{Deserialize, Serialize};
 
 pub use wsframe::JsonFramer;
 
+/// The wire shape, deserialized flat.
+///
+/// Deliberately NOT an internally-tagged enum. `#[serde(tag = "t")]` cannot know
+/// the variant until it has found `t`, so it buffers the **entire** document into
+/// a `serde::private::de::Content` tree first. For a 3.4KB job that measured as a
+/// large part of a 14.1KB receive transient, against ~33KB free — and on this
+/// target a failed allocation aborts and reboots the board. A flat struct streams
+/// field by field with no intermediate tree.
+///
+/// [`ServerMsg`] is the typed form; this exists only to get the bytes in cheaply.
 #[derive(Debug, Deserialize)]
-#[serde(tag = "t")]
+pub struct ServerMsgRaw {
+    pub t: String,
+    // hello
+    pub job: Option<JobPayload>,
+    pub idle: Option<IdlePayload>,
+    // job
+    pub id: Option<String>,
+    pub holder: Option<String>,
+    // job and idle both carry a script at the top level
+    pub script: Option<String>,
+    pub ttl_ms: Option<u64>,
+    pub rev: Option<u64>,
+}
+
+/// What the rest of the firmware matches on.
+#[derive(Debug)]
 pub enum ServerMsg {
-    #[serde(rename = "hello")]
     Hello {
         job: Option<JobPayload>,
         idle: Option<IdlePayload>,
     },
-    #[serde(rename = "job")]
     Job {
         id: String,
-        #[serde(default)]
         holder: String,
         script: String,
         ttl_ms: u64,
     },
-    #[serde(rename = "abort")]
     Abort,
-    #[serde(rename = "idle")]
     Idle {
         script: String,
-        #[allow(dead_code)] // present on the wire; device state is script-only
-        rev: u64,
     },
+}
+
+impl TryFrom<ServerMsgRaw> for ServerMsg {
+    type Error = String;
+
+    fn try_from(raw: ServerMsgRaw) -> Result<Self, Self::Error> {
+        match raw.t.as_str() {
+            "hello" => Ok(ServerMsg::Hello {
+                job: raw.job,
+                idle: raw.idle,
+            }),
+            "job" => Ok(ServerMsg::Job {
+                id: raw.id.ok_or("job without id")?,
+                holder: raw.holder.unwrap_or_default(),
+                script: raw.script.ok_or("job without script")?,
+                ttl_ms: raw.ttl_ms.ok_or("job without ttl_ms")?,
+            }),
+            "abort" => Ok(ServerMsg::Abort),
+            "idle" => Ok(ServerMsg::Idle {
+                script: raw.script.ok_or("idle without script")?,
+            }),
+            other => Err(format!("unknown message type {other:?}")),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -44,8 +86,6 @@ pub struct JobPayload {
 #[derive(Debug, Deserialize)]
 pub struct IdlePayload {
     pub script: String,
-    #[allow(dead_code)] // present on the wire; device state is script-only
-    pub rev: u64,
 }
 
 #[derive(Serialize)]
