@@ -68,14 +68,35 @@ no `as float` cast. These functions are available:
 |---|---|
 | `set_lights(r, y, g)` | set the three lamps (bools) |
 | `sleep(ms)` | pause; also how your script yields |
+| `sleep_until(ms)` | pause until `millis()` reaches an absolute target |
 | `millis()` | ms since your script started |
+| `lamp_dwell_ms()` | the configured minimum relay dwell |
+| `rand_float()` | `[0.0, 1.0)` |
+| `rand_int(lo, hi)` | integer in `lo..=hi` |
+| `rand_chance(p)` | true with probability `p` |
 | `dmx_recv(timeout_ms)` | `#{ ok, base, seq, ch }` — newest DMX frame from the bridge, or `ok: false` on timeout |
 
+**There is no operation cap.** A run is bounded by your lock's TTL and by the kill switch,
+nothing else, so a long analysis loop is fine. A busy loop with no `sleep` will still hold
+the light for the whole lock, so include one.
+
+Prefer `sleep_until` over `sleep` for anything rhythmic. A pattern built from relative sleeps
+adds on every delay the work between them cost, so its period drifts long and it slides off
+the beat; against an absolute target the error cannot accumulate.
+
+`rand_*` come from the ESP32's hardware RNG. Without them a generated pattern repeats
+identically every run, which is most of what makes it look mechanical — rhai ships no RNG and
+there is no clock to improvise one from.
+
 The lamps are driven by mechanical relays, so `set_lights` enforces a minimum dwell per
-lamp (`min_lamp_dwell_ms`, default 100ms — about 10Hz). Asking for changes faster than
-that does not drop them: the call blocks until the relay may move, so a strobe script
-runs at the cap rather than doing something you didn't write. Blocked calls still honor
-your lock expiry. Above roughly 10Hz a relay can't mechanically follow anyway (operate
+lamp (`min_lamp_dwell_ms`, default 100ms — about 10Hz), which `lamp_dwell_ms()` reports.
+Asking for changes faster than that does not drop them: the call blocks until the relay may
+move, so a strobe script runs at the cap rather than doing something you didn't write.
+Blocked calls still honor your lock expiry, and apply their state on the way out.
+
+If your script also reads DMX, gate the writes on `lamp_dwell_ms()` yourself rather than
+letting `set_lights` block — a blocked call stalls your loop, and a stalled loop misses
+frames. Above roughly 10Hz a relay can't mechanically follow anyway (operate
 plus release is around 15ms), and its timing variance is the floor on how tight any
 animation can be.
 
@@ -84,7 +105,7 @@ which presents itself to rekordbox as an Enttec DMX interface. It binds a UDP so
 (`dmx_port`, default 49500) on first call and drops it when your script ends, so the port
 is only open while a script is asking for it. Each call drains everything queued and
 returns only the newest frame — bursts are coalesced, never replayed. It blocks like
-`sleep`, so lock expiry and the kill switch still land within 50ms.
+`sleep`, so lock expiry and the kill switch still land within 10ms.
 
 The values are **raw**, deliberately: thresholding and the channel-to-lamp mapping are
 yours to decide, so they can change without reflashing anything.
@@ -115,9 +136,9 @@ That literal version reads as "off most of the time" in practice — rekordbox d
 only ~28% of a set, and a fixed 128 cut discards nearly half of that. `scripts/follow.rhai` is
 the version worth actually running; see `scripts/README.md` for the measurements behind it.
 
-The script is killed when your lock expires (`sleep` wakes every 50ms to check). Busy loops without `sleep` die early against the 5M-operation cap — use `sleep`. Runtime errors (wrong arity, unknown function) surface in the dashboard history, not at submit time; only parse errors are caught at `POST /v1/script`.
+The script is killed when your lock expires (blocking calls wake every 10ms to check) and its last `set_lights` is applied on the way out. Runtime errors (wrong arity, unknown function) surface in the dashboard history *and* on the light itself as the fault signal below; only parse errors are caught at `POST /v1/script`.
 
-The **idle script** (admin-set, runs when nobody holds a lock) has different semantics: it runs **once per idle transition** with no operation cap — a one-shot script sets a state and the lamps hold it; write your own `loop { … }` for an animation. If it errors, the built-in cycle takes over.
+The **idle script** (admin-set, runs when nobody holds a lock) has different semantics: it runs **once per idle transition** — a one-shot script sets a state and the lamps hold it; write your own `loop { … }` for an animation. If it errors, the fault signal shows for 10s and the built-in cycle takes over.
 
 Idle scripts (and only idle scripts) also get `get_last_holder()`, returning `#{ name, result, ended_ms_ago }` for the most recent job (`name: ""`, `ended_ms_ago: -1` if nobody has held the light since boot):
 
@@ -128,6 +149,12 @@ if h.result == "error" {
     loop { set_lights(true, false, false); sleep(300); set_lights(false, false, false); sleep(300); }
 }
 ```
+
+### The fault signal
+
+All three lamps together at 1Hz — a combination a real signal never shows. Raised when a script errors (for 10s, then normal idle resumes) or when the link to the server has been down for over a minute, and driven by the firmware rather than a script so it still appears when the script thread is dead or could not be spawned. It is *not* raised while a job is running: DMX arrives over the LAN, so a script can be mid-show with the server unreachable.
+
+With `min_lamp_dwell_ms = 0` (solid-state relays) it pulses at 1Hz indefinitely. With mechanical relays it eases to a short blink after 30s, because 1Hz is 7,200 transitions/lamp/hour and that would spend a real fraction of the contacts' rated life announcing a fault.
 
 ## Development
 

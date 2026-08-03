@@ -64,16 +64,20 @@ impl Handlers {
             millis: Box::new(|| 0),
             dmx_recv: Box::new(|_| Ok(None)),
             // Deterministic for validation: a compile-only pass must not depend
-            // on entropy, and tests want reproducible sequences.
-            random_u32: Box::new(|| {
-                use std::sync::atomic::{AtomicU32, Ordering};
-                static STATE: AtomicU32 = AtomicU32::new(0x9E37_79B9);
-                let mut x = STATE.load(Ordering::Relaxed);
-                x ^= x << 13;
-                x ^= x >> 17;
-                x ^= x << 5;
-                STATE.store(x, Ordering::Relaxed);
-                x
+            // on entropy. State is per-Handlers, not a process-wide static, so
+            // two engines in one process get independent reproducible streams
+            // instead of interleaving into an unpredictable one.
+            random_u32: Box::new({
+                let state = std::sync::atomic::AtomicU32::new(0x9E37_79B9);
+                move || {
+                    use std::sync::atomic::Ordering;
+                    let mut x = state.load(Ordering::Relaxed);
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    state.store(x, Ordering::Relaxed);
+                    x
+                }
             }),
             lamp_dwell_ms: Box::new(|| 0),
         }

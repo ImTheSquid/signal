@@ -56,26 +56,68 @@ Measured over 266s of a real set, with the fixture patched as a 3-channel RGB pa
 | any channel > 0 | 27.9% |
 | any channel >= 128 | 15.4% |
 
-Peaks were `R=255 G=131 B=255`, median non-zero level 118. Two consequences drove the design:
+Peaks were `R=255 G=131 B=255`, median non-zero level 118. Three consequences:
 
-- A fixed `>= 128` cut discards nearly half the output, and since green peaks at 131 the green
-  lamp would almost never fire. So lamps are chosen **relative to the brightest channel**.
-- rekordbox drives the fixture in short accents, so instantaneous mapping reads as flicker.
-  Each hit is **latched for `HOLD_MS`**, deliberately above the 100ms relay dwell so the hold
-  survives the throttle instead of being coalesced away.
+- **A fixed `>= 128` cut can never light green.** It peaks at 131, and a cut taken against the
+  frame maximum needed 204. Each channel therefore gets its **own** running peak with slow
+  decay, so a channel the venue only ever drives to half still uses its whole lamp.
+- **Absolute levels carry nothing.** `[3,4,6]` is a typical frame. Everything works on
+  normalised levels and on *change*.
+- **The output is dark 72% of the time, and the light must not be.** So DMX supplies only
+  *colour* and *tempo*; the pattern itself is generated. Density is no longer bounded by
+  rekordbox's duty cycle, which is what made every earlier version look sparse.
 
-**28% is a ceiling set by rekordbox, not by this script.** If it still feels sparse, change the
-fixture's macro role (the non-Simple `Par Light 1`, or `Bar Light 1`) or author a denser pattern
-in MACRO EDITOR. No script change will exceed what the macro engine emits.
+### How it works
 
-### Tunables
+Per frame: per-channel AGC → normalised levels → a latched palette (which lamps this colour
+lights, held through dark passages) → energy → rectified flux against an adaptive floor →
+onsets. Onset intervals are octave-folded into 280-1000ms and fed to an agreement-gated EMA,
+giving a beat period and a phase anchor. Three disagreeing intervals in a row are read as a
+track change and taken as the new tempo.
+
+The pattern then renders on a quarter-beat grid inside the palette, choosing every 8 beats from
+six looks — pump, chase, stab, offbeat, energy-driven build, scatter — with each onset punching
+the whole palette through as an accent.
+
+Two hardware facts shape the rendering:
+
+- **Quarter beats, never eighths.** At 128 BPM an eighth is 59ms, under the 100ms relay dwell,
+  so it cannot be rendered at all. Above ~150 BPM the cycle doubles to half time rather than
+  drifting against the track.
+- **The script gates its own writes on `lamp_dwell_ms()`** instead of letting `set_lights`
+  block. A blocked call stalls the loop, and a stalled loop misses DMX frames.
+
+### Verified, not asserted
+
+`crates/script-env/tests/follow.rs` runs this exact file against a synthetic stream on a virtual
+clock — 60 simulated seconds in ~0.1s, deterministic. Every past failure here was invisible in
+the source and obvious in the output, so the output is what is checked: transition density,
+dwell compliance, green actually firing against a lower peak, movement through a 6s blackout,
+and no imitation of the firmware's 1Hz fault signal.
+
+Tempo lock is measured against a control — circular concentration of transition times on the
+quarter-beat grid of the tempo playing, versus the grid of a tempo that is not:
+
+| stream | on its own grid | on the wrong grid | noise floor |
+|---|---|---|---|
+| 128 BPM | 0.594 | 0.018 | 0.054 |
+| 100 BPM | 0.429 | 0.019 | 0.056 |
+
+Density measures 6.0 transitions/s against a 469ms beat, 4/s through the blackout.
+
+### Tuning
+
+The constants are at the top of the file with a comment each. The ones worth touching first:
 
 | name | effect |
 |---|---|
-| `FLOOR` | below this the fixture counts as dark; lower catches fainter output |
-| `SHARE` | a lamp lights at >= `SHARE`/4 of the brightest channel; lower means more lamps on together |
-| `HOLD_MS` | how long one hit holds a lamp; longer is denser but blurs fast hits |
-| `QUIET_MS` | DMX silence before the fallback sweep takes over, so the light is never dead |
+| `LAMP_CUT` | normalised level at which a lamp joins the palette; lower lights more lamps together |
+| `LOOK_BEATS` | beats before a new look is chosen; lower changes character more often |
+| `THR_MULT` | onset sensitivity; lower finds more onsets and more accents |
+| `PEAK_DECAY` | how fast the AGC ceiling falls; lower adapts quicker to a dimmer track |
+
+Re-run `cargo test -p script-env --test follow` after any change — the thresholds there are set
+from measurements, so a regression in density or dwell shows up immediately.
 
 ## `logcat.mjs`
 
