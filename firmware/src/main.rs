@@ -29,19 +29,44 @@ const WIFI_CHECK: Duration = Duration::from_secs(10);
 const IDLE_RESTART_PAUSE: Duration = Duration::from_millis(500);
 const FW_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// What the light does when nobody holds a lock and no idle script is set
-/// (or the stored one is broken). Idle scripts run once per idle transition
-/// with no operation cap — loop yourself if you want an animation.
-const BUILTIN_IDLE: &str = r#"
-loop {
-    set_lights(false, false, true);
-    sleep(4000);
-    set_lights(false, true, false);
-    sleep(1500);
-    set_lights(true, false, false);
-    sleep(5000);
+/// The built-in cycle, run natively from the main loop rather than as a Rhai
+/// script.
+///
+/// It used to be a script with an infinite `loop`, which meant a Rhai engine —
+/// measured at 96.7KB on 32-bit — stayed resident the entire time the light was
+/// idle. That is exactly when a job arrives and needs a contiguous receive
+/// transient (measured 14.1KB for a 3.4KB script), and it left ~33KB free
+/// instead of ~144KB. On this target `panic-strategy = abort`, so a failed
+/// allocation reboots the board; the job is then never acknowledged and the
+/// server heals its history row to `lost`.
+///
+/// Admin-set idle scripts still run through the interpreter and are unaffected.
+/// One-shot scripts (the common case) free the engine as soon as they return.
+const IDLE_GREEN: u128 = 4000;
+const IDLE_YELLOW: u128 = 1500;
+const IDLE_RED: u128 = 5000;
+
+/// Lamp state for the built-in cycle at `elapsed` into it. Changes at most every
+/// 1.5s, so it never contends with the relay dwell limit.
+fn builtin_idle_lamps(elapsed: Duration) -> (bool, bool, bool) {
+    let period = IDLE_GREEN + IDLE_YELLOW + IDLE_RED;
+    let t = elapsed.as_millis() % period;
+    if t < IDLE_GREEN {
+        (false, false, true)
+    } else if t < IDLE_GREEN + IDLE_YELLOW {
+        (false, true, false)
+    } else {
+        (true, false, false)
+    }
 }
-"#;
+
+/// How the light is filling idle time.
+enum Idle {
+    /// The admin-set script is running through the interpreter.
+    Script,
+    /// The built-in cycle, driven from the main loop with no engine resident.
+    Builtin { since: Instant },
+}
 
 pub enum AppEvent {
     WsConnected,
@@ -62,6 +87,8 @@ struct App {
     running_id: Option<String>,
     idle_script: Option<String>,
     idle_broken: bool,
+    /// Whether idle time is filled by the interpreter or the native cycle.
+    idle: Idle,
     idle_restart_at: Option<Instant>,
     runner: Runner,
     lights: Arc<Lights>,
@@ -95,28 +122,43 @@ impl App {
         self.run_gen += 1;
         self.idle_restart_at = None;
         self.running_id = None;
-        let script = match (&self.idle_script, self.idle_broken) {
-            (Some(script), false) => script.clone(),
-            _ => BUILTIN_IDLE.to_string(),
-        };
-        self.runner.start(
-            self.run_gen,
-            RunKind::Idle,
-            None,
-            None,
-            script,
-            None,
-            self.lights.clone(),
-            self.last_holder.clone(),
-            self.tx.clone(),
-        );
+
+        match (&self.idle_script, self.idle_broken) {
+            (Some(script), false) => {
+                let script = script.clone();
+                self.idle = Idle::Script;
+                self.runner.start(
+                    self.run_gen,
+                    RunKind::Idle,
+                    None,
+                    None,
+                    script,
+                    None,
+                    self.lights.clone(),
+                    self.last_holder.clone(),
+                    self.tx.clone(),
+                );
+            }
+            _ => {
+                // Free the interpreter rather than leave 96.7KB resident for as
+                // long as the light is idle.
+                self.runner.stop();
+                self.idle = Idle::Builtin {
+                    since: Instant::now(),
+                };
+            }
+        }
     }
 
     fn set_idle_script(&mut self, script: String) {
-        let changed = self.idle_script.as_deref() != Some(script.as_str());
         self.idle_script = Some(script);
         self.idle_broken = false;
-        if changed && self.running_id.is_none() {
+        // Restart unconditionally when idle, not only when the text changed.
+        // The built-in cycle never ends on its own, so gating on `changed` meant
+        // that once it was running, re-saving the *same* script was a permanent
+        // no-op — and the admin form is prefilled from the server, so the natural
+        // retry submits byte-identical text and could never recover.
+        if self.running_id.is_none() {
             self.start_idle();
         }
     }
@@ -207,12 +249,20 @@ impl App {
     fn send_state(&self, client: &mut EspWebSocketClient<'_>) {
         let (r, y, g) = self.lights.get();
         let heap = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
+        let heap_block = unsafe {
+            esp_idf_svc::sys::heap_caps_get_largest_free_block(
+                esp_idf_svc::sys::MALLOC_CAP_8BIT,
+            )
+        } as u32;
+        let (or_, oy, og) = self.lights.ops();
         send(
             client,
             &DeviceMsg::State {
                 lights: LightsJson { r, y, g },
                 running: self.running_id.as_deref().unwrap_or("idle"),
                 heap,
+                heap_block,
+                ops: [or_, oy, og],
                 fw: FW_VERSION,
             },
         );
@@ -318,6 +368,7 @@ fn main() -> Result<()> {
         running_id: None,
         idle_script: None,
         idle_broken: false,
+        idle: Idle::Builtin { since: Instant::now() },
         idle_restart_at: None,
         runner: Runner::new(),
         lights: lights.clone(),
@@ -399,6 +450,15 @@ fn main() -> Result<()> {
             Ok(event) => app.handle(event, &mut client),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => unreachable!("app holds a sender"),
+        }
+
+        // Drive the built-in cycle. Cheap: it only writes when the state changes,
+        // and it changes at most every 1.5s.
+        if let Idle::Builtin { since } = app.idle {
+            let want = builtin_idle_lamps(since.elapsed());
+            if lights.get() != want {
+                lights.set(want.0, want.1, want.2);
+            }
         }
 
         if app.idle_restart_at.is_some_and(|at| Instant::now() >= at) {

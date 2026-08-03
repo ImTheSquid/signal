@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -20,6 +20,10 @@ pub struct Lights {
     /// to keep scripts from chattering the contacts.
     last_change: Mutex<[Option<Instant>; 3]>,
     min_dwell: Duration,
+    /// Per-lamp count of physical transitions since boot. Mechanical relays are
+    /// rated in operations, so this is the only way to tell whether a lighting
+    /// pattern is affordable rather than guessing from datasheet estimates.
+    ops: [AtomicU32; 3],
 }
 
 impl Lights {
@@ -41,6 +45,7 @@ impl Lights {
             active_low,
             last_change: Mutex::new([None; 3]),
             min_dwell,
+            ops: [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)],
         };
         lights.set(false, false, false);
         Ok(lights)
@@ -81,9 +86,10 @@ impl Lights {
             self.dirty.store(true, Ordering::SeqCst);
             let now = Instant::now();
             let mut last = self.last_change.lock().unwrap();
-            for (at, mask) in last.iter_mut().zip(MASKS) {
+            for ((at, mask), ops) in last.iter_mut().zip(MASKS).zip(self.ops.iter()) {
                 if (prev ^ bits) & mask != 0 {
                     *at = Some(now);
+                    ops.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
@@ -92,6 +98,15 @@ impl Lights {
     pub fn get(&self) -> (bool, bool, bool) {
         let bits = self.state.load(Ordering::SeqCst);
         (bits & R != 0, bits & Y != 0, bits & G != 0)
+    }
+
+    /// Physical transitions per lamp since boot, for wear accounting.
+    pub fn ops(&self) -> (u32, u32, u32) {
+        (
+            self.ops[0].load(Ordering::Relaxed),
+            self.ops[1].load(Ordering::Relaxed),
+            self.ops[2].load(Ordering::Relaxed),
+        )
     }
 
     /// True once per change; the main loop uses this to push state promptly.

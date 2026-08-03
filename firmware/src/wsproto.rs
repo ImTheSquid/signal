@@ -63,6 +63,15 @@ pub enum DeviceMsg<'a> {
         lights: LightsJson,
         running: &'a str,
         heap: u32,
+        /// Largest contiguous free block. `heap` alone does not predict an
+        /// allocation failure — a fragmented heap with plenty free still cannot
+        /// hand out the 32KB contiguous script stack, and on this target a failed
+        /// allocation aborts and reboots the board.
+        heap_block: u32,
+        /// Physical relay transitions per lamp since boot (r, y, g). Mechanical
+        /// relays are rated in operations, so this is what says whether a
+        /// lighting pattern is affordable.
+        ops: [u32; 3],
         fw: &'a str,
     },
     #[serde(rename = "job_done")]

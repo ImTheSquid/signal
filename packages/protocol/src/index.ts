@@ -69,6 +69,14 @@ export const DeviceStateSchema = z.object({
   lights: LightsSchema,
   running: z.string(), // "idle" | jobId
   heap: z.number(),
+  /** Largest contiguous free block. `heap` alone does not predict an allocation
+   *  failure: a fragmented heap with plenty free still cannot hand out the 32KB
+   *  contiguous script stack, and on that target a failed allocation reboots the
+   *  board. Optional so a device on older firmware still validates. */
+  heap_block: z.number().optional(),
+  /** Physical relay transitions per lamp since boot (r, y, g), for wear
+   *  accounting. Optional for the same reason. */
+  ops: z.array(z.number()).length(3).optional(),
   fw: z.string(),
   ts: z.number(),
 });
