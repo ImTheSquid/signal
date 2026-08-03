@@ -81,6 +81,44 @@ const DONE_RETRY: Duration = Duration::from_millis(500);
 /// strings forever on this heap is worse than a `lost` entry.
 const DONE_GIVE_UP: Duration = Duration::from_secs(300);
 
+/// A visible fault: all three lamps together, which a real signal never shows,
+/// so it cannot be confused with any healthy pattern.
+///
+/// Before this, an error fell through to the built-in cycle — indistinguishable
+/// from healthy idle, so failures were invisible.
+struct Fault {
+    since: Instant,
+    /// `None` shows until the condition clears; `Some` auto-clears after this.
+    linger: Option<Duration>,
+    reason: &'static str,
+}
+
+/// A fault pulses at 1Hz for this long before easing off on mechanical relays.
+const FAULT_LOUD: Duration = Duration::from_secs(30);
+/// Transient faults (a failed script) show briefly, then hand back to idle.
+const FAULT_BLIP: Duration = Duration::from_secs(10);
+/// How long the link may be down before it counts as a fault. Reconnects through
+/// a proxy with 30s heartbeats are routine.
+const LINK_GRACE: Duration = Duration::from_secs(60);
+
+/// Lamp state for the fault signal.
+///
+/// 1Hz 50% duty is 2 transitions/sec/lamp — 7,200/hour, which would spend a large
+/// part of a mechanical relay's rated life just to display a fault. So it stays
+/// loud for [`FAULT_LOUD`] and then eases to a short blink. With `dwell == 0`
+/// (solid-state) there is nothing to protect and it pulses at 1Hz indefinitely.
+fn fault_lamps(elapsed: Duration, dwell: Duration) -> (bool, bool, bool) {
+    let t = elapsed.as_millis();
+    let on = if dwell.is_zero() || elapsed < FAULT_LOUD {
+        t % 1000 < 500
+    } else {
+        // Both phases must clear the dwell or the write is throttled and the
+        // blink turns into an irregular stutter.
+        t % 5000 < dwell.as_millis().max(200)
+    };
+    (on, on, on)
+}
+
 /// How the light is filling idle time.
 enum Idle {
     /// The admin-set script is running through the interpreter.
@@ -113,6 +151,11 @@ struct App {
     idle_restart_at: Option<Instant>,
     /// Set when a job ends, cleared only once the server has it.
     pending_done: Option<PendingDone>,
+    /// Non-None while the fault signal owns the lamps.
+    fault: Option<Fault>,
+    /// When the link went down, and whether it has ever been up.
+    link_down_since: Option<Instant>,
+    ever_connected: bool,
     runner: Runner,
     lights: Arc<Lights>,
     last_holder: SharedLastHolder,
@@ -125,6 +168,7 @@ impl App {
             return; // duplicate delivery (two server instances during recycle)
         }
         log::info!("starting job {id} for {holder} (ttl {ttl_ms}ms)");
+        self.fault = None;
         self.run_gen += 1;
         self.idle_restart_at = None;
         self.running_id = Some(id.clone());
@@ -170,6 +214,31 @@ impl App {
                     since: Instant::now(),
                 };
             }
+        }
+    }
+
+    /// Raise the fault signal, stopping whatever owns the lamps so the two do
+    /// not fight over them.
+    fn raise_fault(&mut self, reason: &'static str, linger: Option<Duration>) {
+        if self.fault.is_some() {
+            return; // already showing; do not restart the pulse
+        }
+        log::warn!("fault: {reason}");
+        self.run_gen += 1;
+        self.runner.stop();
+        self.running_id = None;
+        self.idle_restart_at = None;
+        self.fault = Some(Fault {
+            since: Instant::now(),
+            linger,
+            reason,
+        });
+    }
+
+    fn clear_fault(&mut self) {
+        if let Some(f) = self.fault.take() {
+            log::info!("fault cleared: {}", f.reason);
+            self.start_idle();
         }
     }
 
@@ -223,6 +292,8 @@ impl App {
         match event {
             AppEvent::WsConnected => {
                 log::info!("websocket connected");
+                self.ever_connected = true;
+                self.link_down_since = None;
                 // The server sends `hello` for resync; nothing to do here.
             }
             AppEvent::WsMsg(msg) => self.handle_server_msg(msg),
@@ -258,6 +329,12 @@ impl App {
                 if kind == RunKind::Idle && matches!(outcome, Outcome::Error(_)) {
                     log::warn!("idle script failed; falling back to built-in cycle");
                     self.idle_broken = true;
+                    self.raise_fault("idle script failed", Some(FAULT_BLIP));
+                    return;
+                }
+                if kind == RunKind::Job && matches!(outcome, Outcome::Error(_)) {
+                    self.raise_fault("job script failed", Some(FAULT_BLIP));
+                    return;
                 }
                 if run_gen == self.run_gen {
                     // The active run ended on its own (not superseded).
@@ -432,12 +509,13 @@ fn main() -> Result<()> {
     let nvs = EspDefaultNvsPartition::take()?;
 
     // Relays on non-strap pins, driven to "off" immediately.
+    let dwell = Duration::from_millis(CONFIG.min_lamp_dwell_ms);
     let lights = Arc::new(Lights::new(
         peripherals.pins.gpio32.degrade_output(),
         peripherals.pins.gpio33.degrade_output(),
         peripherals.pins.gpio25.degrade_output(),
         CONFIG.active_low,
-        Duration::from_millis(CONFIG.min_lamp_dwell_ms),
+        dwell,
     )?);
 
     let (tx, rx): (Sender<AppEvent>, Receiver<AppEvent>) = mpsc::channel();
@@ -450,6 +528,9 @@ fn main() -> Result<()> {
         idle: Idle::Builtin { since: Instant::now() },
         idle_restart_at: None,
         pending_done: None,
+        fault: None,
+        link_down_since: None,
+        ever_connected: false,
         runner: Runner::new(),
         lights: lights.clone(),
         last_holder: SharedLastHolder::default(),
@@ -532,12 +613,48 @@ fn main() -> Result<()> {
             Err(mpsc::RecvTimeoutError::Disconnected) => unreachable!("app holds a sender"),
         }
 
-        // Drive the built-in cycle. Cheap: it only writes when the state changes,
-        // and it changes at most every 1.5s.
-        if let Idle::Builtin { since } = app.idle {
-            let want = builtin_idle_lamps(since.elapsed());
-            if lights.get() != want {
-                lights.set(want.0, want.1, want.2);
+        // A link that stays down is a fault worth showing: the light looks
+        // perfectly healthy while unreachable otherwise. Only after it has been
+        // up once, so a boot before the AP is ready doesn't flash.
+        if !client.is_connected() {
+            if app.ever_connected {
+                let down = *app.link_down_since.get_or_insert_with(Instant::now);
+                // Not while a job is running. DMX reaches the light over the LAN,
+                // so a script can be mid-show and working perfectly with the
+                // server unreachable — killing it to announce that would break
+                // the case this exists for. Its own deadline still bounds it.
+                if down.elapsed() >= LINK_GRACE && app.running_id.is_none() {
+                    app.raise_fault("link down", None);
+                }
+            }
+        } else if app.link_down_since.take().is_some() {
+            if app.fault.as_ref().is_some_and(|f| f.reason == "link down") {
+                app.clear_fault();
+            }
+        }
+
+        // The fault signal owns the lamps while it is up, and is driven from
+        // here rather than from a script — so it still shows when the script
+        // thread is dead, or could not be spawned at all.
+        match &app.fault {
+            Some(fault) => {
+                let want = fault_lamps(fault.since.elapsed(), dwell);
+                if lights.get() != want {
+                    lights.set(want.0, want.1, want.2);
+                }
+                if fault.linger.is_some_and(|d| fault.since.elapsed() >= d) {
+                    app.clear_fault();
+                }
+            }
+            // Drive the built-in cycle. Cheap: it only writes when the state
+            // changes, and it changes at most every 1.5s.
+            None => {
+                if let Idle::Builtin { since } = app.idle {
+                    let want = builtin_idle_lamps(since.elapsed());
+                    if lights.get() != want {
+                        lights.set(want.0, want.1, want.2);
+                    }
+                }
             }
         }
 
@@ -547,7 +664,13 @@ fn main() -> Result<()> {
             app.start_idle();
         }
 
-        if lights.take_dirty() || last_heartbeat.elapsed() >= HEARTBEAT {
+        // A fault blinks at 1Hz, which is 2 state pushes/second for as long as it
+        // lasts; each one bypasses the server's write coalescing (it fingerprints
+        // on lamp state) and rebuilds a snapshot for every dashboard client. The
+        // fault itself is the news, not which phase of the blink it is in, so
+        // during one only the heartbeat reports.
+        let dirty = lights.take_dirty();
+        if (dirty && app.fault.is_none()) || last_heartbeat.elapsed() >= HEARTBEAT {
             app.send_state(&mut client);
             last_heartbeat = Instant::now();
         }

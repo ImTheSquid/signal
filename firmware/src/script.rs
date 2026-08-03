@@ -177,6 +177,11 @@ fn run_script(
                         if abort.load(Ordering::SeqCst)
                             || deadline.is_some_and(|d| Instant::now() >= d)
                         {
+                            // Apply it anyway. Returning early silently discarded
+                            // the state the script asked for, so a killed script
+                            // left the lamps mid-pattern — the dwell exists to
+                            // pace the relays, not to veto the last write.
+                            lights.set(r, y, g);
                             return;
                         }
                         let now = Instant::now();
