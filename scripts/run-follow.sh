@@ -94,8 +94,6 @@ echo "script: $SCRIPT"
 echo "cycle : ${LOCK_S}s lock, resubmitting ${MARGIN_S}s before expiry"
 echo
 
-BODY=$(body "$SCRIPT")
-
 # POST and echo "<http_code> <body>", so a 409 can be told from a network error
 # without issuing the request twice.
 post() {
@@ -120,7 +118,9 @@ while true; do
     continue
   fi
 
-  read -r code job <<<"$(post "$BASE/v1/script" "$BODY")"
+  # Re-read every cycle so editing the script takes effect on the next
+  # resubmission rather than needing a restart.
+  read -r code job <<<"$(post "$BASE/v1/script" "$(body "$SCRIPT")")"
   if [ "$code" != "202" ]; then
     echo "$(date +%H:%M:%S) submit failed (HTTP $code): $job"
     nap 5

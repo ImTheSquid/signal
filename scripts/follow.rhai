@@ -20,6 +20,7 @@ let BEAT_GAP = 3000;
 let AGREE_PCT = 22;
 let LOOK_BEATS = 8;
 let DEAD_MS = 8000;
+let PATTERN_MAX = 700;
 
 let DWELL = lamp_dwell_ms();
 if DWELL < 1 { DWELL = 1; }
@@ -27,6 +28,7 @@ if DWELL < 1 { DWELL = 1; }
 let pk_r = PEAK_FLOOR;
 let pk_g = PEAK_FLOOR;
 let pk_b = PEAK_FLOOR;
+let pk_e = PEAK_FLOOR;
 let e_prev = 0.0;
 let flux = 0.0;
 let thr = 0.05;
@@ -85,21 +87,29 @@ loop {
         let ng = g / pk_g;
         let nb = b / pk_b;
 
-        let mx = nr;
-        if ng > mx { mx = ng; }
-        if nb > mx { mx = nb; }
-        if mx > DARK {
+        let raw = r;
+        if g > raw { raw = g; }
+        if b > raw { raw = b; }
+        pk_e *= PEAK_DECAY;
+        if pk_e < PEAK_FLOOR { pk_e = PEAK_FLOOR; }
+        if raw > pk_e { pk_e = raw; }
+        let e = raw / pk_e;
+
+        if e > DARK {
             lr = nr >= LAMP_CUT;
             lg = ng >= LAMP_CUT;
             ly = nb >= LAMP_CUT;
-            if !lr && !ly && !lg {
-                if nr >= ng && nr >= nb { lr = true; }
-                else if ng >= nb { lg = true; }
-                else { ly = true; }
+            let width = 0;
+            if lr { width += 1; }
+            if ly { width += 1; }
+            if lg { width += 1; }
+            if width < 2 {
+                lr = true;
+                ly = true;
+                lg = true;
             }
         }
 
-        let e = (nr + ng + nb) / 3.0;
         let d = e - e_prev;
         if d < 0.0 { d = 0.0; }
         e_prev = e;
@@ -136,6 +146,7 @@ loop {
     }
 
     let pd = period;
+    while pd > PATTERN_MAX { pd /= 2; }
     while pd < DWELL * 4 { pd *= 2; }
 
     let since = now - anchor;
@@ -161,7 +172,12 @@ loop {
 
     if beat_count >= look_until {
         look_until = beat_count + LOOK_BEATS;
-        look = rand_int(0, 5);
+        if pal.len() == 3 {
+            let m = rand_int(0, 2);
+            if m == 0 { look = 1; } else if m == 1 { look = 4; } else { look = 5; }
+        } else {
+            look = rand_int(0, 5);
+        }
     }
 
     let wr = false;
@@ -185,7 +201,7 @@ loop {
         let on = frac < 250 || (frac >= 500 && frac < 750);
         wr = lr && on; wy = ly && on; wg = lg && on;
     } else if look == 3 {
-        let on = frac >= 500 && frac < 750;
+        let on = (frac >= 500 && frac < 750) || frac >= 875;
         wr = lr && on; wy = ly && on; wg = lg && on;
     } else if look == 4 {
         if lvl > 0.55 {
@@ -193,7 +209,8 @@ loop {
             wr = lr && on; wy = ly && on; wg = lg && on;
         } else {
             let s = pick(pal, beat_count % n);
-            wr = s[0]; wy = s[1]; wg = s[2];
+            let on = frac < 500;
+            wr = s[0] && on; wy = s[1] && on; wg = s[2] && on;
         }
     } else {
         let s = pick(pal, scatter_a);

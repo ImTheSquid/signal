@@ -16,8 +16,10 @@ use script_env::{rhai, DmxFrame, Handlers};
 
 const SCRIPT: &str = include_str!("../../../scripts/follow.rhai");
 
-/// ~41Hz, matching the bridge.
+/// The DMX rate. The bridge sends on change plus a keepalive, so what the light
+/// actually receives was measured at 9.8-11.5Hz.
 const FRAME_MS: i64 = 24;
+const FRAME_MS_REAL: i64 = 95;
 const DWELL_MS: i64 = 100;
 /// 128 BPM, and a second tempo used as a control.
 const BEAT_MS: i64 = 469;
@@ -55,6 +57,30 @@ fn synth(t: i64, beat_ms: i64) -> Vec<u8> {
     vec![kick as u8, pad as u8, stab as u8]
 }
 
+/// A stream matching the *measured* statistics of a real set rather than a
+/// convenient one: dark 72% of the time, accents on some beats and not others.
+/// `synth` has a kick on every beat, which flatters the beat estimator and hides
+/// what happens when onsets are scarce.
+fn synth_sparse(t: i64, beat_ms: i64) -> Vec<u8> {
+    let beat = t / beat_ms;
+    let tb = t % beat_ms;
+    // Deterministic per-beat roll, so the stream is reproducible.
+    let h = (beat as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 33;
+
+    // A hit on ~55% of beats, 120ms long: ~26% duty, against a measured 27.9%.
+    let hit = h % 100 < 55 && tb < 120;
+    let decay = if hit { 1.0 - tb as f32 / 120.0 } else { 0.0 };
+
+    // Every 8th beat, a two-beat pad wash on green only — the case that has to
+    // keep the light alive without any onset to trigger from.
+    let wash = beat % 8 >= 6;
+
+    let r = if hit && h % 3 != 0 { 255.0 * decay } else { 0.0 };
+    let b = if hit && h % 3 == 0 { 200.0 * decay } else { 0.0 };
+    let g = if wash { 131.0 } else if hit { 90.0 * decay } else { 0.0 };
+    vec![r as u8, g as u8, b as u8]
+}
+
 struct Run {
     /// (time_ms, r, y, g) for every set_lights the script made.
     changes: Vec<(i64, bool, bool, bool)>,
@@ -62,6 +88,14 @@ struct Run {
 }
 
 fn run_follow(beat_ms: i64) -> Run {
+    run_with(beat_ms, synth)
+}
+
+fn run_with(beat_ms: i64, gen: fn(i64, i64) -> Vec<u8>) -> Run {
+    run_at(beat_ms, gen, FRAME_MS)
+}
+
+fn run_at(beat_ms: i64, gen: fn(i64, i64) -> Vec<u8>, frame_ms: i64) -> Run {
     let clock = Arc::new(AtomicI64::new(0));
     let changes = Arc::new(Mutex::new(Vec::new()));
     // Next frame the fake socket will deliver.
@@ -113,14 +147,14 @@ fn run_follow(beat_ms: i64) -> Run {
                     let mut newest = due;
                     while due <= at {
                         newest = due;
-                        due += FRAME_MS;
+                        due += frame_ms;
                     }
                     next_frame.store(due, Ordering::SeqCst);
                     clock.store(at, Ordering::SeqCst);
                     Ok(Some(DmxFrame {
                         seq: seq.fetch_add(1, Ordering::SeqCst),
                         base: 1,
-                        channels: synth(newest, beat_ms),
+                        channels: gen(newest, beat_ms),
                     }))
                 }
             }),
@@ -337,6 +371,94 @@ fn relay_operations_per_lamp() {
         assert!(
             per_min <= 300.0,
             "{lamp}: {per_min:.0} ops/min exceeds the relay's 300/min mechanical limit"
+        );
+    }
+}
+
+/// Reproduces the complaint: sparse, mostly-dark input. `synth` hides this by
+/// putting a kick on every beat.
+#[test]
+fn stays_dense_on_a_sparse_stream() {
+    let run = run_with(BEAT_MS, synth_sparse);
+    let lit = run.changes.iter().filter(|c| c.1 || c.2 || c.3).count();
+    let per_sec = run.changes.len() as f64 / (run.end_ms as f64 / 1000.0);
+
+    // Longest stretch with no transition at all.
+    let mut gap = 0;
+    for w in run.changes.windows(2) {
+        gap = gap.max(w[1].0 - w[0].0);
+    }
+    let duty: usize = {
+        let mut on = 0;
+        for w in run.changes.windows(2) {
+            if w[0].1 || w[0].2 || w[0].3 {
+                on += (w[1].0 - w[0].0) as usize;
+            }
+        }
+        on * 100 / run.end_ms as usize
+    };
+    println!(
+        "sparse stream: {per_sec:.1} transitions/s, {}% of writes light something, \
+         lamps lit {duty}% of the time, longest still gap {gap}ms",
+        lit * 100 / run.changes.len()
+    );
+    assert!(per_sec >= 4.0, "only {per_sec:.1} transitions/s on a sparse stream");
+    assert!(gap <= 600, "light stood still for {gap}ms");
+}
+
+/// What rekordbox actually sends, measured off the wire: a 3-channel RGB par
+/// driven to **one saturated colour at a time**. Two channels sit at zero and the
+/// live one rotates every few bars. Colour-faithful mapping onto three coloured
+/// lamps therefore lights one lamp at a time, which is inherently sparse — this
+/// is the stream that exposed it.
+fn synth_saturated(t: i64, beat_ms: i64) -> Vec<u8> {
+    let beat = t / beat_ms;
+    let tb = t % beat_ms;
+    let h = (beat as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 33;
+    // Lit 40% of the time, matching the measurement.
+    let lit = h % 100 < 62 && tb < 190;
+    let level = if lit {
+        (255.0 * (1.0 - tb as f32 / 260.0)) as u8
+    } else {
+        0
+    };
+    // One channel at a time; the colour changes every 16 beats.
+    match (beat / 16) % 3 {
+        0 => vec![level, 0, 0],
+        1 => vec![0, 0, level],
+        _ => vec![0, level, 0],
+    }
+}
+
+/// The case the hardware is actually in: one saturated colour at a time, arriving
+/// at ~10Hz. The light must still use the whole fixture and stay busy.
+#[test]
+fn stays_dense_on_one_saturated_colour_at_10hz() {
+    let run = run_at(BEAT_MS, synth_saturated, FRAME_MS_REAL);
+    let per_sec = run.changes.len() as f64 / (run.end_ms as f64 / 1000.0);
+    let mut gap = 0;
+    for w in run.changes.windows(2) {
+        gap = gap.max(w[1].0 - w[0].0);
+    }
+    let used = [
+        run.changes.iter().filter(|c| c.1).count(),
+        run.changes.iter().filter(|c| c.2).count(),
+        run.changes.iter().filter(|c| c.3).count(),
+    ];
+    println!(
+        "saturated @10Hz: {per_sec:.1} transitions/s, longest still gap {gap}ms, \
+         lamp use r={} y={} g={} of {}",
+        used[0], used[1], used[2], run.changes.len()
+    );
+    assert!(per_sec >= 4.0, "only {per_sec:.1} transitions/s");
+    assert!(gap <= 600, "light stood still for {gap}ms");
+    // A single live colour channel must not reduce the fixture to one lamp.
+    for (i, lamp) in ["red", "yellow", "green"].iter().enumerate() {
+        assert!(
+            used[i] * 20 >= run.changes.len(),
+            "{lamp} used in only {}/{} writes",
+            used[i],
+            run.changes.len()
         );
     }
 }

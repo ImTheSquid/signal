@@ -72,6 +72,19 @@ Peaks were `R=255 G=131 B=255`, median non-zero level 118. Three consequences:
 - **The output is dark 72% of the time, and the light must not be.** So DMX supplies only
   *colour* and *tempo*; the pattern itself is generated. Density is no longer bounded by
   rekordbox's duty cycle, which is what made every earlier version look sparse.
+- **rekordbox sends one saturated colour at a time.** Measured off the wire: with a 3-channel
+  RGB par patched at 1-3, one channel carries 255 and the other two sit at exactly zero, the
+  live one rotating every few bars. A colour-faithful mapping onto three *coloured* lamps
+  therefore lights one lamp at a time, which is sparse by construction. So the palette has a
+  floor of **two** lamps — a frame that would light fewer lights all three, and the look is then
+  restricted to the walking ones (chase, build, scatter) rather than the unison ones, since
+  three lamps in unison is the fault signal.
+
+Two AGC references, not one, because they answer different questions. Deciding *which lamp*
+wants a **per-channel** peak, so a channel the venue only drives to half still uses its lamp.
+Measuring *energy* wants a **single shared** peak across channels: under per-channel
+normalisation a dim channel scales to ~1.0, so the max sits near 1.0 whenever anything is lit
+and the envelope disappears. Conflating the two cost half the tempo lock (0.469 → 0.229).
 
 ### How it works
 
@@ -106,7 +119,9 @@ Two hardware facts shape the rendering:
 
 - **Quarter beats, never eighths.** At 128 BPM an eighth is 59ms, under the 100ms relay dwell,
   so it cannot be rendered at all. Above ~150 BPM the cycle doubles to half time rather than
-  drifting against the track.
+  drifting against the track, and below ~86 BPM it halves to double time — `PATTERN_MAX` bounds
+  how still the light can get when the tempo estimate runs slow, which on sparse input it does,
+  because octave-folding biases toward `BEAT_MAX`.
 - **The script gates its own writes on `lamp_dwell_ms()`** instead of letting `set_lights`
   block. A blocked call stalls the loop, and a stalled loop misses DMX frames.
 
@@ -123,10 +138,21 @@ quarter-beat grid of the tempo playing, versus the grid of a tempo that is not:
 
 | stream | on its own grid | on the wrong grid | noise floor |
 |---|---|---|---|
-| 128 BPM | 0.594 | 0.018 | 0.054 |
-| 100 BPM | 0.429 | 0.019 | 0.056 |
+| 128 BPM | 0.469 | 0.010 | 0.051 |
+| 100 BPM | 0.547 | 0.041 | 0.055 |
 
-Density measures 6.2 transitions/s against a 469ms beat, 4/s through the blackout.
+Density, across three streams — the third being the measured shape of real output, at the ~10Hz
+the bridge actually delivers rather than the 41Hz DMX rate:
+
+| stream | transitions/s | longest still gap |
+|---|---|---|
+| kick on every beat, 41Hz | 6.8 | — |
+| sparse, mostly dark, 41Hz | 6.2 | 480ms |
+| one saturated colour at a time, 10Hz | 6.6 | 580ms |
+
+**This is the relay ceiling, not a design choice.** At that density the pattern costs 296 / 272 /
+269 operations per minute for red / yellow / green against a datasheet maximum of 300/min. There
+is no headroom left for a denser pattern on mechanical relays.
 
 ### Tuning
 
