@@ -81,16 +81,32 @@ Peaks were `R=255 G=131 B=255`, median non-zero level 118. Three consequences:
   | par R / G / B | 255 | 20 / 4 / 3 | 7050 / 4300 / 950ms | 0.3 / 0.1 / 0.1 |
   | MH dimmer | 255 | 107 | 3700ms | 0.5 |
   | MH pan / tilt | 205 / 102 | 55 / 68 | ~6000ms | 0.4 / 0.3 |
-  | MH strobe | — | rekordbox never drives it | | |
+  | strobe R / G / B | 253 | 2 each | 3950ms | 0.0 |
+  | MH strobe, strobe Dimmer/Strobe | — | never driven | | |
 
   Beat rate at any dance tempo is ~2/s; the fastest channel here manages 0.5. The engine
   automates on a 3-9 second timescale — bars and phrases, not beats. Earlier notes claiming the
   stream is beat-synced were wrong.
 
-  So the rhythm is **generated**, and DMX supplies only colour (par RGB), energy (the moving
-  head's dimmer, by far the best signal at 107 levels over the full range) and phrase position
-  (pan/tilt). A beat estimator is still there and still engages if a macro ever does emit
-  beat-rate onsets, but density no longer depends on it.
+  Two channels are named `Strobe` and rekordbox drives neither: the moving head's `Strobe` and
+  the strobe fixture's combined `Dimmer/Strobe`. It does drive a plain `Dimmer`. So the engine
+  appears to refuse strobe-capable channels outright, which is worth knowing before patching a
+  fixture whose intensity is a combined channel — it would sit dark.
+
+  So the rhythm is **generated**, and each DMX channel is used for what it actually carries:
+
+  | signal | from | used for |
+  |---|---|---|
+  | colour | par R/G/B (1-3) | ranking which lamps a look lights, brightest first |
+  | energy | MH dimmer (5) | how many lamps light — the width |
+  | phrase | MH pan (7) | a sweep reversal re-rolls the look, so character changes land on phrase boundaries |
+  | section | strobe R/G/B (12-14) | a ~4s binary gate that shifts the width thresholds up or down |
+
+  Absence is not a value: with fewer channels than that, each signal falls back rather than
+  reading as zero. A 3-channel stream still works.
+
+  A beat estimator is still there and still engages if a macro ever does emit beat-rate onsets,
+  but density no longer depends on it.
 
 Two AGC references, not one, because they answer different questions. Deciding *which lamp*
 wants a **per-channel** peak, so a channel the venue only drives to half still uses its lamp.
@@ -171,10 +187,11 @@ the ~10Hz the bridge actually delivers rather than the 41Hz DMX rate — and is 
 | one saturated colour at a time, 10Hz | 7.3 | 260ms |
 | **measured: par + moving head, 10Hz** | **5.7** | **400ms** |
 
-**This is the relay ceiling, not a design choice.** The pattern costs 264 / 254 / 268 operations
-per minute for red / yellow / green against a datasheet maximum of 300/min. An earlier attempt at
-a denser version hit 320/min and the dwell gate began arbitrating which writes landed — which
-cost the tempo lock too, halving it to 0.247. Anything busier needs solid-state relays.
+**This is the relay ceiling, not a design choice.** Against a datasheet maximum of 300
+operations/min the pattern costs 264 / 254 / 268 for red / yellow / green on the synthetic stream
+and 228 / 236 / 210 on the measured one. An earlier attempt at a denser version hit 320/min, and
+past the ceiling the dwell gate starts arbitrating which writes land — which cost the tempo lock
+too, halving it to 0.247. Anything busier needs solid-state relays.
 
 ### Tuning
 

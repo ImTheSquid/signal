@@ -10,6 +10,13 @@ fn pickn(ord, start, k) {
 
 fn order3(a, b, c) {
     let ord = [0, 1, 2];
+let pan_s = 0.0;
+let pan_prev = 0.0;
+let pan_dir = 0;
+let phrase_at = -99999;
+let look_at = -99999;
+let hot = false;
+let gated = false;
     let lev = [a, b, c];
     if lev[ord[1]] > lev[ord[0]] { let t = ord[0]; ord[0] = ord[1]; ord[1] = t; }
     if lev[ord[2]] > lev[ord[1]] { let t = ord[1]; ord[1] = ord[2]; ord[2] = t; }
@@ -34,6 +41,9 @@ let LOOK_BEATS = 8;
 let DEAD_MS = 8000;
 let PATTERN_MAX = 700;
 let DIMMER_CH = 4;
+let PAN_CH = 6;
+let HOT_CH = 11;
+let PHRASE_MIN = 1500;
 let WIDE_AT = 0.30;
 let FULL_AT = 0.65;
 
@@ -55,6 +65,13 @@ let anchor = 0;
 let disagree = 0;
 
 let ord = [0, 1, 2];
+let pan_s = 0.0;
+let pan_prev = 0.0;
+let pan_dir = 0;
+let phrase_at = -99999;
+let look_at = -99999;
+let hot = false;
+let gated = false;
 
 let beat_count = 0;
 let last_slot = -1;
@@ -110,6 +127,26 @@ loop {
         if raw > pk_e { pk_e = raw; }
         let e = raw / pk_e;
 
+        if p.ch.len() > PAN_CH {
+            pan_s += (p.ch[PAN_CH].to_float() - pan_s) * 0.08;
+            let dir = pan_dir;
+            if pan_s > pan_prev + 0.4 { dir = 1; }
+            else if pan_s < pan_prev - 0.4 { dir = -1; }
+            if dir != pan_dir && pan_dir != 0 && now - phrase_at > PHRASE_MIN {
+                phrase_at = now;
+            }
+            pan_dir = dir;
+            pan_prev = pan_s;
+        }
+
+        if p.ch.len() > HOT_CH + 2 {
+            gated = true;
+            let h = p.ch[HOT_CH];
+            if p.ch[HOT_CH + 1] > h { h = p.ch[HOT_CH + 1]; }
+            if p.ch[HOT_CH + 2] > h { h = p.ch[HOT_CH + 2]; }
+            hot = h > 24;
+        }
+
         let d = e - e_prev;
         if d < 0.0 { d = 0.0; }
         e_prev = e;
@@ -155,9 +192,20 @@ loop {
     let quarter = frac / 250;
     let half = frac / 500;
 
+    let wide_at = WIDE_AT;
+    let full_at = FULL_AT;
+    if gated {
+        if hot {
+            wide_at *= 0.6;
+            full_at *= 0.7;
+        } else {
+            wide_at *= 1.4;
+            full_at *= 1.15;
+        }
+    }
     let w = 1;
-    if lvl > WIDE_AT { w = 2; }
-    if lvl > FULL_AT { w = 3; }
+    if lvl > wide_at { w = 2; }
+    if lvl > full_at { w = 3; }
 
     if quarter != last_slot {
         if quarter == 0 { beat_count += 1; }
@@ -170,7 +218,8 @@ loop {
         last_slot = quarter;
     }
 
-    if beat_count >= look_until {
+    if beat_count >= look_until || phrase_at > look_at {
+        look_at = phrase_at;
         look_until = beat_count + LOOK_BEATS;
         look = rand_int(0, 5);
     }

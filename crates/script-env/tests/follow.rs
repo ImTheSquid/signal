@@ -341,7 +341,12 @@ fn locks_to_the_tempo_that_is_playing() {
 /// measured like one.
 #[test]
 fn relay_operations_per_lamp() {
-    let run = run_follow(BEAT_MS);
+    // Both the synthetic stream and the one measured off the wire, since the
+    // hardware runs the latter and its cost is the one that has to fit.
+    for (name, run) in [
+        ("kick every beat", run_follow(BEAT_MS)),
+        ("measured", run_at(BEAT_MS, synth_measured, FRAME_MS_REAL)),
+    ] {
     let mut ops = [0u32; 3];
     let mut prev = (false, false, false);
     for c in &run.changes {
@@ -361,7 +366,7 @@ fn relay_operations_per_lamp() {
         let per_min = ops[i] as f64 / mins;
         let hours_to_1e5 = 100_000.0 / (per_min * 60.0);
         println!(
-            "{lamp}: {} ops in {:.1} min = {per_min:.0}/min, \
+            "{name} / {lamp}: {} ops in {:.1} min = {per_min:.0}/min, \
              {hours_to_1e5:.0}h to 10^5 electrical operations",
             ops[i], mins
         );
@@ -370,8 +375,9 @@ fn relay_operations_per_lamp() {
         // can, so this is a hard bound rather than a budget.
         assert!(
             per_min <= 300.0,
-            "{lamp}: {per_min:.0} ops/min exceeds the relay's 300/min mechanical limit"
+            "{name} / {lamp}: {per_min:.0} ops/min exceeds the relay's 300/min limit"
         );
+    }
     }
 }
 
@@ -493,13 +499,20 @@ fn synth_measured(t: i64, _beat_ms: i64) -> Vec<u8> {
     // Pan/tilt: smooth 9s sweeps, no steps at all.
     let pan = 199.0 * (0.5 + 0.5 * (tau * f / 9.0).sin());
     let tilt = 64.0 * (0.5 + 0.5 * (tau * f / 9.0 + 1.5).sin());
+    // The strobe fixture at 12-15: rekordbox toggles its RGB white on a ~4s cycle
+    // and never touches its Dimmer/Strobe channel. That toggle is the only
+    // section-level gate in the stream.
+    let gate = if (t / 4000) % 2 == 0 { 253 } else { 0 };
     vec![
         par_r as u8, par_g as u8, par_b as u8,
         0,                       // MH mode, rekordbox cannot drive it
         (255.0 * dim) as u8,     // MH dimmer
-        0,                       // MH strobe, unused by rekordbox
+        0,                       // MH strobe, never driven
         pan as u8, tilt as u8,
         0, 0, 255,               // MH rgb: pinned blue
+        gate, gate, gate,        // strobe rgb
+        0,                       // strobe Dimmer/Strobe, never driven
+        0,                       // bar matrix WW1, rekordbox cannot drive it
     ]
 }
 
