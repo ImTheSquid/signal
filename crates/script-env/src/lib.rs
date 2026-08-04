@@ -8,9 +8,14 @@ pub use rhai;
 
 use rhai::Engine;
 
-/// Maximum script source size in bytes, enforced at the API, the websocket,
-/// and on-device before compilation.
+/// Maximum size in bytes of the script that reaches the device, measured after
+/// minification. Enforced at the API and bounded again by the websocket framer.
 pub const MAX_SCRIPT_BYTES: usize = 16 * 1024;
+
+/// Maximum size in bytes of a script as submitted, before minification. Comments
+/// and indentation are stripped before `MAX_SCRIPT_BYTES` applies, so this is what
+/// bounds the work the validator will do on one request.
+pub const MAX_RAW_SCRIPT_BYTES: usize = 256 * 1024;
 
 /// Callbacks that back the script API. The validator passes no-op stubs;
 /// the firmware passes closures driving the relays.

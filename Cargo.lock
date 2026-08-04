@@ -227,6 +227,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "rhaiper"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb51fd006f96e54b4ada41deda3785792b516709cd9a4cbaa73af905b96d5446"
+dependencies = [
+ "rhai",
+ "rhaiper-map",
+ "serde_json",
+]
+
+[[package]]
+name = "rhaiper-map"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9da8239cec117d318a76610c9a67be767bb26d0786b72f9a522072ad5e97f37"
+
+[[package]]
 name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -348,6 +365,7 @@ name = "validator"
 version = "0.1.0"
 dependencies = [
  "getrandom 0.3.4",
+ "rhaiper",
  "script-env",
  "serde_json",
  "wasm-bindgen",
