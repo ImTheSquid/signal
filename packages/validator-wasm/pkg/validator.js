@@ -1,18 +1,24 @@
 /* @ts-self-types="./validator.d.ts" */
 
 /**
- * Compile-check a script against the shared engine configuration.
- * Returns JSON: {"ok":true} or {"ok":false,"error":...,"line":...,"col":...}
+ * Compile-check a script and minify it for the device.
+ *
+ * Returns JSON: {"ok":true,"script":...,"map":...,"rawBytes":N,"bytes":M,"minified":bool}
+ * or {"ok":false,"error":...,"line":...,"col":...}
+ *
+ * `minify_with_engine` compiles both its input and its own output with the engine it
+ * is given, so passing the validation engine makes one call cover the parse check the
+ * API needs and a conformance check on the text the device will actually run.
  * @param {string} script
  * @returns {string}
  */
-function validate(script) {
+function prepare(script) {
     let deferred2_0;
     let deferred2_1;
     try {
         const ptr0 = passStringToWasm0(script, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len0 = WASM_VECTOR_LEN;
-        const ret = wasm.validate(ptr0, len0);
+        const ret = wasm.prepare(ptr0, len0);
         deferred2_0 = ret[0];
         deferred2_1 = ret[1];
         return getStringFromWasm0(ret[0], ret[1]);
@@ -20,7 +26,39 @@ function validate(script) {
         wasm.__wbindgen_free(deferred2_0, deferred2_1, 1);
     }
 }
-exports.validate = validate;
+exports.prepare = prepare;
+
+/**
+ * Rewrite the `line N, position M` positions in a device-reported error so they
+ * refer to the submitted script rather than the minified text.
+ *
+ * `minified` is the text the device ran: Source Map v3 counts columns in UTF-16
+ * units while rhai counts characters, and converting between them needs that line.
+ * Anything that does not resolve is left exactly as it arrived.
+ * @param {string} map_json
+ * @param {string} minified
+ * @param {string} message
+ * @returns {string}
+ */
+function remap(map_json, minified, message) {
+    let deferred4_0;
+    let deferred4_1;
+    try {
+        const ptr0 = passStringToWasm0(map_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(minified, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(message, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len2 = WASM_VECTOR_LEN;
+        const ret = wasm.remap(ptr0, len0, ptr1, len1, ptr2, len2);
+        deferred4_0 = ret[0];
+        deferred4_1 = ret[1];
+        return getStringFromWasm0(ret[0], ret[1]);
+    } finally {
+        wasm.__wbindgen_free(deferred4_0, deferred4_1, 1);
+    }
+}
+exports.remap = remap;
 function __wbg_get_imports() {
     const import0 = {
         __proto__: null,
