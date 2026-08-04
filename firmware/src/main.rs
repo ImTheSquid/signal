@@ -465,6 +465,13 @@ fn connect_wifi(wifi: &mut BlockingWifi<EspWifi<'static>>) -> Result<()> {
         ..Default::default()
     }))?;
     wifi.start()?;
+    // Modem power save makes the AP buffer unicast between beacon wakes, which
+    // delivers DMX in ~300ms clumps instead of a stream — measured as the
+    // dominant receive-timing distortion. The bridge disables it for the same
+    // reason, and this board is mains-powered.
+    esp_idf_svc::sys::esp!(unsafe {
+        esp_idf_svc::sys::esp_wifi_set_ps(esp_idf_svc::sys::wifi_ps_type_t_WIFI_PS_NONE)
+    })?;
     loop {
         match wifi.connect().and_then(|()| wifi.wait_netif_up()) {
             Ok(()) => {

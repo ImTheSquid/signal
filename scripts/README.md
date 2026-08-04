@@ -69,44 +69,57 @@ Peaks were `R=255 G=131 B=255`, median non-zero level 118. Three consequences:
   decay, so a channel the venue only ever drives to half still uses its whole lamp.
 - **Absolute levels carry nothing.** `[3,4,6]` is a typical frame. Everything works on
   normalised levels and on *change*.
-- **The output is dark 72% of the time, and the light must not be.** So DMX supplies only
-  *colour* and *tempo*; the pattern itself is generated. Density is no longer bounded by
-  rekordbox's duty cycle, which is what made every earlier version look sparse.
-- **Nothing rekordbox sends moves at beat rate.** This is the measurement that matters most, and
-  it contradicts what the design originally assumed. With an RGB par at 1-3 and an 8-channel
-  moving head at 4-11, captured with music playing:
+- **The output is dark 72% of the time, and the light must not be.** So the pattern is
+  generated, and DMX steers it. Density is no longer bounded by rekordbox's duty cycle,
+  which is what made every earlier version look sparse.
+- **Whether anything moves at beat rate depends on the content.** An early ambient capture
+  showed nothing faster than 0.5 rises/s and the design concluded rekordbox never sends
+  rhythm; a loop measured 2026-08-04 showed the MH dimmer pumping full-scale at **13
+  changes/s**, par R/B fading at ~9/s, and pan sweeping fast (10.6/s). Both are real. So
+  the rhythm is **followed when the stream carries one and generated when it doesn't** —
+  the onset detector feeds a beat estimator that free-runs between usable onsets.
 
-  | channel | peak | levels | period | rises/s |
-  |---|---|---|---|---|
-  | par R / G / B | 255 | 20 / 4 / 3 | 7050 / 4300 / 950ms | 0.3 / 0.1 / 0.1 |
-  | MH dimmer | 255 | 107 | 3700ms | 0.5 |
-  | MH pan / tilt | 205 / 102 | 55 / 68 | ~6000ms | 0.4 / 0.3 |
-  | strobe R / G / B | 253 | 2 each | 3950ms | 0.0 |
-  | MH strobe, strobe Dimmer/Strobe | — | never driven | | |
+  Still true from the early capture: two channels are named `Strobe` and rekordbox drives
+  neither — the moving head's `Strobe` and the strobe fixture's combined `Dimmer/Strobe` —
+  while driving a plain `Dimmer`. A fixture whose intensity is a combined channel sits dark.
 
-  Beat rate at any dance tempo is ~2/s; the fastest channel here manages 0.5. The engine
-  automates on a 3-9 second timescale — bars and phrases, not beats. Earlier notes claiming the
-  stream is beat-synced were wrong.
-
-  Two channels are named `Strobe` and rekordbox drives neither: the moving head's `Strobe` and
-  the strobe fixture's combined `Dimmer/Strobe`. It does drive a plain `Dimmer`. So the engine
-  appears to refuse strobe-capable channels outright, which is worth knowing before patching a
-  fixture whose intensity is a combined channel — it would sit dark.
-
-  So the rhythm is **generated**, and each DMX channel is used for what it actually carries:
+  Each DMX channel is used for what it actually carries:
 
   | signal | from | used for |
   |---|---|---|
-  | colour | par R/G/B (1-3) | ranking which lamps a look lights, brightest first |
-  | energy | MH dimmer (5) | how many lamps light — the width |
-  | phrase | MH pan (7) | a sweep reversal re-rolls the look, so character changes land on phrase boundaries |
-  | section | strobe R/G/B (12-14) | a ~4s binary gate that shifts the width thresholds up or down |
+  | colour | par R/G/B (1-3) | ranking which lamps a look lights, brightest first; a fully dark par rotates the ranking per beat instead of freezing it |
+  | energy | MH dimmer (5) | how many lamps light — the width — and, through its onsets, the tempo |
+  | phrase | MH pan (7) | a sweep reversal re-rolls the look — gated on traversing 35% of pan's recent range, or fast pan re-rolls it constantly |
+  | section | strobe R/G/B (12-14) | a binary gate that *lowers* the width thresholds when hot; when cold it does nothing — a cold gate must never narrow the light, because it measured hot only 0.1% of a real set |
+  | timing | seq | how many sent frames a receive gap swallowed — see below, this is what keeps the tempo locked to the music instead of the wifi |
 
   Absence is not a value: with fewer channels than that, each signal falls back rather than
   reading as zero. A 3-channel stream still works.
 
-  A beat estimator is still there and still engages if a macro ever does emit beat-rate onsets,
-  but density no longer depends on it.
+### The wire is bursty, and seq is the defence
+
+  Measured on a live loop: the bridge logs 23.2 changed-frames/s, but they arrive in
+  clumps — p50 inter-frame gap **0ms**, p95 306ms. The receiver coalesces each clump to
+  the newest frame (deliberately — stale lamp states must not replay), so the script sees
+  ~5.7 frames/s of a 23fps stream, with energy accumulated across each gap.
+
+  Run naively, the onset detector fires on the clump boundaries: onset intervals cluster
+  at the ~300ms network gap and the tempo locks to the wifi (measured: 560ms period
+  against 457ms playing). The bridge's `seq` counts every *sent* packet, so the receive
+  side can see how much a gap swallowed:
+
+  - flux is normalised per sender frame (`Δe / Δseq`): a musical attack is a large jump
+    across few frames, a coalesced fade is the same jump across many;
+  - an onset with `Δseq > 3` neither votes on the tempo nor fires the accent — its
+    timing is the network's, not the music's;
+  - the phase anchor is a snap-or-nudge PLL (snap beyond a quarter period, else 1/4 of
+    the error), so per-onset arrival jitter stops smearing the beat grid. Adopting each
+    onset's arrival wholesale measured 0.054 on-grid; the PLL measures 0.364.
+
+  The clumping itself is ESP-IDF's default modem power save: the AP buffers unicast
+  between beacon wakes. The bridge already runs `WIFI_PS_NONE` for exactly this reason;
+  the light's firmware now does too, which removes most of the bunching at the source —
+  the seq handling stays, because drops and congestion still happen.
 
 Two AGC references, not one, because they answer different questions. Deciding *which lamp*
 wants a **per-channel** peak, so a channel the venue only drives to half still uses its lamp.
@@ -116,31 +129,33 @@ and the envelope disappears. Conflating the two cost half the tempo lock (0.469 
 
 ### How it works
 
-Per frame: per-channel AGC → normalised levels → a latched palette (which lamps this colour
-lights, held through dark passages) → energy → rectified flux against an adaptive floor →
-onsets. Onset intervals are octave-folded into 280-1000ms and fed to an agreement-gated EMA,
-giving a beat period and a phase anchor. Three disagreeing intervals in a row are read as a
-track change and taken as the new tempo.
+Per frame: per-channel AGC → normalised levels → the lamp ranking (rotated per beat when
+the colour is dead) → energy → seq-normalised rectified flux against an adaptive floor →
+onsets. Clean onsets (`Δseq ≤ 3`) are octave-folded into 380-680ms and fed to an
+agreement-gated EMA for the period and a snap-or-nudge PLL for the phase. Three
+disagreeing intervals in a row are read as a track change and taken as the new tempo.
 
 The pattern renders on a quarter-beat grid. Two things decide what is lit:
 
 - **Which lamps** — the three lamps are ranked by their own normalised colour level, brightest
   first, so a look that lights `k` lamps lights the `k` the music is most in.
-- **How many** — width comes from the energy envelope: one lamp when quiet, two past
-  `WIDE_AT`, three past `FULL_AT`, and zero in a look's rest phases. Measured across a real
-  stream, the light spends 29% / 16% / 30% / 23% of its writes on 0 / 1 / 2 / 3 lamps.
+- **How many** — width comes from the energy envelope: two lamps whenever DMX is live
+  (the floor is deliberate — one lamp reads as broken, and the relay wear it costs is
+  budgeted below), three past `FULL_AT`. Rest phases drop to width-1, never to nothing:
+  contrast comes from narrowing, not blackouts. Measured on the live-loop stream, writes
+  split 8% / 21% / 35% / 34% across 0 / 1 / 2 / 3 lamps.
 
-`look` is re-rolled every `LOOK_BEATS` beats and each onset punches all three through briefly as
-an accent.
+`look` is re-rolled every `LOOK_BEATS` beats — or at a phrase boundary — and each clean
+onset punches all three through briefly as an accent.
 
 | `look` | name | what it does |
 |---|---|---|
-| 0 | pulse | full width on the front half of the cycle; breathes |
+| 0 | pulse | full width on the front half of the cycle, narrows on the back |
 | 1 | chase | a single lamp walking the ranking, half a cycle each |
-| 2 | stab | two hits per cycle with gaps, so the off is as loud as the on |
-| 3 | offbeat | skips the downbeat entirely; syncopated against the track |
-| 4 | swell | width climbs 1 → 2 → 3 across the cycle, then drops to nothing |
-| 5 | scatter | random width and starting lamp, re-rolled every half cycle |
+| 2 | stab | two full-width hits per cycle, narrow between |
+| 3 | offbeat | narrow on the downbeat half, full width after — syncopated |
+| 4 | swell | width climbs 1 → 2 → 3 across the cycle, then resets |
+| 5 | scatter | random width (never zero) and starting lamp, re-rolled every half cycle |
 
 A **stillness watchdog** guarantees a change at least every half cycle: one look's rest phase
 running into the next look's rest phase held the lamps for 825ms, and the watchdog cuts the worst
@@ -170,28 +185,34 @@ dwell compliance, green actually firing against a lower peak, movement through a
 and no imitation of the firmware's 1Hz fault signal.
 
 Tempo lock is measured against a control — circular concentration of transition times on the
-quarter-beat grid of the tempo playing, versus the grid of a tempo that is not:
+quarter-beat grid of the tempo playing, versus a grid it must not lock to. The last row is
+the case that broke live: 50% of its delivery windows are bunched into 300ms flushes, and
+the grid it must beat is the network's:
 
 | stream | on its own grid | on the wrong grid | noise floor |
 |---|---|---|---|
-| 128 BPM | 0.579 | 0.019 | 0.051 |
-| 100 BPM | 0.421 | 0.017 | 0.055 |
+| 128 BPM, clean delivery | 0.364 | 0.019 | 0.049 |
+| 100 BPM, clean delivery | 0.355 | 0.052 | 0.052 |
+| 131.5 BPM, 50% bunched | 0.170 | 0.049 (the burst grid) | 0.052 |
 
-Density, across four streams. The last is the measured shape of real output — both fixtures, at
-the ~10Hz the bridge actually delivers rather than the 41Hz DMX rate — and is the one that counts:
+Density, across five streams. The live-loop row replays what a real deck sent on
+2026-08-04, through bunched delivery, with a dead-colour stretch:
 
 | stream | transitions/s | longest still gap |
 |---|---|---|
-| kick on every beat, 41Hz | 6.9 | — |
-| sparse, mostly dark, 41Hz | 6.9 | 268ms |
-| one saturated colour at a time, 10Hz | 7.3 | 260ms |
-| **measured: par + moving head, 10Hz** | **5.7** | **400ms** |
+| kick on every beat, 41Hz | ~7 | — |
+| sparse, mostly dark, 41Hz | 7.3 | 264ms |
+| one saturated colour at a time, 10Hz | 8.3 | 260ms |
+| measured: par + moving head, 10Hz | 5.7 | 400ms |
+| **live loop, bunched delivery** | **7.3** | **260ms (dark ≤ 152ms)** |
 
-**This is the relay ceiling, not a design choice.** Against a datasheet maximum of 300
-operations/min the pattern costs 264 / 254 / 268 for red / yellow / green on the synthetic stream
-and 228 / 236 / 210 on the measured one. An earlier attempt at a denser version hit 320/min, and
-past the ceiling the dwell gate starts arbitrating which writes land — which cost the tempo lock
-too, halving it to 0.247. Anything busier needs solid-state relays.
+**The relay wear is a spent budget, not a ceiling.** The width floor prices at
+241 / 262 / 191 ops/min for red / yellow / green on the kick stream and ~172-174 on the
+measured one — 6-10 hours of set time per 10^5 electrical operations, a deliberate trade
+of relay life for a light that never looks broken. The test now asserts only that the
+dwell gate held (nothing past `60000/DWELL_MS` per minute); the per-lamp cost is printed
+so a regression is visible, not fatal. Past the dwell gate writes get arbitrated and the
+tempo lock halves, so the dwell itself stays.
 
 ### Tuning
 
@@ -199,8 +220,11 @@ All of them are `let` bindings at the top of the file, in this order:
 
 | name | effect |
 |---|---|
-| `WIDE_AT`, `FULL_AT` | energy thresholds for the second and third lamp; lower lights more together |
-| `DIMMER_CH` | index of the moving head's dimmer channel, the energy source |
+| `WIDE_AT`, `FULL_AT` | energy thresholds for the second and third lamp; lower lights more together (the live floor of two applies regardless) |
+| `VOTE_SEQ` | largest `Δseq` whose onset may vote on tempo or fire the accent; larger trusts arrival timing more |
+| `COLOUR_DEAD` | normalised colour level below which the ranking rotates instead of freezing |
+| `DIMMER_CH`, `PAN_CH`, `HOT_CH` | indices of the energy, phrase, and section channels |
+| `PHRASE_MIN` | shortest gap between phrase re-rolls, on top of the 35%-of-range traversal gate |
 | `LOOK_BEATS` | beats before a new look is chosen; lower changes character more often |
 | `THR_MULT`, `THR_BIAS` | onset sensitivity against the adaptive floor; lower finds more onsets and more accents |
 | `PEAK_DECAY` | how fast the AGC ceiling falls, per step; lower adapts quicker to a dimmer track |
