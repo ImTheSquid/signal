@@ -18,8 +18,11 @@
 set -uo pipefail
 
 BASE="${TRAFFIC_LIGHT_BASE:-https://signal.jackhogan.me}"
-LOCK_S="${LOCK_S:-300}"      # per-cycle lock length; the key caps this
-MARGIN_S="${MARGIN_S:-20}"   # resubmit this long before the TTL runs out
+LOCK_S="${LOCK_S:-3600}"     # per-cycle lock length; the key caps this, and the
+                             # ttl in the response is what actually gets waited on.
+                             # Long cycles matter: every handover is a chance for a
+                             # wifi drop to strand the light on the idle script.
+MARGIN_S="${MARGIN_S:-45}"   # resubmit this long before the TTL runs out
 SCRIPT=""
 TOKEN_FILE=""
 
@@ -111,10 +114,17 @@ nap() {
 
 while true; do
   read -r code lock <<<"$(post "$BASE/v1/lock" "{\"duration_s\": $LOCK_S}")"
-  if [ "$code" != "201" ]; then
-    # 409 means somebody else legitimately holds it; back off rather than fight.
-    echo "$(date +%H:%M:%S) cannot lock (HTTP $code): $lock"
+  if [ "$code" = "409" ]; then
+    # Somebody else legitimately holds it; back off rather than fight.
+    echo "$(date +%H:%M:%S) cannot lock (HTTP 409): $lock"
     nap 10
+    continue
+  fi
+  if [ "$code" != "201" ]; then
+    # Network trouble: the light is on the idle script while we dither, so
+    # retry hard.
+    echo "$(date +%H:%M:%S) lock failed (HTTP $code): $lock"
+    nap 2
     continue
   fi
 
@@ -123,7 +133,7 @@ while true; do
   read -r code job <<<"$(post "$BASE/v1/script" "$(body "$SCRIPT")")"
   if [ "$code" != "202" ]; then
     echo "$(date +%H:%M:%S) submit failed (HTTP $code): $job"
-    nap 5
+    nap 2
     continue
   fi
 
