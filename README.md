@@ -7,7 +7,7 @@ A real three-lamp traffic signal on the internet. Friends, apps, and trinkets ge
 ```
 friend ──HTTP──▶ SvelteKit /v1/* ──────────▶ Redis ◀────── pub/sub ────── api/device.ts
                     │                          ▲                             ▲ websocket
-                    └─ validates scripts       │ pub/sub                     └── ESP32 (runs Rhai on-device)
+                    └─ validates + minifies    │ pub/sub                     └── ESP32 (runs Rhai on-device)
                        via Rhai→WASM       api/live.ts
                                                ▲ websocket
                                             dashboard (live updates)
@@ -17,7 +17,7 @@ Everything runs on one box behind nginx — see [deploy/home-app/](deploy/home-a
 
 - **apps/web** — SvelteKit app: public dashboard (live over websocket, 10s polling as fallback), admin panel (keys, idle script editor, lamp test, history controls, kill switch), the `/v1` JSON API, and two standalone websocket servers: `api/device.ts` (the ESP32) and `api/live.ts` (browsers). SvelteKit routes can't upgrade websockets, so those run as their own processes — which is also why the JSON API lives at `/v1`, not `/api`.
 - **crates/script-env** — the single source of truth for the Rhai language surface and sandbox limits, used by both the validator and the firmware.
-- **crates/validator** → **packages/validator-wasm** — `Engine::compile` compiled to WASM; `POST /v1/script` rejects scripts that won't parse, with line/col errors.
+- **crates/validator** → **packages/validator-wasm** — `Engine::compile` plus [rhaiper](https://crates.io/crates/rhaiper), compiled to WASM. `POST /v1/script` rejects scripts that won't parse, with line/col errors, and minifies the rest before storing them.
 - **packages/protocol** — zod schemas + constants for the wire protocol and Redis keys.
 - **firmware** — Rust (esp-idf) for an ESP32-WROOM-32E: wifi → SNTP → websocket, Rhai engine in a dedicated thread, three relay GPIOs (32/33/25 = R/Y/G).
 - **dmx-bridge** — Rust (esp-idf) for an ESP32-S3 that presents FTDI descriptors over USB so **rekordbox lighting** drives the signal. It reassembles the DMX512 stream rekordbox writes and forwards raw channel values over LAN UDP to `dmx_recv()`. See `dmx-bridge/README.md`.
@@ -41,10 +41,11 @@ curl -X POST $BASE/v1/lock -H "$AUTH" -H "$JSON" -d '{"duration_s": 120}'
 # Keys minted with the override flag may steal the lock (explicit opt-in):
 curl -X POST $BASE/v1/lock -H "$AUTH" -H "$JSON" -d '{"duration_s": 60, "override": true}'
 
-# Run a script (must hold the lock; max 16KB; ≤20 submissions/min)
+# Run a script (must hold the lock; max 16KB minified, 256KB as sent; ≤20 submissions/min)
 curl -X POST $BASE/v1/script -H "$AUTH" -H "$JSON" \
   -d '{"script": "loop { set_lights(true,false,false); sleep(500); set_lights(false,false,false); sleep(500); }"}'
-# → 202 {"jobId":..., "ttl_ms":...} | 422 {"error":"Unexpected ...","line":1,"col":9}
+# → 202 {"jobId":..., "ttl_ms":..., "bytes":..., "raw_bytes":...}
+#   422 {"error":"Unexpected ...","line":1,"col":9} | 413 over either limit
 
 # Release early
 curl -X DELETE $BASE/v1/lock -H "$AUTH"
@@ -58,6 +59,12 @@ curl $BASE/v1/status
 ```
 
 ### Script environment
+
+Comment and indent freely. `POST /v1/script` minifies with
+[rhaiper](https://crates.io/crates/rhaiper) before storing, so the 16KB limit measures the
+stripped text and the device never receives a comment — `scripts/follow.rhai` goes 8251 → 5054
+bytes on whitespace alone. The source map stays server-side, so runtime errors in the dashboard
+still cite the line you wrote rather than a position in text nobody has seen.
 
 Scripts are Rhai with `i64` integers and `f32` floats (no closures/modules/eval). Floats are
 single-precision deliberately: rhai's default `FLOAT` is `f64`, which the ESP32's
