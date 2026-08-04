@@ -1,10 +1,10 @@
 import { json } from '@sveltejs/kit';
-import { MAX_SCRIPT_BYTES, REDIS } from '@traffic-light/protocol';
+import { MAX_RAW_SCRIPT_BYTES, REDIS } from '@traffic-light/protocol';
 import { authenticate } from '$lib/server/keys';
 import { submitJob } from '$lib/server/locks';
 import { pushHistory } from '$lib/server/history';
 import { redis } from '$lib/server/redis';
-import { validateScript } from '$lib/server/validate';
+import { isValidationError, prepareScript } from '$lib/server/validate';
 import type { RequestHandler } from './$types';
 
 const SUBMITS_PER_MINUTE = 20;
@@ -25,15 +25,26 @@ export const POST: RequestHandler = async ({ request }) => {
 	if (typeof script !== 'string' || script.length === 0) {
 		return json({ error: 'body must be {"script": "..."}' }, { status: 400 });
 	}
-	if (Buffer.byteLength(script) > MAX_SCRIPT_BYTES) {
-		return json({ error: `script exceeds ${MAX_SCRIPT_BYTES} bytes` }, { status: 413 });
+	if (Buffer.byteLength(script) > MAX_RAW_SCRIPT_BYTES) {
+		return json({ error: `script exceeds ${MAX_RAW_SCRIPT_BYTES} bytes` }, { status: 413 });
 	}
 
-	const invalid = validateScript(script);
-	if (invalid) return json(invalid, { status: 422 });
+	// Minifies as well as compile-checks. The device limit applies to what comes
+	// out, so comments and indentation no longer count against it.
+	const prepared = prepareScript(script);
+	if (isValidationError(prepared)) {
+		return json(prepared, { status: prepared.tooBig ? 413 : 422 });
+	}
 
 	const jobId = crypto.randomUUID();
-	const result = await submitJob(r, key.id, { jobId, keyId: key.id, holder: key.name, script });
+	const result = await submitJob(r, key.id, {
+		jobId,
+		keyId: key.id,
+		holder: key.name,
+		script: prepared.script,
+		map: prepared.map,
+		rawBytes: prepared.rawBytes
+	});
 	if (result.status !== 'ok') {
 		const error =
 			result.status === 'nolock' ? 'no lock held — POST /v1/lock first' : 'lock held by another key';
@@ -50,5 +61,14 @@ export const POST: RequestHandler = async ({ request }) => {
 		result: 'running'
 	});
 
-	return json({ jobId, ttl_ms: result.ttlMs }, { status: 202 });
+	return json(
+		{
+			jobId,
+			ttl_ms: result.ttlMs,
+			bytes: prepared.bytes,
+			raw_bytes: prepared.rawBytes,
+			...(prepared.minified ? {} : { warning: prepared.warning })
+		},
+		{ status: 202 }
+	);
 };

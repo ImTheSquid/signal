@@ -75,10 +75,8 @@ AUTH="Authorization: Bearer $TOKEN"
 # JSON-encode the script body. Doing this in python avoids hand-rolled quoting,
 # which breaks on the backslashes and quotes real scripts contain.
 #
-# Deliberately sends the script as written. An earlier version minified it to dodge
-# a firmware bug that silently dropped any frame over ~1KB; that bug is fixed in
-# the firmware (see crates/wsframe), so the workaround is gone. A light still
-# running firmware from before that fix will drop large scripts.
+# Sends the script as written, comments and all: POST /v1/script minifies it before
+# storing it, so the device gets the stripped form either way.
 body() {
   python3 -c "import json,sys; print(json.dumps({'script': open(sys.argv[1]).read()}))" "$1"
 }

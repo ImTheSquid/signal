@@ -2,7 +2,11 @@ import { z } from "zod";
 
 // ---- Shared limits (mirrored in crates/script-env) ----
 
+/** Size of the script that reaches the device, measured after minification. */
 export const MAX_SCRIPT_BYTES = 16 * 1024;
+/** Size of a script as submitted. Comments and indentation are stripped before
+ *  MAX_SCRIPT_BYTES applies, so this bounds the work one request can ask for. */
+export const MAX_RAW_SCRIPT_BYTES = 256 * 1024;
 export const WS_MAX_PAYLOAD = 32 * 1024;
 /** Device sends a state message at least this often as a WS keepalive. */
 export const DEVICE_HEARTBEAT_MS = 20_000;
@@ -21,6 +25,10 @@ export const REDIS = {
   key: (id: string) => `key:${id}`,
   keys: "keys",
   idle: "idle",
+  /** Source map for the idle script. A separate key rather than a field on
+   *  `idle`, whose schema is spread straight into the `hello` frame — a map
+   *  added there would ride to the device and undo the minification. */
+  idleMap: "idle:map",
   device: "device",
   history: "history",
   settings: "settings",
@@ -47,7 +55,15 @@ export const JobSchema = z.object({
   keyId: z.string(),
   /** Key holder's display name — the device exposes it to idle scripts. */
   holder: z.string().default(""),
+  /** Minified. What the device runs, and what `map` resolves positions against. */
   script: z.string(),
+  /** Source Map v3 for `script`. Absent when the script was not minified, or was
+   *  generated rather than submitted. Server-side only: the `job` frame is built
+   *  field by field, so this never reaches the device. Lives here rather than
+   *  under its own key so that it expires with the job. */
+  map: z.string().optional(),
+  /** Submitted size, for reporting what minification saved. */
+  rawBytes: z.number().optional(),
   expiresAt: z.number(),
 });
 export type Job = z.infer<typeof JobSchema>;
@@ -89,7 +105,10 @@ export const HistoryEntrySchema = z.object({
   start: z.number(),
   end: z.number().nullable(),
   result: z.enum(["ok", "error", "aborted", "deadline", "preempted", "running", "lost"]),
+  /** Positions rewritten to the script as submitted, where a map allowed it. */
   error: z.string().optional(),
+  /** What the device reported, kept only when remapping changed it. */
+  deviceError: z.string().optional(),
   /** Collapsed consecutive runs by the same key (absent = 1). */
   runs: z.number().optional(),
 });

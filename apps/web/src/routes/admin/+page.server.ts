@@ -10,7 +10,7 @@ import { clearHistory, getHistory, getSettings, pushHistory, setSettings } from 
 import { createKey, revokeKey } from '$lib/server/keys';
 import { acquireLock, forceRelease, getLock, releaseLock, submitJob } from '$lib/server/locks';
 import { redis } from '$lib/server/redis';
-import { validateScript } from '$lib/server/validate';
+import { isValidationError, prepareScript } from '$lib/server/validate';
 import type { Actions, PageServerLoad } from './$types';
 
 export interface AdminKeyRow {
@@ -126,16 +126,20 @@ export const actions: Actions = {
 		if (!authed(cookies)) return fail(401, { error: 'not logged in' });
 		const form = await request.formData();
 		const script = String(form.get('script') ?? '');
-		const invalid = validateScript(script);
-		if (invalid) {
-			return fail(422, { error: `line ${invalid.line ?? '?'}: ${invalid.error}` });
+		const prepared = prepareScript(script);
+		if (isValidationError(prepared)) {
+			const where = prepared.line === null ? '' : `line ${prepared.line}: `;
+			return fail(prepared.tooBig ? 413 : 422, { error: `${where}${prepared.error}` });
 		}
 		const r = redis();
 		const prev = await r.get<Idle>(REDIS.idle);
-		const idle: Idle = { script, rev: (prev?.rev ?? 0) + 1 };
+		const idle: Idle = { script: prepared.script, rev: (prev?.rev ?? 0) + 1 };
 		await r.set(REDIS.idle, JSON.stringify(idle));
+		// Separate key: the idle schema is spread straight into the `hello` frame, so
+		// a map stored on it would ride to the device.
+		await r.set(REDIS.idleMap, prepared.map);
 		await r.publish(REDIS.eventsChannel, JSON.stringify({ type: 'idle' }));
-		return { ok: true };
+		return { ok: true, bytes: prepared.bytes, rawBytes: prepared.rawBytes };
 	},
 
 	kill: async ({ cookies }) => {

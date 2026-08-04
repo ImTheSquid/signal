@@ -24,6 +24,9 @@ import {
 	type Job,
 	type ServerMsg
 } from '@traffic-light/protocol';
+// Imported straight from the wasm package rather than through `$lib`, which only
+// resolves inside SvelteKit. The nodejs-target build is CJS, so plain Node loads it.
+import { remap as remapError } from '@traffic-light/validator-wasm';
 
 const redisUrl = process.env.REDIS_URL ?? 'redis://localhost:6379';
 // maxRetriesPerRequest: null so commands queue rather than fail across a
@@ -101,13 +104,27 @@ async function recordJobDone(msg: {
 	result: 'ok' | 'error' | 'aborted' | 'deadline';
 	error?: string;
 }): Promise<void> {
+	// Read before the delete below: the device reports positions against the
+	// minified script, and the map that translates them expires with the job.
+	const raw = await redis.get(REDIS.jobCurrent);
+	const job = raw ? (JSON.parse(raw) as Job) : null;
+
 	const entries = await redis.lrange(REDIS.history, 0, HISTORY_LENGTH - 1);
 	for (let i = 0; i < entries.length; i++) {
 		const entry = JSON.parse(entries[i]) as HistoryEntry;
 		if (entry.jobId === msg.id) {
 			entry.end = Date.now();
 			entry.result = msg.result;
-			if (msg.error) entry.error = msg.error;
+			if (msg.error) {
+				const mapped =
+					job?.jobId === msg.id && job.map
+						? remapError(job.map, job.script, msg.error)
+						: msg.error;
+				entry.error = mapped;
+				// Keep what the device actually said when it differs, so a wrong map
+				// cannot destroy the only copy of the error.
+				if (mapped !== msg.error) entry.deviceError = msg.error;
+			}
 			await redis.lset(REDIS.history, i, JSON.stringify(entry));
 			// Now terminal — merge into a same-key streak if adjacent.
 			await redis.eval(COLLAPSE_HISTORY_LUA, 1, REDIS.history);
@@ -115,8 +132,7 @@ async function recordJobDone(msg: {
 		}
 	}
 	// Clear the stored job so reconnect hellos don't replay a finished script.
-	const raw = await redis.get(REDIS.jobCurrent);
-	if (raw && (JSON.parse(raw) as Job).jobId === msg.id) {
+	if (job?.jobId === msg.id) {
 		await redis.del(REDIS.jobCurrent);
 	}
 	await redis.publish(REDIS.eventsChannel, JSON.stringify({ type: 'update' }));

@@ -153,6 +153,8 @@ fn leading_u32(s: &str) -> (Option<u32>, &str) {
     (s[..end].parse().ok(), &s[end..])
 }
 
+/// A size rejection rather than a parse failure: no position to report, and the
+/// API answers 413 rather than 422.
 fn reject(error: &str) -> String {
-    json!({ "ok": false, "error": error, "line": null, "col": null }).to_string()
+    json!({ "ok": false, "error": error, "line": null, "col": null, "tooBig": true }).to_string()
 }
