@@ -20,7 +20,8 @@ fn text(v: &Value) -> String {
     v["script"].as_str().unwrap().to_string()
 }
 
-/// Valid under the restricted engine: no closures, modules, or f64 literals.
+/// Everything the invariants must hold for: hand-written cases valid under the
+/// restricted engine (no closures, modules, or f64 literals), plus the real script.
 const SCRIPTS: &[&str] = &[
     "set_lights(true, false, false);\n",
     "// a comment\nlet x = 1; /* and another */\nsleep(x);\n",
@@ -29,12 +30,13 @@ const SCRIPTS: &[&str] = &[
     "let a = 5;\nlet b = a - -1;\nsleep(b);\n",
     "for i in 0..3 {\n    sleep(i);\n}\n",
     "try {\n    sleep(1);\n} catch (e) {\n    sleep(2);\n}\n",
+    FOLLOW,
 ];
 
 #[test]
 fn output_still_compiles_under_the_device_engine() {
     let engine = script_env::validation_engine();
-    for src in SCRIPTS.iter().chain(std::iter::once(&FOLLOW)) {
+    for &src in SCRIPTS {
         let out = text(&ok(src));
         engine
             .compile(&out)
@@ -44,7 +46,7 @@ fn output_still_compiles_under_the_device_engine() {
 
 #[test]
 fn output_never_grows_and_is_a_fixed_point() {
-    for src in SCRIPTS.iter().chain(std::iter::once(&FOLLOW)) {
+    for &src in SCRIPTS {
         let once = text(&ok(src));
         assert!(once.len() <= src.len(), "{src:?} grew to {once:?}");
         assert_eq!(once, text(&ok(&once)), "not idempotent for {src:?}");
@@ -92,13 +94,13 @@ fn undeclared_variables_are_still_rejected() {
 
 #[test]
 fn oversized_raw_input_is_rejected_before_minifying() {
-    let huge = format!("// {}\nsleep(1);\n", "x".repeat(script_env::MAX_RAW_SCRIPT_BYTES));
+    let huge = format!(
+        "// {}\nsleep(1);\n",
+        "x".repeat(script_env::MAX_RAW_SCRIPT_BYTES)
+    );
     let v = prepared(&huge);
     assert_eq!(v["ok"], Value::Bool(false));
-    assert!(
-        v["error"].as_str().unwrap().contains("limit is"),
-        "got {v}"
-    );
+    assert!(v["error"].as_str().unwrap().contains("limit is"), "got {v}");
 }
 
 /// A script whose comments push it past the device limit but whose code fits is
@@ -129,8 +131,7 @@ fn remap_recovers_the_authored_line() {
 
     let out = validator::remap(map, &min, &message);
     assert_eq!(
-        out,
-        "Function not found: set_lights (line 4, position 1)",
+        out, "Function not found: set_lights (line 4, position 1)",
         "minified was {min:?}"
     );
 }

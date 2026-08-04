@@ -3,20 +3,6 @@ use rhaiper::{minify_with_engine, Options};
 use serde_json::json;
 use wasm_bindgen::prelude::*;
 
-/// Source name recorded in the map. Submitted scripts have no filename, so this
-/// only surfaces if a map is read by external tooling.
-const SOURCE_NAME: &str = "script";
-
-fn map_options() -> MapOptions {
-    MapOptions {
-        // A copy of the original script would roughly double what the map costs to
-        // store, and nothing here reads it back — only positions are wanted.
-        include_sources_content: false,
-        source_name: SOURCE_NAME.to_string(),
-        ..Default::default()
-    }
-}
-
 /// Compile-check a script and minify it for the device.
 ///
 /// Returns JSON: {"ok":true,"script":...,"map":...,"rawBytes":N,"bytes":M,"minified":bool}
@@ -50,10 +36,22 @@ pub fn prepare(script: &str) -> String {
                     script_env::MAX_SCRIPT_BYTES
                 ));
             }
+            let map = out.to_source_map(
+                script,
+                &MapOptions {
+                    // A copy of the original would roughly double what the map costs
+                    // to store, and nothing reads it back — only positions are wanted.
+                    include_sources_content: false,
+                    // Submitted scripts have no filename. Only external source-map
+                    // tooling would ever see this.
+                    source_name: "script".into(),
+                    ..Default::default()
+                },
+            );
             json!({
                 "ok": true,
                 "script": out.text,
-                "map": out.to_source_map(script, &map_options()),
+                "map": map,
                 "rawBytes": script.len(),
                 "bytes": out.text.len(),
                 "minified": true,
@@ -108,23 +106,22 @@ pub fn prepare(script: &str) -> String {
 /// Anything that does not resolve is left exactly as it arrived.
 #[wasm_bindgen]
 pub fn remap(map_json: &str, minified: &str, message: &str) -> String {
+    const LINE: &str = "line ";
+    const POS: &str = ", position ";
+
     let Ok(map) = SourceMap::from_json(map_json) else {
         return message.to_string();
     };
-
-    const LINE: &str = "line ";
-    const POS: &str = ", position ";
 
     let mut out = String::with_capacity(message.len());
     let mut rest = message;
 
     while let Some(at) = rest.find(LINE) {
-        let (head, tail) = rest.split_at(at);
+        // The marker goes out with the text before it, so a position that does not
+        // resolve cannot rescan it.
+        let (head, tail) = rest.split_at(at + LINE.len());
         out.push_str(head);
-        out.push_str(LINE);
-        // Past the marker either way, so a position that does not resolve cannot
-        // rescan the same text.
-        rest = &tail[LINE.len()..];
+        rest = tail;
 
         let (Some(line), after) = leading_u32(rest) else {
             continue;

@@ -107,7 +107,9 @@ async function recordJobDone(msg: {
 	// Read before the delete below: the device reports positions against the
 	// minified script, and the map that translates them expires with the job.
 	const raw = await redis.get(REDIS.jobCurrent);
-	const job = raw ? (JSON.parse(raw) as Job) : null;
+	const stored = raw ? (JSON.parse(raw) as Job) : null;
+	// Only the job this message is about can explain its positions.
+	const job = stored?.jobId === msg.id ? stored : null;
 
 	const entries = await redis.lrange(REDIS.history, 0, HISTORY_LENGTH - 1);
 	for (let i = 0; i < entries.length; i++) {
@@ -116,10 +118,7 @@ async function recordJobDone(msg: {
 			entry.end = Date.now();
 			entry.result = msg.result;
 			if (msg.error) {
-				const mapped =
-					job?.jobId === msg.id && job.map
-						? remapError(job.map, job.script, msg.error)
-						: msg.error;
+				const mapped = job?.map ? remapError(job.map, job.script, msg.error) : msg.error;
 				entry.error = mapped;
 				// Keep what the device actually said when it differs, so a wrong map
 				// cannot destroy the only copy of the error.
@@ -132,9 +131,7 @@ async function recordJobDone(msg: {
 		}
 	}
 	// Clear the stored job so reconnect hellos don't replay a finished script.
-	if (job?.jobId === msg.id) {
-		await redis.del(REDIS.jobCurrent);
-	}
+	if (job) await redis.del(REDIS.jobCurrent);
 	await redis.publish(REDIS.eventsChannel, JSON.stringify({ type: 'update' }));
 }
 

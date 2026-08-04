@@ -61,13 +61,15 @@ export const POST: RequestHandler = async ({ request }) => {
 		result: 'running'
 	});
 
+	// `warning` is only set when minification was declined, and JSON drops it when
+	// undefined, so the field appears exactly when there is something to say.
 	return json(
 		{
 			jobId,
 			ttl_ms: result.ttlMs,
 			bytes: prepared.bytes,
 			raw_bytes: prepared.rawBytes,
-			...(prepared.minified ? {} : { warning: prepared.warning })
+			warning: prepared.warning
 		},
 		{ status: 202 }
 	);

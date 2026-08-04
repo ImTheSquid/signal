@@ -139,7 +139,7 @@ export const actions: Actions = {
 		// a map stored on it would ride to the device.
 		await r.set(REDIS.idleMap, prepared.map);
 		await r.publish(REDIS.eventsChannel, JSON.stringify({ type: 'idle' }));
-		return { ok: true, bytes: prepared.bytes, rawBytes: prepared.rawBytes };
+		return { ok: true };
 	},
 
 	kill: async ({ cookies }) => {

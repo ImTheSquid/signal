@@ -1,4 +1,4 @@
-import { prepare as prepareWasm, remap as remapWasm } from '@traffic-light/validator-wasm';
+import { prepare as prepareWasm } from '@traffic-light/validator-wasm';
 
 export interface ValidationError {
 	error: string;
@@ -21,37 +21,20 @@ export interface PreparedScript {
 	warning?: string;
 }
 
-type PrepareResult =
-	| ({ ok: true } & PreparedScript)
-	| ({ ok: false } & ValidationError);
+type PrepareResult = ({ ok: true } & PreparedScript) | ({ ok: false } & ValidationError);
 
 /**
  * Compile-check a script with the same Rhai engine config the ESP32 runs, and
  * minify it. Error positions refer to the submitted text, not the minified text.
+ *
+ * `ok` is dropped: callers put the error straight on the wire, where it would be a
+ * field the API never used to return.
  */
 export function prepareScript(script: string): PreparedScript | ValidationError {
-	const result = JSON.parse(prepareWasm(script)) as PrepareResult;
-	if (!result.ok) {
-		return {
-			error: result.error,
-			line: result.line,
-			col: result.col,
-			tooBig: result.tooBig
-		};
-	}
-	const { script: minified, map, rawBytes, bytes, minified: wasMinified, warning } = result;
-	return { script: minified, map, rawBytes, bytes, minified: wasMinified, warning };
+	const { ok: _ok, ...result } = JSON.parse(prepareWasm(script)) as PrepareResult;
+	return result;
 }
 
 export function isValidationError(v: PreparedScript | ValidationError): v is ValidationError {
 	return 'error' in v;
-}
-
-/**
- * Rewrite the positions in a device-reported error so they point at the script as
- * submitted. `minified` must be the text the device actually ran.
- */
-export function remapError(map: string, minified: string, message: string): string {
-	if (!map) return message;
-	return remapWasm(map, minified, message);
 }
