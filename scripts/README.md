@@ -72,13 +72,25 @@ Peaks were `R=255 G=131 B=255`, median non-zero level 118. Three consequences:
 - **The output is dark 72% of the time, and the light must not be.** So DMX supplies only
   *colour* and *tempo*; the pattern itself is generated. Density is no longer bounded by
   rekordbox's duty cycle, which is what made every earlier version look sparse.
-- **rekordbox sends one saturated colour at a time.** Measured off the wire: with a 3-channel
-  RGB par patched at 1-3, one channel carries 255 and the other two sit at exactly zero, the
-  live one rotating every few bars. A colour-faithful mapping onto three *coloured* lamps
-  therefore lights one lamp at a time, which is sparse by construction. So the palette has a
-  floor of **two** lamps — a frame that would light fewer lights all three, and the look is then
-  restricted to the walking ones (chase, build, scatter) rather than the unison ones, since
-  three lamps in unison is the fault signal.
+- **Nothing rekordbox sends moves at beat rate.** This is the measurement that matters most, and
+  it contradicts what the design originally assumed. With an RGB par at 1-3 and an 8-channel
+  moving head at 4-11, captured with music playing:
+
+  | channel | peak | levels | period | rises/s |
+  |---|---|---|---|---|
+  | par R / G / B | 255 | 20 / 4 / 3 | 7050 / 4300 / 950ms | 0.3 / 0.1 / 0.1 |
+  | MH dimmer | 255 | 107 | 3700ms | 0.5 |
+  | MH pan / tilt | 205 / 102 | 55 / 68 | ~6000ms | 0.4 / 0.3 |
+  | MH strobe | — | rekordbox never drives it | | |
+
+  Beat rate at any dance tempo is ~2/s; the fastest channel here manages 0.5. The engine
+  automates on a 3-9 second timescale — bars and phrases, not beats. Earlier notes claiming the
+  stream is beat-synced were wrong.
+
+  So the rhythm is **generated**, and DMX supplies only colour (par RGB), energy (the moving
+  head's dimmer, by far the best signal at 107 levels over the full range) and phrase position
+  (pan/tilt). A beat estimator is still there and still engages if a macro ever does emit
+  beat-rate onsets, but density no longer depends on it.
 
 Two AGC references, not one, because they answer different questions. Deciding *which lamp*
 wants a **per-channel** peak, so a channel the venue only drives to half still uses its lamp.
@@ -94,22 +106,30 @@ onsets. Onset intervals are octave-folded into 280-1000ms and fed to an agreemen
 giving a beat period and a phase anchor. Three disagreeing intervals in a row are read as a
 track change and taken as the new tempo.
 
-The pattern then renders on a quarter-beat grid inside the palette, re-rolling `look` every
-`LOOK_BEATS` beats. Each onset punches the whole palette through for one dwell period as an
-accent, over whatever look is running.
+The pattern renders on a quarter-beat grid. Two things decide what is lit:
+
+- **Which lamps** — the three lamps are ranked by their own normalised colour level, brightest
+  first, so a look that lights `k` lamps lights the `k` the music is most in.
+- **How many** — width comes from the energy envelope: one lamp when quiet, two past
+  `WIDE_AT`, three past `FULL_AT`, and zero in a look's rest phases. Measured across a real
+  stream, the light spends 29% / 16% / 30% / 23% of its writes on 0 / 1 / 2 / 3 lamps.
+
+`look` is re-rolled every `LOOK_BEATS` beats and each onset punches all three through briefly as
+an accent.
 
 | `look` | name | what it does |
 |---|---|---|
-| 0 | pump | palette on the front half of every cycle; breathes |
-| 1 | chase | one palette lamp per half cycle, walking |
+| 0 | pulse | full width on the front half of the cycle; breathes |
+| 1 | chase | a single lamp walking the ranking, half a cycle each |
 | 2 | stab | two hits per cycle with gaps, so the off is as loud as the on |
 | 3 | offbeat | skips the downbeat entirely; syncopated against the track |
-| 4 | build | one lamp when quiet, whole palette flickering at quarter resolution when loud |
-| 5 | scatter | one or two palette lamps, re-rolled every quarter |
+| 4 | swell | width climbs 1 → 2 → 3 across the cycle, then drops to nothing |
+| 5 | scatter | random width and starting lamp, re-rolled every half cycle |
 
-The chase, build and scatter looks walk a slot count of **at least two**, where a slot past the
-end of the palette means all off. Without that, a colour lighting only one lamp made three of
-the six looks completely static — measured as 6 transitions across a 6s green-only passage.
+A **stillness watchdog** guarantees a change at least every half cycle: one look's rest phase
+running into the next look's rest phase held the lamps for 825ms, and the watchdog cuts the worst
+case to 400ms. It fires at most once per quarter and only when the pattern would otherwise be
+still, so it costs nothing where the light is already busy.
 
 After `DEAD_MS` with no DMX at all the bridge is assumed gone and the light falls back to a slow
 wander. Deliberately neither a red-yellow-green sequence nor all three lamps at 1Hz: the first
@@ -138,21 +158,23 @@ quarter-beat grid of the tempo playing, versus the grid of a tempo that is not:
 
 | stream | on its own grid | on the wrong grid | noise floor |
 |---|---|---|---|
-| 128 BPM | 0.469 | 0.010 | 0.051 |
-| 100 BPM | 0.547 | 0.041 | 0.055 |
+| 128 BPM | 0.579 | 0.019 | 0.051 |
+| 100 BPM | 0.421 | 0.017 | 0.055 |
 
-Density, across three streams — the third being the measured shape of real output, at the ~10Hz
-the bridge actually delivers rather than the 41Hz DMX rate:
+Density, across four streams. The last is the measured shape of real output — both fixtures, at
+the ~10Hz the bridge actually delivers rather than the 41Hz DMX rate — and is the one that counts:
 
 | stream | transitions/s | longest still gap |
 |---|---|---|
-| kick on every beat, 41Hz | 6.8 | — |
-| sparse, mostly dark, 41Hz | 6.2 | 480ms |
-| one saturated colour at a time, 10Hz | 6.6 | 580ms |
+| kick on every beat, 41Hz | 6.9 | — |
+| sparse, mostly dark, 41Hz | 6.9 | 268ms |
+| one saturated colour at a time, 10Hz | 7.3 | 260ms |
+| **measured: par + moving head, 10Hz** | **5.7** | **400ms** |
 
-**This is the relay ceiling, not a design choice.** At that density the pattern costs 296 / 272 /
-269 operations per minute for red / yellow / green against a datasheet maximum of 300/min. There
-is no headroom left for a denser pattern on mechanical relays.
+**This is the relay ceiling, not a design choice.** The pattern costs 264 / 254 / 268 operations
+per minute for red / yellow / green against a datasheet maximum of 300/min. An earlier attempt at
+a denser version hit 320/min and the dwell gate began arbitrating which writes landed — which
+cost the tempo lock too, halving it to 0.247. Anything busier needs solid-state relays.
 
 ### Tuning
 
@@ -160,16 +182,17 @@ All of them are `let` bindings at the top of the file, in this order:
 
 | name | effect |
 |---|---|
-| `LAMP_CUT` | normalised level at which a lamp joins the palette; lower lights more lamps together |
+| `WIDE_AT`, `FULL_AT` | energy thresholds for the second and third lamp; lower lights more together |
+| `DIMMER_CH` | index of the moving head's dimmer channel, the energy source |
 | `LOOK_BEATS` | beats before a new look is chosen; lower changes character more often |
 | `THR_MULT`, `THR_BIAS` | onset sensitivity against the adaptive floor; lower finds more onsets and more accents |
 | `PEAK_DECAY` | how fast the AGC ceiling falls, per step; lower adapts quicker to a dimmer track |
 | `PEAK_FLOOR` | raw floor under the AGC ceiling, so a dark passage cannot amplify noise |
-| `DARK` | normalised level below which a frame carries no colour and the palette latches |
 | `STEP` | decision cadence in ms; kept above the ~41Hz DMX rate |
 | `FLUX_SMOOTH`, `THR_SMOOTH` | EMA rates for the flux signal and its floor |
 | `REFRACT` | minimum ms between onsets |
-| `BEAT_MIN`, `BEAT_MAX` | the octave-folding window, 214 to 60 BPM |
+| `BEAT_MIN`, `BEAT_MAX` | the octave-folding window, 158 to 88 BPM |
+| `PATTERN_MAX` | longest pattern cycle; bounds how still the light can get |
 | `BEAT_GAP` | an onset interval longer than this says nothing about tempo |
 | `AGREE_PCT` | how far an interval may sit from the estimate and still be folded in |
 | `DEAD_MS` | DMX silence before the bridge is assumed gone |

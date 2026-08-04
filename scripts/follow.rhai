@@ -1,26 +1,41 @@
-fn pick(pal, i) {
+fn pickn(ord, start, k) {
     let out = [false, false, false];
-    if i < pal.len() { out[pal[i]] = true; }
+    let i = 0;
+    while i < k && i < 3 {
+        out[ord[(start + i) % 3]] = true;
+        i += 1;
+    }
     out
+}
+
+fn order3(a, b, c) {
+    let ord = [0, 1, 2];
+    let lev = [a, b, c];
+    if lev[ord[1]] > lev[ord[0]] { let t = ord[0]; ord[0] = ord[1]; ord[1] = t; }
+    if lev[ord[2]] > lev[ord[1]] { let t = ord[1]; ord[1] = ord[2]; ord[2] = t; }
+    if lev[ord[1]] > lev[ord[0]] { let t = ord[0]; ord[0] = ord[1]; ord[1] = t; }
+    ord
 }
 
 let STEP = 20;
 let PEAK_DECAY = 0.999;
 let PEAK_FLOOR = 20.0;
-let LAMP_CUT = 0.30;
-let DARK = 0.12;
+let DARK = 0.10;
 let FLUX_SMOOTH = 0.30;
 let THR_SMOOTH = 0.02;
 let THR_MULT = 1.8;
 let THR_BIAS = 0.03;
 let REFRACT = 110;
-let BEAT_MIN = 280;
-let BEAT_MAX = 1000;
-let BEAT_GAP = 3000;
-let AGREE_PCT = 22;
+let BEAT_MIN = 380;
+let BEAT_MAX = 680;
+let BEAT_GAP = 6000;
+let AGREE_PCT = 25;
 let LOOK_BEATS = 8;
 let DEAD_MS = 8000;
 let PATTERN_MAX = 700;
+let DIMMER_CH = 4;
+let WIDE_AT = 0.30;
+let FULL_AT = 0.65;
 
 let DWELL = lamp_dwell_ms();
 if DWELL < 1 { DWELL = 1; }
@@ -39,14 +54,12 @@ let period = 500;
 let anchor = 0;
 let disagree = 0;
 
-let lr = true;
-let ly = true;
-let lg = true;
+let ord = [0, 1, 2];
 
 let beat_count = 0;
 let last_slot = -1;
-let scatter_a = 0;
-let scatter_b = -1;
+let scatter_start = 0;
+let scatter_w = 1;
 
 let look = 0;
 let look_until = 0;
@@ -56,6 +69,9 @@ let cur_r = false;
 let cur_y = false;
 let cur_g = false;
 let last_change = -99999;
+
+let nudge = false;
+let nudge_s = [false, false, false];
 
 let t0 = millis();
 let next = t0;
@@ -83,32 +99,16 @@ loop {
         if g > pk_g { pk_g = g; }
         if b > pk_b { pk_b = b; }
 
-        let nr = r / pk_r;
-        let ng = g / pk_g;
-        let nb = b / pk_b;
+        ord = order3(r / pk_r, b / pk_b, g / pk_g);
 
         let raw = r;
         if g > raw { raw = g; }
         if b > raw { raw = b; }
+        if p.ch.len() > DIMMER_CH { raw = p.ch[DIMMER_CH].to_float(); }
         pk_e *= PEAK_DECAY;
         if pk_e < PEAK_FLOOR { pk_e = PEAK_FLOOR; }
         if raw > pk_e { pk_e = raw; }
         let e = raw / pk_e;
-
-        if e > DARK {
-            lr = nr >= LAMP_CUT;
-            lg = ng >= LAMP_CUT;
-            ly = nb >= LAMP_CUT;
-            let width = 0;
-            if lr { width += 1; }
-            if ly { width += 1; }
-            if lg { width += 1; }
-            if width < 2 {
-                lr = true;
-                ly = true;
-                lg = true;
-            }
-        }
 
         let d = e - e_prev;
         if d < 0.0 { d = 0.0; }
@@ -153,77 +153,66 @@ loop {
     if since < 0 { since = 0; }
     let frac = (since % pd) * 1000 / pd;
     let quarter = frac / 250;
+    let half = frac / 500;
 
-    let pal = [];
-    if lr { pal.push(0); }
-    if ly { pal.push(1); }
-    if lg { pal.push(2); }
-    if pal.len() == 0 { pal.push(0); }
-    let n = pal.len();
-    if n < 2 { n = 2; }
+    let w = 1;
+    if lvl > WIDE_AT { w = 2; }
+    if lvl > FULL_AT { w = 3; }
 
     if quarter != last_slot {
         if quarter == 0 { beat_count += 1; }
+        nudge = false;
+        if quarter % 2 == 0 {
+            scatter_start = rand_int(0, 2);
+            scatter_w = rand_int(0, w);
+            if scatter_w == 0 && rand_chance(0.6) { scatter_w = 1; }
+        }
         last_slot = quarter;
-        scatter_a = rand_int(0, n - 1);
-        scatter_b = -1;
-        if rand_chance(0.45) { scatter_b = rand_int(0, n - 1); }
     }
 
     if beat_count >= look_until {
         look_until = beat_count + LOOK_BEATS;
-        if pal.len() == 3 {
-            let m = rand_int(0, 2);
-            if m == 0 { look = 1; } else if m == 1 { look = 4; } else { look = 5; }
-        } else {
-            look = rand_int(0, 5);
-        }
+        look = rand_int(0, 5);
     }
 
-    let wr = false;
-    let wy = false;
-    let wg = false;
+    let s = [false, false, false];
 
     if now - last_pkt >= DEAD_MS {
-        let k = (beat_count / 2) % 3;
-        wr = k == 0;
-        wy = k == 1;
-        wg = k == 2;
+        s = pickn(ord, beat_count, 1 + (beat_count / 3) % 2);
     } else if now < accent_until {
-        wr = lr; wy = ly; wg = lg;
+        s = pickn(ord, 0, 3);
     } else if look == 0 {
-        let on = frac < 500;
-        wr = lr && on; wy = ly && on; wg = lg && on;
+        if quarter < 2 { s = pickn(ord, 0, w); }
     } else if look == 1 {
-        let s = pick(pal, (beat_count * 2 + frac / 500) % n);
-        wr = s[0]; wy = s[1]; wg = s[2];
+        s = pickn(ord, beat_count * 2 + half, 1);
     } else if look == 2 {
-        let on = frac < 250 || (frac >= 500 && frac < 750);
-        wr = lr && on; wy = ly && on; wg = lg && on;
+        if quarter == 0 || quarter == 2 { s = pickn(ord, 0, w); }
     } else if look == 3 {
-        let on = (frac >= 500 && frac < 750) || frac >= 875;
-        wr = lr && on; wy = ly && on; wg = lg && on;
+        if quarter >= 2 { s = pickn(ord, half, w); }
     } else if look == 4 {
-        if lvl > 0.55 {
-            let on = quarter % 2 == 0;
-            wr = lr && on; wy = ly && on; wg = lg && on;
-        } else {
-            let s = pick(pal, beat_count % n);
-            let on = frac < 500;
-            wr = s[0] && on; wy = s[1] && on; wg = s[2] && on;
-        }
+        let k = quarter + 1;
+        if k > 3 { k = 0; }
+        if k > w + 1 { k = w + 1; }
+        s = pickn(ord, 0, k);
     } else {
-        let s = pick(pal, scatter_a);
-        wr = s[0]; wy = s[1]; wg = s[2];
-        if scatter_b >= 0 {
-            let s2 = pick(pal, scatter_b);
-            wr = wr || s2[0]; wy = wy || s2[1]; wg = wg || s2[2];
-        }
+        s = pickn(ord, scatter_start, scatter_w);
     }
 
-    if (wr != cur_r || wy != cur_y || wg != cur_g) && now - last_change >= DWELL {
-        set_lights(wr, wy, wg);
-        cur_r = wr; cur_y = wy; cur_g = wg;
+    if !nudge && now - last_change >= pd / 2 {
+        nudge = true;
+        if cur_r || cur_y || cur_g {
+            nudge_s = [false, false, false];
+        } else {
+            let k = w;
+            if k < 1 { k = 1; }
+            nudge_s = pickn(ord, beat_count, k);
+        }
+    }
+    if nudge { s = nudge_s; }
+
+    if (s[0] != cur_r || s[1] != cur_y || s[2] != cur_g) && now - last_change >= DWELL {
+        set_lights(s[0], s[1], s[2]);
+        cur_r = s[0]; cur_y = s[1]; cur_g = s[2];
         last_change = now;
     }
 

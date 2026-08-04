@@ -462,3 +462,89 @@ fn stays_dense_on_one_saturated_colour_at_10hz() {
         );
     }
 }
+
+/// The stream as *measured* off the wire with both fixtures patched — an RGB par
+/// at 1-3 and an 8-channel moving head at 4-11.
+///
+/// The measurements that matter, and they contradict what the design assumed:
+/// nothing rekordbox sends moves at beat rate. The colour channels fade over more
+/// than 9s (0.5 rises/s) and pan/tilt are perfectly smooth 9s sweeps with *zero*
+/// rises. The moving head's dimmer is the only real rhythm source at 1.3 rises/s,
+/// on a 3350ms cycle — roughly two bars, not a beat. So the pattern's density
+/// cannot come from the stream; only its colour, energy and phrase position can.
+fn synth_measured(t: i64, _beat_ms: i64) -> Vec<u8> {
+    let f = t as f32 / 1000.0;
+    let tau = std::f32::consts::TAU;
+    // Colour: three slow fades at >9s, peaking where the real ones did.
+    let par_r = 92.0 * (0.5 + 0.5 * (tau * f / 11.0).sin()).max(0.0);
+    let par_g = 131.0 * (0.5 + 0.5 * (tau * f / 9.5 + 2.0).sin()).max(0.0);
+    let par_b = 180.0 * (0.5 + 0.5 * (tau * f / 10.5 + 4.0).sin()).max(0.0);
+    // Dimmer: a 3350ms envelope that swells, plateaus, falls and rests.
+    let ph = (t % 3350) as f32 / 3350.0;
+    let dim = if ph < 0.25 {
+        ph / 0.25
+    } else if ph < 0.5 {
+        1.0
+    } else if ph < 0.7 {
+        1.0 - (ph - 0.5) / 0.2
+    } else {
+        0.0
+    };
+    // Pan/tilt: smooth 9s sweeps, no steps at all.
+    let pan = 199.0 * (0.5 + 0.5 * (tau * f / 9.0).sin());
+    let tilt = 64.0 * (0.5 + 0.5 * (tau * f / 9.0 + 1.5).sin());
+    vec![
+        par_r as u8, par_g as u8, par_b as u8,
+        0,                       // MH mode, rekordbox cannot drive it
+        (255.0 * dim) as u8,     // MH dimmer
+        0,                       // MH strobe, unused by rekordbox
+        pan as u8, tilt as u8,
+        0, 0, 255,               // MH rgb: pinned blue
+    ]
+}
+
+/// Against real measured input the light must still be busy, even though the
+/// stream contains no beat-rate information for it to follow.
+#[test]
+fn stays_dense_on_the_measured_stream() {
+    let run = run_at(BEAT_MS, synth_measured, FRAME_MS_REAL);
+    let per_sec = run.changes.len() as f64 / (run.end_ms as f64 / 1000.0);
+    let mut gap = 0;
+    for w in run.changes.windows(2) {
+        gap = gap.max(w[1].0 - w[0].0);
+    }
+    let used = [
+        run.changes.iter().filter(|c| c.1).count(),
+        run.changes.iter().filter(|c| c.2).count(),
+        run.changes.iter().filter(|c| c.3).count(),
+    ];
+    let mut width = [0usize; 4];
+    for c in &run.changes {
+        width[c.1 as usize + c.2 as usize + c.3 as usize] += 1;
+    }
+    let n = run.changes.len();
+    println!(
+        "measured stream: {per_sec:.1} transitions/s, longest still gap {gap}ms, \
+         lamp use r={} y={} g={} of {n}; width 0/1/2/3 = {}%/{}%/{}%/{}%",
+        used[0], used[1], used[2],
+        width[0] * 100 / n, width[1] * 100 / n, width[2] * 100 / n, width[3] * 100 / n
+    );
+    // Every width must appear: one lamp, several, and none, varying over time.
+    for k in 0..4 {
+        assert!(
+            width[k] * 50 >= n,
+            "width {k} occurred in only {}/{n} writes — the light should use all of them",
+            width[k]
+        );
+    }
+    assert!(per_sec >= 4.0, "only {per_sec:.1} transitions/s on real input");
+    assert!(gap <= 700, "light stood still for {gap}ms");
+    for (i, lamp) in ["red", "yellow", "green"].iter().enumerate() {
+        assert!(
+            used[i] * 20 >= run.changes.len(),
+            "{lamp} used in only {}/{} writes",
+            used[i],
+            run.changes.len()
+        );
+    }
+}
