@@ -52,6 +52,15 @@ use crate::wsproto::{DeviceMsg, JsonFramer, LightsJson, ServerMsg, ServerMsgRaw}
 // idle is region structure, not churn: the heap is several separate spans
 // (6K + 154K + 14K + 111K) and no allocation can straddle them, so the largest
 // block is capped by the largest region.
+//
+// Nor is the 38KB of pure IRAM the boot log lists as heap reachable.
+// `MALLOC_CAP_IRAM_8BIT` needs CONFIG_ESP32_IRAM_AS_8BIT_ACCESSIBLE_MEMORY,
+// which exists only in single-core builds — this one uses both cores — and
+// charges ~167 cycles per byte or unaligned access. rhai walks the AST reading
+// u8, bool and enum discriminants constantly, so it is the worst possible
+// tenant, and nothing else allocated here is word-only. The D/IRAM spans are
+// already in the heap; moving wifi code out of pure IRAM would free more of the
+// same unusable kind and gain no DRAM.
 
 const HEARTBEAT: Duration = Duration::from_secs(20);
 const WIFI_CHECK: Duration = Duration::from_secs(10);
