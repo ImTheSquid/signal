@@ -184,6 +184,15 @@ the source and obvious in the output, so the output is what is checked: transiti
 dwell compliance, green actually firing against a lower peak, movement through a 6s blackout,
 and no imitation of the firmware's 1Hz fault signal.
 
+Every stream in that file is *synthetic*, including the one built from measurements, so none of
+it can disagree with a live set. `FOLLOW_CAPTURE` points the `replays_a_capture` test at a real
+recording from `dmxcap.mjs` instead, and prints the lamp timeline the script would have produced
+from it — which is what `watch.mjs` records the light actually doing.
+
+```sh
+FOLLOW_CAPTURE=$PWD/dmx.txt cargo test -p script-env --test follow -- --nocapture
+```
+
 Tempo lock is measured against a control — circular concentration of transition times on the
 quarter-beat grid of the tempo playing, versus a grid it must not lock to. The last row is
 the case that broke live: 50% of its delivery windows are bunched into 300ms flushes, and
@@ -240,6 +249,27 @@ All of them are `let` bindings at the top of the file, in this order:
 
 Re-run `cargo test -p script-env --test follow` after any change — the thresholds there are set
 from measurements, so a regression in density or dwell shows up immediately.
+
+## `dmxcap.mjs` and `watch.mjs`
+
+The two ends of the DMX path, recorded so they can be compared. Run both through a set, alongside
+`run-follow.sh`:
+
+```sh
+node scripts/dmxcap.mjs dmx.txt      # what the light was told  (udp/49500)
+node scripts/watch.mjs  light.jsonl  # what the light did       (the live socket)
+```
+
+`dmxcap.mjs` writes one frame per line, `arrival_ms seq base v0,v1,...`, which
+`FOLLOW_CAPTURE` replays. Its Ctrl-C summary separates the three ways the stream can be wrong:
+nothing arriving at all, frames arriving with every channel zero (the lighting engine running but
+outputting blackout — nothing playing, or a venue mismatch), and real DMX. Because `seq` counts
+what the bridge *sent*, the summary also prices the loss the receiver had to absorb.
+
+`watch.mjs` records the public snapshot, which carries `lights`, `running` and per-lamp relay
+`ops`. **`ops` counts since boot and the light is shared**, so a total is meaningless on its own —
+the summary cuts a segment whenever `running` changes and attributes ops, lamp changes and time
+to each job, so a script that never moved a given lamp is distinguishable from one that never ran.
 
 ## `logcat.mjs`
 

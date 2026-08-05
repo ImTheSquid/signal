@@ -733,3 +733,193 @@ fn stays_wide_and_alive_on_the_live_loop() {
         );
     }
 }
+
+// ---- Replay of a real capture ----
+
+/// One frame as `scripts/dmxcap.mjs` recorded it: `arrival_ms seq base v0,v1,...`.
+struct Captured {
+    at: i64,
+    seq: i64,
+    base: i64,
+    ch: Vec<u8>,
+}
+
+fn parse_capture(text: &str) -> Vec<Captured> {
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|line| {
+            let mut f = line.split_whitespace();
+            let mut next = |what: &str| {
+                f.next()
+                    .unwrap_or_else(|| panic!("capture line missing {what}: {line}"))
+            };
+            let at = next("time").parse().expect("time");
+            let seq = next("seq").parse().expect("seq");
+            let base = next("base").parse().expect("base");
+            let ch = next("channels")
+                .split(',')
+                .map(|v| v.parse().expect("channel value"))
+                .collect();
+            Captured { at, seq, base, ch }
+        })
+        .collect()
+}
+
+/// Replay real arrival times through the real script. `run_delivered` models
+/// delivery with a function; here the file *is* the model, carrying whatever
+/// bunching and loss the wifi actually did, and `seq` is the bridge's own count
+/// rather than one derived from a frame index.
+fn run_capture(frames: Vec<Captured>) -> Run {
+    let end_at = frames.last().map(|f| f.at).unwrap_or(0);
+    let frames = Arc::new(frames);
+    let clock = Arc::new(AtomicI64::new(0));
+    let changes = Arc::new(Mutex::new(Vec::new()));
+    let next = Arc::new(AtomicI64::new(0));
+
+    let mut engine = rhai::Engine::new();
+    script_env::apply_limits(&mut engine);
+    script_env::register_api(
+        &mut engine,
+        Handlers {
+            set_lights: Box::new({
+                let clock = clock.clone();
+                let changes = changes.clone();
+                move |r, y, g| {
+                    changes
+                        .lock()
+                        .unwrap()
+                        .push((clock.load(Ordering::SeqCst), r, y, g));
+                }
+            }),
+            sleep: Box::new({
+                let clock = clock.clone();
+                move |ms| {
+                    if ms > 0 {
+                        clock.fetch_add(ms, Ordering::SeqCst);
+                    }
+                }
+            }),
+            millis: Box::new({
+                let clock = clock.clone();
+                move || clock.load(Ordering::SeqCst)
+            }),
+            dmx_recv: Box::new({
+                let clock = clock.clone();
+                let next = next.clone();
+                let frames = frames.clone();
+                move |timeout| {
+                    let now = clock.load(Ordering::SeqCst);
+                    let end = now + timeout;
+                    let i = next.load(Ordering::SeqCst) as usize;
+                    if i >= frames.len() || frames[i].at > end {
+                        clock.store(end, Ordering::SeqCst);
+                        return Ok(None);
+                    }
+                    // A frame whose arrival already passed was queued while the
+                    // script was busy; the socket drains the queue and keeps only
+                    // the newest, so coalesce to everything landing by then.
+                    let at = frames[i].at.max(now);
+                    let mut newest = i;
+                    while newest + 1 < frames.len() && frames[newest + 1].at <= at {
+                        newest += 1;
+                    }
+                    next.store(newest as i64 + 1, Ordering::SeqCst);
+                    clock.store(at, Ordering::SeqCst);
+                    Ok(Some(DmxFrame {
+                        seq: frames[newest].seq,
+                        base: frames[newest].base,
+                        channels: frames[newest].ch.clone(),
+                    }))
+                }
+            }),
+            lamp_dwell_ms: Box::new(|| DWELL_MS),
+            ..Handlers::stubs()
+        },
+    );
+
+    engine.on_progress({
+        let clock = clock.clone();
+        move |_| {
+            if clock.load(Ordering::SeqCst) >= end_at {
+                Some(rhai::Dynamic::from("done"))
+            } else {
+                None
+            }
+        }
+    });
+
+    match engine.run(SCRIPT) {
+        Ok(()) => panic!("follow.rhai returned; it must loop"),
+        Err(e) => match *e {
+            rhai::EvalAltResult::ErrorTerminated(..) => {}
+            other => panic!("follow.rhai failed at runtime: {other}"),
+        },
+    }
+
+    let changes = changes.lock().unwrap().clone();
+    Run {
+        end_ms: clock.load(Ordering::SeqCst),
+        changes,
+    }
+}
+
+/// Replay a capture from `scripts/dmxcap.mjs`. Every other stream in this file
+/// is synthetic, so this is the only test that can disagree with a live set —
+/// which is the point: it prints the lamp timeline the script *would* have
+/// produced, to diff against what `scripts/watch.mjs` recorded it actually did.
+///
+/// Skipped unless FOLLOW_CAPTURE names a file, so it costs nothing in CI.
+#[test]
+fn replays_a_capture() {
+    let Ok(path) = std::env::var("FOLLOW_CAPTURE") else {
+        println!("FOLLOW_CAPTURE unset — skipped");
+        return;
+    };
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+    let frames = parse_capture(&text);
+    assert!(!frames.is_empty(), "{path} holds no frames");
+
+    let span_s = frames.last().unwrap().at as f64 / 1000.0;
+    let sent = frames.last().unwrap().seq - frames[0].seq + 1;
+    println!(
+        "replaying {} frames over {span_s:.1}s ({:.1}/s received of {:.1}/s sent), {} channels",
+        frames.len(),
+        frames.len() as f64 / span_s,
+        sent as f64 / span_s,
+        frames[0].ch.len()
+    );
+
+    let run = run_capture(frames);
+    let n = run.changes.len();
+    assert!(n > 0, "the script never wrote to the lamps on this capture");
+
+    let mut used = [0usize; 3];
+    let mut width = [0usize; 4];
+    let mut still = 0;
+    for c in &run.changes {
+        used[0] += c.1 as usize;
+        used[1] += c.2 as usize;
+        used[2] += c.3 as usize;
+        width[c.1 as usize + c.2 as usize + c.3 as usize] += 1;
+    }
+    for w in run.changes.windows(2) {
+        still = still.max(w[1].0 - w[0].0);
+    }
+    println!(
+        "simulated: {:.1} transitions/s, lamp use r={} y={} g={} of {n}, \
+         width 0/1/2/3 = {}%/{}%/{}%/{}%, longest still gap {still}ms",
+        n as f64 / (run.end_ms as f64 / 1000.0),
+        used[0],
+        used[1],
+        used[2],
+        width[0] * 100 / n,
+        width[1] * 100 / n,
+        width[2] * 100 / n,
+        width[3] * 100 / n
+    );
+    for (i, lamp) in ["red", "yellow", "green"].iter().enumerate() {
+        if used[i] == 0 {
+            println!("  {lamp} never lit on this capture");
+        }
+    }
+}
