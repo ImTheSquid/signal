@@ -244,10 +244,116 @@ pub fn register_idle_api(
     });
 }
 
-/// A fully configured engine with stub handlers, for validation.
-pub fn validation_engine() -> Engine {
-    let mut engine = Engine::new();
+/// Which of rhai's optional standard packages an engine carries.
+///
+/// `Engine::run` takes `&self`, so an engine cannot gain a package once a run
+/// has started; the set is fixed before evaluation. That matters because
+/// registering all of them costs ~69KB of the device's ~140KB free heap, which
+/// leaves room for about 5KB of script — less than `scripts/follow.rhai` needs.
+/// Registering only what a script uses costs ~21KB for that script and roughly
+/// doubles the ceiling. `crates/script-env/tests/footprint.rs` prices it.
+///
+/// Arithmetic and logic are not represented here because they are not optional:
+/// every script counts and compares, and together they are a small part of the
+/// cost.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Components {
+    pub core: bool,
+    pub array: bool,
+    pub map: bool,
+    pub string: bool,
+    pub math: bool,
+    pub iterator: bool,
+    pub blob: bool,
+    pub bit_field: bool,
+    pub functions: bool,
+}
+
+impl Components {
+    /// Everything the documented surface promises. What validation must accept,
+    /// and the safe answer whenever the needed set is unknown.
+    pub const fn all() -> Self {
+        Components {
+            core: true,
+            array: true,
+            map: true,
+            string: true,
+            math: true,
+            iterator: true,
+            blob: true,
+            bit_field: true,
+            functions: true,
+        }
+    }
+
+    /// Everything except what a script must opt out of explicitly.
+    ///
+    /// There is deliberately no `detect(script)`. Rhai resolves calls at run
+    /// time, so which packages a script needs is not decidable from its text:
+    /// the only sound answers are to run every path (impossible) or to be told.
+    /// Inferring it from substrings would trade a reboot for a script that dies
+    /// the first time an untested branch is taken, which is worse — the failure
+    /// moves from startup to the middle of a set.
+    pub const fn none() -> Self {
+        Components {
+            core: false,
+            array: false,
+            map: false,
+            string: false,
+            math: false,
+            iterator: false,
+            blob: false,
+            bit_field: false,
+            functions: false,
+        }
+    }
+}
+
+/// An engine carrying `components`, with the sandbox limits applied.
+///
+/// The single construction site for the language surface: the validator and the
+/// firmware both come through here, so what validates and what runs cannot
+/// drift apart.
+pub fn new_engine(components: Components) -> Engine {
+    use rhai::packages::Package;
+
+    let mut engine = Engine::new_raw();
+    // Not optional — see `Components`.
+    rhai::packages::ArithmeticPackage::new().register_into_engine(&mut engine);
+    rhai::packages::LogicPackage::new().register_into_engine(&mut engine);
+
+    macro_rules! opt {
+        ($flag:expr, $pkg:ty) => {
+            if $flag {
+                <$pkg>::new().register_into_engine(&mut engine);
+            }
+        };
+    }
+    opt!(components.core, rhai::packages::LanguageCorePackage);
+    opt!(components.array, rhai::packages::BasicArrayPackage);
+    opt!(components.map, rhai::packages::BasicMapPackage);
+    if components.string {
+        rhai::packages::BasicStringPackage::new().register_into_engine(&mut engine);
+        // Both, or `all()` would be narrower than the `Engine::new()` it stands
+        // in for: StandardPackage carries MoreStringPackage too.
+        rhai::packages::MoreStringPackage::new().register_into_engine(&mut engine);
+    }
+    opt!(components.math, rhai::packages::BasicMathPackage);
+    opt!(components.iterator, rhai::packages::BasicIteratorPackage);
+    opt!(components.blob, rhai::packages::BasicBlobPackage);
+    opt!(components.bit_field, rhai::packages::BitFieldPackage);
+    opt!(components.functions, rhai::packages::BasicFnPackage);
+
     apply_limits(&mut engine);
+    engine
+}
+
+/// A fully configured engine with stub handlers, for validation.
+///
+/// Always the full surface: validation must accept anything the docs promise,
+/// whatever narrower set the device will actually run it on.
+pub fn validation_engine() -> Engine {
+    let mut engine = new_engine(Components::all());
     register_api(&mut engine, Handlers::stubs());
     engine
 }
@@ -609,5 +715,60 @@ mod tests {
         let engine = validation_engine();
         let bomb = format!("let x = {}1{};", "(".repeat(200), ")".repeat(200));
         assert!(engine.compile(&bomb).is_err());
+    }
+}
+
+#[cfg(test)]
+mod component_tests {
+    use super::*;
+
+    /// Exercises one feature from every package `Engine::new()` carries, so a
+    /// gap between `Components::all()` and the surface it replaces shows up
+    /// here rather than in somebody's script at 2am. Rhai resolves calls at run
+    /// time, so these must be *run*, not just compiled.
+    const SURFACE: &str = r#"
+        let n = 7 + 3 * 2;              // arithmetic
+        let ok = n > 5 && n != 0;       // logic
+        let xs = [1, 2, 3];             // array
+        xs.push(4);
+        let m = #{ a: 1 };              // map
+        let s = "ab" + "cd";            // string
+        let t = s.sub_string(1, 2);     // more string
+        let f = (2.0).sqrt();           // math
+        let total = 0;
+        for i in 0..3 { total += i; }   // iterator
+        let b = n & 3;                  // bit field
+        let ty = type_of(n);            // language core
+        ok && xs.len() == 4 && m.a == 1 && t != "" && f > 0.0 && total == 3 && b >= 0 && ty != ""
+    "#;
+
+    #[test]
+    fn all_components_cover_the_standard_surface() {
+        let mut engine = new_engine(Components::all());
+        register_api(&mut engine, Handlers::stubs());
+        let got: bool = engine
+            .eval(SURFACE)
+            .expect("Components::all() must run everything Engine::new() would");
+        assert!(got);
+    }
+
+    /// The saving is real only if dropping components actually drops functions.
+    #[test]
+    fn dropping_components_drops_the_surface() {
+        let mut engine = new_engine(Components::none());
+        register_api(&mut engine, Handlers::stubs());
+        assert!(
+            engine.eval::<bool>(SURFACE).is_err(),
+            "a bare engine still ran the full surface; the components do nothing"
+        );
+    }
+
+    /// Arithmetic and logic are always on, so the cheapest engine is still able
+    /// to count and compare — which is what makes them non-optional.
+    #[test]
+    fn the_cheapest_engine_still_counts_and_compares() {
+        let mut engine = new_engine(Components::none());
+        register_api(&mut engine, Handlers::stubs());
+        assert!(engine.eval::<bool>("let n = 7 + 3 * 2; n > 5 && n != 0").unwrap());
     }
 }
