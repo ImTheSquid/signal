@@ -90,7 +90,16 @@ async function sendHello(): Promise<void> {
 		t: 'hello',
 		job:
 			job && job.t === 'job'
-				? { id: job.id, holder: job.holder, script: job.script, ttl_ms: job.ttl_ms }
+				? {
+						id: job.id,
+						holder: job.holder,
+						script: job.script,
+						ttl_ms: job.ttl_ms,
+						// Without this a device that reconnects mid-job is handed the
+						// script with no declaration, so it rebuilds the whole standard
+						// library and can no longer fit what it was already running.
+						components: job.components
+					}
 				: null,
 		idle
 	});
