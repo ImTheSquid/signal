@@ -16,7 +16,12 @@ exclude = ["firmware", "dmx-bridge"]
 # `no_closure` stays on. Closures capture through shared cells (Rc/RefCell),
 # which is heap churn on a board already near its floor, and nothing in the
 # script API needs them — the DMX loop is straight-line integer and float math.
+# `sync` makes rhai's Shared an Arc rather than an Rc, which is what lets the
+# standard-library modules be built once at boot and handed to every per-run
+# engine by pointer. Without it each run rebuilds ~69KB and hands it back, and
+# that churn is why the board idles with 140KB free but a largest block of 108KB.
 rhai = { version = "1", features = [
+    "sync",
     "only_i64",
     "no_closure",
     "no_module",

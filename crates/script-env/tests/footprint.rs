@@ -69,6 +69,12 @@ const HOST_TO_DEVICE: isize = 2;
 
 #[test]
 fn interpreter_footprint() {
+    // The standard-library modules are built once and shared by pointer, so the
+    // first engine pays for them and every later one pays a refcount. The device
+    // builds an engine per run, so it is the second number that it lives with.
+    let first_engine = cost(|| script_env::new_engine(script_env::Components::all()));
+    let later_engine = cost(|| script_env::new_engine(script_env::Components::all()));
+
     let full = cost(script_env::rhai::Engine::new);
     let raw = cost(script_env::rhai::Engine::new_raw);
     let validation = cost(script_env::validation_engine);
@@ -103,6 +109,9 @@ fn interpreter_footprint() {
          \n    follow.rhai AST      {ast:>8}   from {} source bytes\
          \n    minified AST         {ast_min:>8}   from {} minified bytes\
          \n    AST per source byte  {per_byte:>8.1}\
+         \n\
+         \n    new_engine, first   {first_engine:>8}   (builds the shared modules)\
+         \n    new_engine, later   {later_engine:>8}   (what each run costs)\
          \n\
          \n  device budget (host/2), against {DEVICE_FREE_HEAP} free\
          \n    engine               {engine_dev:>8}\

@@ -390,32 +390,77 @@ impl Components {
 pub fn new_engine(components: Components) -> Engine {
     use rhai::packages::Package;
 
+    // Arithmetic and logic are built once and shared by pointer thereafter:
+    // `register_global_module` stores the handle rather than copying functions
+    // in, so every run after the first pays a refcount instead of rebuilding
+    // them. That is churn the board feels — it idles with 140KB free but a
+    // largest block of 108KB.
+    //
+    // Only these two, deliberately. A cached module is never freed, so caching
+    // the optional ones would pin whatever any script ever declared: one idle
+    // script wanting the full surface would hold ~63KB for the life of the
+    // board and cost every later job more than declaring ever saved it
+    // (measured: a 5.9KB ceiling against the 12.3KB this arrangement gives).
+    // These two are in every engine regardless, so they can never be wasted.
+    macro_rules! shared {
+        ($pkg:ty) => {{
+            static CELL: std::sync::OnceLock<std::sync::Arc<rhai::Module>> =
+                std::sync::OnceLock::new();
+            CELL.get_or_init(|| <$pkg>::new().as_shared_module()).clone()
+        }};
+    }
+    // `init_engine` is how a package registers custom operators or syntax. Every
+    // package used here leaves it empty, but calling it keeps this exactly
+    // equivalent to `register_into_engine` if that ever stops being true.
+    macro_rules! add_shared {
+        ($engine:expr, $pkg:ty) => {{
+            <$pkg as Package>::init_engine(&mut $engine);
+            $engine.register_global_module(shared!($pkg));
+        }};
+    }
+    // Built per run and freed with the engine, so an unused component costs
+    // nothing beyond the run that asked for it.
+    macro_rules! add {
+        ($engine:expr, $pkg:ty) => {{
+            <$pkg>::new().register_into_engine(&mut $engine);
+        }};
+    }
+
     let mut engine = Engine::new_raw();
     // Not optional — see `Components`.
-    rhai::packages::ArithmeticPackage::new().register_into_engine(&mut engine);
-    rhai::packages::LogicPackage::new().register_into_engine(&mut engine);
+    add_shared!(engine, rhai::packages::ArithmeticPackage);
+    add_shared!(engine, rhai::packages::LogicPackage);
 
-    macro_rules! opt {
-        ($flag:expr, $pkg:ty) => {
-            if $flag {
-                <$pkg>::new().register_into_engine(&mut engine);
-            }
-        };
+    if components.core {
+        add!(engine, rhai::packages::LanguageCorePackage);
     }
-    opt!(components.core, rhai::packages::LanguageCorePackage);
-    opt!(components.array, rhai::packages::BasicArrayPackage);
-    opt!(components.map, rhai::packages::BasicMapPackage);
+    if components.array {
+        add!(engine, rhai::packages::BasicArrayPackage);
+    }
+    if components.map {
+        add!(engine, rhai::packages::BasicMapPackage);
+    }
     if components.string {
-        rhai::packages::BasicStringPackage::new().register_into_engine(&mut engine);
+        add!(engine, rhai::packages::BasicStringPackage);
         // Both, or `all()` would be narrower than the `Engine::new()` it stands
         // in for: StandardPackage carries MoreStringPackage too.
-        rhai::packages::MoreStringPackage::new().register_into_engine(&mut engine);
+        add!(engine, rhai::packages::MoreStringPackage);
     }
-    opt!(components.math, rhai::packages::BasicMathPackage);
-    opt!(components.iterator, rhai::packages::BasicIteratorPackage);
-    opt!(components.blob, rhai::packages::BasicBlobPackage);
-    opt!(components.bit_field, rhai::packages::BitFieldPackage);
-    opt!(components.functions, rhai::packages::BasicFnPackage);
+    if components.math {
+        add!(engine, rhai::packages::BasicMathPackage);
+    }
+    if components.iterator {
+        add!(engine, rhai::packages::BasicIteratorPackage);
+    }
+    if components.blob {
+        add!(engine, rhai::packages::BasicBlobPackage);
+    }
+    if components.bit_field {
+        add!(engine, rhai::packages::BitFieldPackage);
+    }
+    if components.functions {
+        add!(engine, rhai::packages::BasicFnPackage);
+    }
 
     apply_limits(&mut engine);
     engine
