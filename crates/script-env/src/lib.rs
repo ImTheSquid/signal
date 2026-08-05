@@ -10,7 +10,16 @@ use rhai::Engine;
 
 /// Maximum size in bytes of the script that reaches the device, measured after
 /// minification. Enforced at the API and bounded again by the websocket framer.
-pub const MAX_SCRIPT_BYTES: usize = 16 * 1024;
+///
+/// This is the *best case*: what fits when a script declares the narrowest set
+/// of [`Components`] it can. A script that declares nothing carries rhai's whole
+/// standard library and fits about 5KB, so this limit passing does not mean the
+/// device will take it — `heap_check` in the firmware gives the real answer, in
+/// a message that says how much was needed and how much was free.
+///
+/// Sized from `tests/footprint.rs`, which fails if it drifts past what the
+/// hardware can honour. It was 16KB, which nothing could ever run.
+pub const MAX_SCRIPT_BYTES: usize = 12 * 1024;
 
 /// Maximum size in bytes of a script as submitted, before minification. Comments
 /// and indentation are stripped before `MAX_SCRIPT_BYTES` applies, so this is what

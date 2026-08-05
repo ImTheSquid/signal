@@ -27,8 +27,11 @@ export type Component = (typeof COMPONENTS)[number];
 
 // ---- Shared limits (mirrored in crates/script-env) ----
 
-/** Size of the script that reaches the device, measured after minification. */
-export const MAX_SCRIPT_BYTES = 16 * 1024;
+/** Size of the script that reaches the device, measured after minification.
+ *  The best case — what fits when a script declares the narrowest `components`
+ *  it can. Declaring nothing fits about 5KB, and the device reports the real
+ *  limit when it declines. */
+export const MAX_SCRIPT_BYTES = 12 * 1024;
 /** Size of a script as submitted. Comments and indentation are stripped before
  *  MAX_SCRIPT_BYTES applies, so this bounds the work one request can ask for. */
 export const MAX_RAW_SCRIPT_BYTES = 256 * 1024;
