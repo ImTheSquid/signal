@@ -11,7 +11,12 @@ name = "firmware"
 harness = false # do not use the built-in cargo test harness -> resolve rust-analyzer errors
 
 [profile.release]
+# Size here is not about flash. Static DRAM (.data + .bss) and IRAM text come
+# out of the same pool the heap is carved from, and the interpreter lives close
+# to that floor — so every byte the linker saves is a byte a script can use.
 opt-level = "s"
+lto = "fat"
+codegen-units = 1
 
 [profile.dev]
 debug = true    # Symbols are nice, and they don't increase the size on Flash

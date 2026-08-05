@@ -32,14 +32,49 @@ pub struct LastHolderInfo {
 pub type SharedLastHolder = Arc<Mutex<Option<LastHolderInfo>>>;
 
 /// Rhai needs far more stack than the ESP-IDF pthread default — it's a
-/// recursive interpreter. Sized to the engine's max_expr_depths/call_levels;
-/// kept lean because this allocation exists whenever any script (incl. idle)
-/// is running and the board lives close to the heap floor.
-const SCRIPT_STACK_BYTES: usize = 32 * 1024;
+/// recursive interpreter. Bounded by the engine's max_call_levels and
+/// max_expr_depths rather than by script length, so this does not have to grow
+/// with the script.
+///
+/// Measured, not guessed: the run logs its own high-water mark on the way out,
+/// and 32KB left 25812 bytes never touched. Halved on that evidence, which
+/// hands 16KB back to the heap the AST is competing for — more than the whole
+/// binary's static DRAM. Watch the log line before cutting it further.
+const SCRIPT_STACK_BYTES: usize = 16 * 1024;
 
-/// Heap the interpreter needs before the script's own AST, measured by
+/// Heap the full standard library needs, measured by
 /// `crates/script-env/tests/footprint.rs` and halved for this 32-bit target.
+/// What a script that declares nothing costs.
 const ENGINE_HEAP_BYTES: usize = 70 * 1024;
+
+/// What one declared component costs, same measurement. Arithmetic and logic
+/// are not here: they are in every engine and are built once and shared, so
+/// they are not part of what a run has to find.
+fn component_heap_bytes(name: &str) -> usize {
+    match name {
+        "core" => 19 * 1024,
+        "string" => 15 * 1024,
+        "array" => 10 * 1024,
+        "map" | "iterator" | "blob" => 8 * 1024,
+        "math" => 6 * 1024,
+        // Unknown names are rejected before a script runs, so this is only the
+        // arithmetic being conservative about a component added later.
+        _ => 8 * 1024,
+    }
+}
+
+/// What this run's engine will cost, given what it declared. Undeclared means
+/// the whole library.
+fn engine_heap_bytes(components: Option<&Vec<String>>) -> usize {
+    match components {
+        None => ENGINE_HEAP_BYTES,
+        Some(names) => names
+            .iter()
+            .map(|n| component_heap_bytes(n))
+            .sum::<usize>()
+            .min(ENGINE_HEAP_BYTES),
+    }
+}
 /// AST bytes per byte of minified source, from the same measurement, rounded up.
 const AST_BYTES_PER_SOURCE_BYTE: usize = 8;
 /// Room for the run itself — scope, values, and the DMX frames a script pulls in
@@ -56,14 +91,21 @@ const RUN_MARGIN_BYTES: usize = 8 * 1024;
 ///
 /// Conservative on purpose: refusing a script that would have just fit costs a
 /// legible error, while accepting one that does not costs a reboot cycle.
-fn heap_check(script_len: usize) -> Result<(), String> {
+fn heap_check(script_len: usize, components: Option<&Vec<String>>) -> Result<(), String> {
     let free = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() } as usize;
     let largest =
         unsafe { esp_idf_svc::sys::heap_caps_get_largest_free_block(esp_idf_svc::sys::MALLOC_CAP_8BIT) };
-    let needed = SCRIPT_STACK_BYTES
-        + ENGINE_HEAP_BYTES
-        + script_len * AST_BYTES_PER_SOURCE_BYTE
-        + RUN_MARGIN_BYTES;
+    let engine = engine_heap_bytes(components);
+    let ast = script_len * AST_BYTES_PER_SOURCE_BYTE;
+    let needed = SCRIPT_STACK_BYTES + engine + ast + RUN_MARGIN_BYTES;
+
+    // Logged every time, not only on refusal: when this is wrong the board
+    // reboots, and the only way to tell an estimate that was too generous from
+    // one that was too mean is to see the numbers it decided on.
+    log::info!(
+        "heap check: free={free} largest={largest} need={needed} \
+         (stack {SCRIPT_STACK_BYTES} + engine {engine} + ast {ast} + margin {RUN_MARGIN_BYTES})"
+    );
 
     // The stack is one contiguous allocation, so free heap alone does not say it
     // can be had — this board idles with ~140KB free but a largest block of
@@ -157,7 +199,7 @@ impl Runner {
 
         // Decline before allocating anything, so a script that cannot fit fails
         // as a run rather than as a reboot.
-        let spawned = match heap_check(script.len()) {
+        let spawned = match heap_check(script.len(), components.as_ref()) {
             Err(e) => Err(std::io::Error::other(e)),
             Ok(()) => std::thread::Builder::new()
                 .name("rhai".into())
@@ -172,6 +214,15 @@ impl Runner {
                         &abort,
                         &lights,
                         &last_holder,
+                    );
+                    // What the interpreter actually needed, so SCRIPT_STACK_BYTES
+                    // can be sized from measurement rather than from caution —
+                    // it is 23% of the free heap, and rhai's depth is bounded by
+                    // max_call_levels/max_expr_depths, not by the script.
+                    let unused =
+                        unsafe { esp_idf_svc::sys::uxTaskGetStackHighWaterMark(std::ptr::null_mut()) };
+                    log::info!(
+                        "script stack: {unused} bytes never touched of {SCRIPT_STACK_BYTES}"
                     );
                     let _ = tx.send(AppEvent::ScriptDone {
                         run_gen,
