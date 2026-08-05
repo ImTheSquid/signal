@@ -433,6 +433,15 @@ pub fn new_engine(components: Components) -> Engine {
     }
 
     let mut engine = Engine::new_raw();
+
+    // `Engine::new` turns this on and `new_raw` does not, so building up from
+    // raw silently loses it. Without the interner every identifier and string
+    // literal in a script allocates separately instead of being shared: measured
+    // on scripts/follow.rhai, the AST goes 91648 -> 110368 bytes and 1303 -> 1879
+    // allocations, and on the device each of those allocations also costs an
+    // 8-byte heap header. Not optional on a board this tight.
+    engine.set_max_strings_interned(1024);
+
     // Not optional — see `Components`.
     add_shared!(engine, rhai::packages::ArithmeticPackage);
     add_shared!(engine, rhai::packages::LogicPackage);

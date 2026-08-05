@@ -24,20 +24,45 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicIsize, Ordering};
 
 static LIVE: AtomicIsize = AtomicIsize::new(0);
+/// Live allocation count, not bytes. The device's allocator charges a header per
+/// allocation, so this is what decides whether a cheaper allocator is worth
+/// having — see `allocation_overhead_is_worth_measuring`.
+static COUNT: AtomicIsize = AtomicIsize::new(0);
+/// Live allocations by size class, `SIZE_CLASSES[i] ..= SIZE_CLASSES[i+1]`.
+/// Small classes are what a per-allocation header punishes.
+static BUCKETS: [AtomicIsize; 6] = [
+    AtomicIsize::new(0),
+    AtomicIsize::new(0),
+    AtomicIsize::new(0),
+    AtomicIsize::new(0),
+    AtomicIsize::new(0),
+    AtomicIsize::new(0),
+];
+const SIZE_CLASSES: [usize; 6] = [8, 16, 32, 64, 256, usize::MAX];
+
+fn bucket_of(size: usize) -> usize {
+    SIZE_CLASSES.iter().position(|&c| size <= c).unwrap_or(5)
+}
 
 struct Counting;
 
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
         LIVE.fetch_add(l.size() as isize, Ordering::Relaxed);
+        COUNT.fetch_add(1, Ordering::Relaxed);
+        BUCKETS[bucket_of(l.size())].fetch_add(1, Ordering::Relaxed);
         System.alloc(l)
     }
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
         LIVE.fetch_sub(l.size() as isize, Ordering::Relaxed);
+        COUNT.fetch_sub(1, Ordering::Relaxed);
+        BUCKETS[bucket_of(l.size())].fetch_sub(1, Ordering::Relaxed);
         System.dealloc(p, l)
     }
     unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
         LIVE.fetch_add(new as isize - l.size() as isize, Ordering::Relaxed);
+        BUCKETS[bucket_of(l.size())].fetch_sub(1, Ordering::Relaxed);
+        BUCKETS[bucket_of(new)].fetch_add(1, Ordering::Relaxed);
         System.realloc(p, l, new)
     }
 }
@@ -49,6 +74,10 @@ fn live() -> isize {
     LIVE.load(Ordering::Relaxed)
 }
 
+fn count() -> isize {
+    COUNT.load(Ordering::Relaxed)
+}
+
 /// Allocation held by `f`'s return value, which is dropped before returning.
 fn cost<T>(f: impl FnOnce() -> T) -> isize {
     let base = live();
@@ -56,6 +85,15 @@ fn cost<T>(f: impl FnOnce() -> T) -> isize {
     let bytes = live() - base;
     drop(held);
     bytes
+}
+
+/// Bytes *and* allocations held by `f`'s return value.
+fn cost_counted<T>(f: impl FnOnce() -> T) -> (isize, isize) {
+    let (base_bytes, base_count) = (live(), count());
+    let held = f();
+    let out = (live() - base_bytes, count() - base_count);
+    drop(held);
+    out
 }
 
 const SCRIPT: &str = include_str!("../../../scripts/follow.rhai");
@@ -78,6 +116,132 @@ const DEVICE_AST_BYTES_PER_SOURCE_BYTE: f64 = 24.0;
 /// side of building it. The host reports 135320 for the same thing, so scaling
 /// the host number is what produced a guard that let a doomed script through.
 const DEVICE_FULL_ENGINE: isize = 95_872;
+
+/// ESP-IDF's TLSF charges ~8 bytes of header per allocation. `talc`, the best
+/// no_std alternative surveyed, charges one `usize` — 4 bytes on this 32-bit
+/// target. So routing the interpreter through an arena is worth
+/// `allocations * 4` bytes and nothing more, which is a much smaller number
+/// than "the allocator overhead" sounds like.
+///
+/// This exists so that trade is decided on a measurement. It asserts nothing
+/// about the result: it prints what an arena could recover, against a ceiling
+/// of about 3,500 source bytes.
+#[test]
+fn allocation_overhead_is_worth_measuring() {
+    const IDF_HEADER: isize = 8;
+    const TALC_HEADER: isize = 4;
+
+    let engine = script_env::new_engine(script_env::Components::all());
+    let (engine_bytes, engine_allocs) =
+        cost_counted(|| script_env::new_engine(script_env::Components::all()));
+
+    let opts = rhaiper::Options {
+        rename: false,
+        ..Default::default()
+    };
+    let minified = rhaiper::minify_with_engine(&engine, SCRIPT, &opts)
+        .expect("follow.rhai must minify")
+        .text;
+
+    let before = [
+        BUCKETS[0].load(Ordering::Relaxed),
+        BUCKETS[1].load(Ordering::Relaxed),
+        BUCKETS[2].load(Ordering::Relaxed),
+        BUCKETS[3].load(Ordering::Relaxed),
+        BUCKETS[4].load(Ordering::Relaxed),
+        BUCKETS[5].load(Ordering::Relaxed),
+    ];
+    let (ast_bytes, ast_allocs) =
+        cost_counted(|| engine.compile(&minified).expect("minified must compile"));
+    let after = [
+        BUCKETS[0].load(Ordering::Relaxed),
+        BUCKETS[1].load(Ordering::Relaxed),
+        BUCKETS[2].load(Ordering::Relaxed),
+        BUCKETS[3].load(Ordering::Relaxed),
+        BUCKETS[4].load(Ordering::Relaxed),
+        BUCKETS[5].load(Ordering::Relaxed),
+    ];
+    drop(engine);
+
+    let total_allocs = engine_allocs + ast_allocs;
+    println!(
+        "\n  allocations held, for {} minified source bytes\
+         \n    engine (full library)  {engine_allocs:>7} allocs   {engine_bytes:>8} bytes\
+         \n    follow.rhai AST        {ast_allocs:>7} allocs   {ast_bytes:>8} bytes\
+         \n    together               {total_allocs:>7} allocs\
+         \n\
+         \n  AST allocations by size (what a per-allocation header punishes)",
+        minified.len()
+    );
+    let mut lo = 0usize;
+    for (i, &hi) in SIZE_CLASSES.iter().enumerate() {
+        let n = after[i] - before[i];
+        let label = if hi == usize::MAX {
+            format!("{lo}+")
+        } else {
+            format!("{lo}-{hi}")
+        };
+        println!("    {label:>10} bytes  {n:>7}");
+        lo = hi.saturating_add(1);
+    }
+
+    // The same text compiled on the two engines this crate can produce. These
+    // must not diverge: the firmware runs `new_engine`, so if it built a fatter
+    // AST than the stock `Engine::new` the device would be paying for the
+    // convenience of a shared constructor.
+    let stock = script_env::rhai::Engine::new();
+    let (stock_ast, stock_allocs) =
+        cost_counted(|| stock.compile(&minified).expect("stock compile"));
+    drop(stock);
+    let mut limited = script_env::rhai::Engine::new();
+    script_env::apply_limits(&mut limited);
+    let (limited_ast, limited_allocs) =
+        cost_counted(|| limited.compile(&minified).expect("limited compile"));
+    drop(limited);
+
+    let mut packaged = script_env::rhai::Engine::new_raw();
+    {
+        use script_env::rhai::packages::Package;
+        script_env::rhai::packages::StandardPackage::new().register_into_engine(&mut packaged);
+    }
+    let (packaged_ast, packaged_allocs) =
+        cost_counted(|| packaged.compile(&minified).expect("packaged compile"));
+    drop(packaged);
+
+    let ours = script_env::new_engine(script_env::Components::all());
+    let (ours_ast, ours_allocs) =
+        cost_counted(|| ours.compile(&minified).expect("our compile"));
+    drop(ours);
+    println!(
+        "  same text, isolating what makes the AST bigger\
+         \n    Engine::new()                 {stock_ast:>8} bytes  {stock_allocs:>7} allocs\
+         \n    Engine::new() + apply_limits  {limited_ast:>8} bytes  {limited_allocs:>7} allocs\
+         \n    new_raw + StandardPackage     {packaged_ast:>8} bytes  {packaged_allocs:>7} allocs\
+         \n    new_engine(all())             {ours_ast:>8} bytes  {ours_allocs:>7} allocs\n"
+    );
+
+    // `new_engine` builds up from `new_raw`, which does not turn on the string
+    // interner that `Engine::new` does. Forgetting it cost 18600 bytes and 573
+    // allocations on this script and shipped to the device before it was caught,
+    // so parity with the stock engine is pinned rather than trusted.
+    assert!(
+        ours_ast <= stock_ast && ours_allocs <= stock_allocs,
+        "new_engine builds a fatter AST than Engine::new ({ours_ast} bytes / \
+         {ours_allocs} allocs vs {stock_ast} / {stock_allocs}); the string \
+         interner is the usual cause"
+    );
+
+    let idf = total_allocs * IDF_HEADER;
+    let talc = total_allocs * TALC_HEADER;
+    println!(
+        "\n  header cost on device, engine + AST\
+         \n    ESP-IDF TLSF at {IDF_HEADER}/alloc   {idf:>8} bytes\
+         \n    talc at {TALC_HEADER}/alloc          {talc:>8} bytes\
+         \n    an arena could recover  {:>8} bytes = about {} more source bytes\n",
+        idf - talc,
+        ((idf - talc) as f64 / DEVICE_AST_BYTES_PER_SOURCE_BYTE) as isize
+    );
+}
 
 #[test]
 fn interpreter_footprint() {
