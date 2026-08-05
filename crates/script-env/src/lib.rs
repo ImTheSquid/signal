@@ -17,9 +17,15 @@ use rhai::Engine;
 /// device will take it — `heap_check` in the firmware gives the real answer, in
 /// a message that says how much was needed and how much was free.
 ///
-/// Sized from `tests/footprint.rs`, which fails if it drifts past what the
-/// hardware can honour. It was 16KB, which nothing could ever run.
-pub const MAX_SCRIPT_BYTES: usize = 12 * 1024;
+/// Sized from what the device actually managed, not from the host measurement,
+/// which was optimistic by more than 2x: 5054 bytes of script exhausted a heap
+/// reporting 154900 free, even with a narrowly declared engine. The AST does not
+/// halve on a 32-bit target, and rhai's parser peaks well above the tree it
+/// keeps. That works out near 24 device bytes per source byte, so the narrowest
+/// engine leaves room for roughly 4.5KB.
+///
+/// It has been 16KB and then 12KB; neither was runnable.
+pub const MAX_SCRIPT_BYTES: usize = 4 * 1024;
 
 /// Maximum size in bytes of a script as submitted, before minification. Comments
 /// and indentation are stripped before `MAX_SCRIPT_BYTES` applies, so this is what

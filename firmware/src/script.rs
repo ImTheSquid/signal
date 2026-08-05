@@ -44,24 +44,28 @@ pub type SharedLastHolder = Arc<Mutex<Option<LastHolderInfo>>>;
 /// script that just ran.
 const SCRIPT_STACK_BYTES: usize = 32 * 1024;
 
-/// Heap the full standard library needs, measured by
-/// `crates/script-env/tests/footprint.rs` and halved for this 32-bit target.
-/// What a script that declares nothing costs.
-const ENGINE_HEAP_BYTES: usize = 70 * 1024;
+/// Heap the full standard library needs, measured on the device by logging free
+/// heap either side of building it: 95872 bytes, or 68% of what is free before
+/// a script has done anything. What a run that declares nothing costs.
+///
+/// Halving the host figure gave 70KB and was 26KB optimistic — engine registries
+/// are pointer-dense but not entirely, and the real ratio is nearer 0.71.
+const ENGINE_HEAP_BYTES: usize = 96 * 1024;
 
 /// What one declared component costs, same measurement. Arithmetic and logic
 /// are not here: they are in every engine and are built once and shared, so
 /// they are not part of what a run has to find.
 fn component_heap_bytes(name: &str) -> usize {
     match name {
-        "core" => 19 * 1024,
-        "string" => 15 * 1024,
-        "array" => 10 * 1024,
-        "map" | "iterator" | "blob" => 8 * 1024,
-        "math" => 6 * 1024,
+        "core" => 32 * 1024,
+        "string" => 20 * 1024,
+        "array" => 17 * 1024,
+        "map" | "iterator" | "blob" => 12 * 1024,
+        "math" => 10 * 1024,
+        "bitfield" | "functions" => 8 * 1024,
         // Unknown names are rejected before a script runs, so this is only the
         // arithmetic being conservative about a component added later.
-        _ => 8 * 1024,
+        _ => 16 * 1024,
     }
 }
 
@@ -77,8 +81,16 @@ fn engine_heap_bytes(components: Option<&Vec<String>>) -> usize {
             .min(ENGINE_HEAP_BYTES),
     }
 }
-/// AST bytes per byte of minified source, from the same measurement, rounded up.
-const AST_BYTES_PER_SOURCE_BYTE: usize = 8;
+/// Heap per byte of minified source, from the device rather than from the host
+/// measurement, which was far too kind.
+///
+/// Observed: 5054 bytes of script, with a declared engine costing 16384 and a
+/// 32768 stack, exhausted a heap reporting 154900 free — so the true cost is
+/// north of 20 bytes per source byte. Two things the host number misses: the
+/// AST does not halve on a 32-bit target (its i64 and f32 fields do not shrink),
+/// and rhai's parser allocates well past the size of the tree it finally keeps,
+/// so the peak during `compile` is what has to fit, not the result.
+const AST_BYTES_PER_SOURCE_BYTE: usize = 24;
 /// Room for the run itself — scope, values, and the DMX frames a script pulls in
 /// while it works. Without it a script fits at startup and dies once busy.
 const RUN_MARGIN_BYTES: usize = 8 * 1024;
@@ -93,6 +105,24 @@ const RUN_MARGIN_BYTES: usize = 8 * 1024;
 ///
 /// Conservative on purpose: refusing a script that would have just fit costs a
 /// legible error, while accepting one that does not costs a reboot cycle.
+/// Free heap at a named point, so the cost of a run can be attributed rather
+/// than estimated.
+///
+/// `esp_get_free_heap_size` counts every region, including IRAM that cannot
+/// serve a byte-addressable allocation, so it reads high. The 8-bit figure is
+/// the one a script's allocations actually draw on, and the largest block is
+/// what a single contiguous request has to fit in.
+fn log_heap(stage: &str) {
+    unsafe {
+        log::info!(
+            "heap after {stage}: all={} usable8={} largest8={}",
+            esp_idf_svc::sys::esp_get_free_heap_size(),
+            esp_idf_svc::sys::heap_caps_get_free_size(esp_idf_svc::sys::MALLOC_CAP_8BIT),
+            esp_idf_svc::sys::heap_caps_get_largest_free_block(esp_idf_svc::sys::MALLOC_CAP_8BIT),
+        );
+    }
+}
+
 fn heap_check(script_len: usize, components: Option<&Vec<String>>) -> Result<(), String> {
     let free = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() } as usize;
     let largest =
@@ -275,6 +305,7 @@ fn run_script(
             Err(e) => return Outcome::Error(e),
         },
     };
+    log_heap("thread start");
     let mut engine = script_env::new_engine(components);
     if kind == RunKind::Idle {
         script_env::register_idle_api(&mut engine, {
@@ -402,6 +433,8 @@ fn run_script(
         }
     });
 
+    log_heap("engine built");
+
     // Compile first and drop the source before evaluating: `Engine::run` holds
     // both the text and the AST live for the whole run, and on this heap the
     // script's own bytes are worth handing back.
@@ -410,6 +443,7 @@ fn run_script(
         Err(e) => return Outcome::Error(e.to_string()),
     };
     drop(script);
+    log_heap("ast compiled");
 
     match engine.run_ast(&ast) {
         Ok(()) => Outcome::Ok,

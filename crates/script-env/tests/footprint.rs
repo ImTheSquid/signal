@@ -64,8 +64,16 @@ const SCRIPT: &str = include_str!("../../../scripts/follow.rhai");
 /// script thread's stack — both from the running light, not from theory.
 const DEVICE_FREE_HEAP: isize = 140_796;
 const SCRIPT_STACK: isize = 32 * 1024;
-/// Host allocations are pointer-dense and this target is 64-bit.
+/// Engine registries are pointer-dense, so they do roughly halve on a 32-bit
+/// target. This does **not** apply to the AST — see below.
 const HOST_TO_DEVICE: isize = 2;
+/// Heap per byte of minified source, from the device, not from halving the host
+/// figure. Halving gave 7.7 and the board then exhausted 154900 free bytes on a
+/// 5054-byte script, so the host number is optimistic by more than 2x: the AST's
+/// i64 and f32 fields do not shrink on a 32-bit target, and rhai's parser peaks
+/// well above the tree it finally keeps. Must match the firmware's
+/// AST_BYTES_PER_SOURCE_BYTE.
+const DEVICE_AST_BYTES_PER_SOURCE_BYTE: f64 = 24.0;
 
 #[test]
 fn interpreter_footprint() {
