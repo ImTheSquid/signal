@@ -24,6 +24,35 @@ use crate::lights::Lights;
 use crate::script::{LastHolderInfo, Outcome, RunKind, Runner, SharedLastHolder};
 use crate::wsproto::{DeviceMsg, JsonFramer, LightsJson, ServerMsg, ServerMsgRaw};
 
+// On replacing the allocator, which has been looked at twice now:
+//
+// ESP-IDF's TLSF charges ~8 bytes per allocation and talc charges 4, so across
+// the interpreter's ~2100 allocations a swap is worth about 8KB — a few hundred
+// source bytes. It is not worth it, for two reasons beyond the size.
+//
+// Using talc here needs more than adding the dependency. Its bundled on-demand
+// sources — `GlobalAllocSource` and `AllocatorSource`, which draw slabs from a
+// backing allocator and hand them back — each hold a raw pointer and ship no
+// `Send` impl, so neither can sit in a `static`. Of the bundled sources only
+// `Claim` can, and that is a fixed static arena.
+//
+// A fixed arena does not fit this workload. The C side wants ~200KB (wifi, TLS,
+// lwip, plus the 32KB pthread stack the script thread runs on, which is a C
+// allocation) and Rust's peak is ~130KB for engine and AST, against ~323KB of
+// heap in total. Those only coexist because they share dynamically; carve the
+// split at link time and whichever side guessed low fails.
+//
+// That leaves writing a `Source` by hand — it is a public trait — drawing slabs
+// from ESP-IDF's malloc, with `Send` asserted on our own type since the pointer
+// is only touched under the allocator lock. Perfectly legitimate, and still not
+// worth it for the reason below.
+//
+// There is also no fragmentation to recover. Free heap and largest block track
+// each other closely during a run (35812 free / 34816 largest), and the gap at
+// idle is region structure, not churn: the heap is several separate spans
+// (6K + 154K + 14K + 111K) and no allocation can straddle them, so the largest
+// block is capped by the largest region.
+
 const HEARTBEAT: Duration = Duration::from_secs(20);
 const WIFI_CHECK: Duration = Duration::from_secs(10);
 const IDLE_RESTART_PAUSE: Duration = Duration::from_millis(500);

@@ -24,15 +24,40 @@ opt-level = "z"
 
 [dependencies]
 log = "0.4"
-esp-idf-svc = { version = "0.52.1", features = ["critical-section", "embassy-time-driver", "embassy-sync"] }
-# Remove `generic-queue-8` if you plan to use `embassy-time` WITH `embassy-executor`
-embassy-time = { version = "0.5", features = ["generic-queue-8"] }
+# No embassy features: nothing here uses it. The template brings in embassy-time,
+# its timer driver and its sync primitives, and `rg embassy src/` finds nothing —
+# so it was a timer queue and a pile of code the light was carrying for free.
+esp-idf-svc = { version = "0.52.1", features = ["critical-section"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml-cfg = "0.2"
 script-env = { path = "../crates/script-env" }
 wsframe = { path = "../crates/wsframe" }
+# Declared here only to add `no_optimize` to what script-env already asks for —
+# cargo unions features, so this applies to the firmware build and not to the
+# validator's. rhai's optimiser runs a whole pass over the tree after parsing,
+# and the peak during `compile` is what has to fit in the heap, not the AST it
+# finally keeps. The validator cannot drop it: rhaiper needs OptimizationLevel.
+#
+# The cost is that constant folding no longer happens, so a script does slightly
+# more work at run time. On a board that reboots when compilation runs out of
+# memory, that is a trade worth making.
+rhai = { version = "1", features = ["no_optimize"] }
+# Rust's allocations go through talc rather than straight to ESP-IDF's malloc.
+# Two reasons, in order of size:
+#
+#  - Fragmentation. The interpreter makes ~2100 small allocations per run and
+#    hands them all back; the board idles with 140796 free but a largest block of
+#    110592, and the script thread needs a contiguous 32KB stack out of that.
+#    talc draws a few large slabs from ESP-IDF instead, so the C side's heap sees
+#    a handful of blocks rather than thousands.
+#  - Header size. ESP-IDF's TLSF charges ~8 bytes per allocation, talc one usize
+#    (4 here), which is worth ~8KB across those allocations.
+#
+# Drawn on demand from the system allocator rather than a static arena: a fixed
+# split would starve either the scripts or the TLS handshake, and which one is
+# not knowable ahead of time.
 
 [build-dependencies]
 embuild = "0.33"
