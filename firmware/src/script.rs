@@ -36,6 +36,52 @@ pub type SharedLastHolder = Arc<Mutex<Option<LastHolderInfo>>>;
 /// kept lean because this allocation exists whenever any script (incl. idle)
 /// is running and the board lives close to the heap floor.
 const SCRIPT_STACK_BYTES: usize = 32 * 1024;
+
+/// Heap the interpreter needs before the script's own AST, measured by
+/// `crates/script-env/tests/footprint.rs` and halved for this 32-bit target.
+const ENGINE_HEAP_BYTES: usize = 70 * 1024;
+/// AST bytes per byte of minified source, from the same measurement, rounded up.
+const AST_BYTES_PER_SOURCE_BYTE: usize = 8;
+/// Room for the run itself — scope, values, and the DMX frames a script pulls in
+/// while it works. Without it a script fits at startup and dies once busy.
+const RUN_MARGIN_BYTES: usize = 8 * 1024;
+
+/// Whether a script of this size can be run without exhausting the heap.
+///
+/// Rust aborts on allocation failure, and on this board abort reboots, so an
+/// interpreter that runs out of memory takes the whole light down and the job
+/// never reports back — it shows up as a `lost` history row and a lamp that
+/// flickers on each boot. There is no way to catch that after the fact, so the
+/// only protection is to decline beforehand.
+///
+/// Conservative on purpose: refusing a script that would have just fit costs a
+/// legible error, while accepting one that does not costs a reboot cycle.
+fn heap_check(script_len: usize) -> Result<(), String> {
+    let free = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() } as usize;
+    let largest =
+        unsafe { esp_idf_svc::sys::heap_caps_get_largest_free_block(esp_idf_svc::sys::MALLOC_CAP_8BIT) };
+    let needed = SCRIPT_STACK_BYTES
+        + ENGINE_HEAP_BYTES
+        + script_len * AST_BYTES_PER_SOURCE_BYTE
+        + RUN_MARGIN_BYTES;
+
+    // The stack is one contiguous allocation, so free heap alone does not say it
+    // can be had — this board idles with ~140KB free but a largest block of
+    // ~108KB.
+    if largest < SCRIPT_STACK_BYTES {
+        return Err(format!(
+            "device out of memory: largest free block is {largest} bytes, \
+             the script stack needs {SCRIPT_STACK_BYTES}"
+        ));
+    }
+    if free < needed {
+        return Err(format!(
+            "script too large for this device: {script_len} bytes needs about \
+             {needed} bytes of heap, {free} free"
+        ));
+    }
+    Ok(())
+}
 /// Abort latency bound: blocking script calls wake at least this often to
 /// check the flag.
 ///
@@ -76,8 +122,8 @@ impl Runner {
         self.abort.store(true, Ordering::SeqCst);
     }
 
-    /// Stop the current script and wait until its thread exits, so at most
-    /// one interpreter (and one 64K stack) ever exists.
+    /// Stop the current script and wait until its thread exits, so at most one
+    /// interpreter (and one script stack) ever exists.
     pub fn stop(&mut self) {
         self.request_abort();
         if let Some(handle) = self.handle.take() {
@@ -107,32 +153,40 @@ impl Runner {
         let job_id_on_fail = job_id.clone();
         let holder_on_fail = holder.clone();
         let tx_on_fail = tx.clone();
-        let spawned = std::thread::Builder::new()
-            .name("rhai".into())
-            .stack_size(SCRIPT_STACK_BYTES)
-            .spawn(move || {
-                let deadline = ttl.map(|t| Instant::now() + t);
-                let outcome = run_script(&script, kind, deadline, &abort, &lights, &last_holder);
-                let _ = tx.send(AppEvent::ScriptDone {
-                    run_gen,
-                    kind,
-                    job_id,
-                    holder,
-                    outcome,
-                });
-            });
+
+        // Decline before allocating anything, so a script that cannot fit fails
+        // as a run rather than as a reboot.
+        let spawned = match heap_check(script.len()) {
+            Err(e) => Err(std::io::Error::other(e)),
+            Ok(()) => std::thread::Builder::new()
+                .name("rhai".into())
+                .stack_size(SCRIPT_STACK_BYTES)
+                .spawn(move || {
+                    let deadline = ttl.map(|t| Instant::now() + t);
+                    let outcome =
+                        run_script(script, kind, deadline, &abort, &lights, &last_holder);
+                    let _ = tx.send(AppEvent::ScriptDone {
+                        run_gen,
+                        kind,
+                        job_id,
+                        holder,
+                        outcome,
+                    });
+                }),
+        };
         match spawned {
             Ok(handle) => self.handle = Some(handle),
-            // Usually heap exhaustion — never worth a panic-reset. Report it
+            // Either the heap check declined or the spawn itself failed, both of
+            // which are heap exhaustion. Never worth a panic-reset: report it
             // like a script failure so the main loop keeps its invariants.
             Err(e) => {
-                log::error!("script thread spawn failed: {e}");
+                log::error!("script not started: {e}");
                 let _ = tx_on_fail.send(AppEvent::ScriptDone {
                     run_gen,
                     kind,
                     job_id: job_id_on_fail,
                     holder: holder_on_fail,
-                    outcome: Outcome::Error(format!("device out of memory: {e}")),
+                    outcome: Outcome::Error(e.to_string()),
                 });
             }
         }
@@ -140,15 +194,16 @@ impl Runner {
 }
 
 fn run_script(
-    script: &str,
+    script: String,
     kind: RunKind,
     deadline: Option<Instant>,
     abort: &Arc<AtomicBool>,
     lights: &Arc<Lights>,
     last_holder: &SharedLastHolder,
 ) -> Outcome {
-    let mut engine = script_env::rhai::Engine::new();
-    script_env::apply_limits(&mut engine);
+    // The full surface: a key holder's script may use anything the docs
+    // promise, and which packages it needs is not knowable before it runs.
+    let mut engine = script_env::new_engine(script_env::Components::all());
     if kind == RunKind::Idle {
         script_env::register_idle_api(&mut engine, {
             let last_holder = last_holder.clone();
@@ -275,7 +330,16 @@ fn run_script(
         }
     });
 
-    match engine.run(script) {
+    // Compile first and drop the source before evaluating: `Engine::run` holds
+    // both the text and the AST live for the whole run, and on this heap the
+    // script's own bytes are worth handing back.
+    let ast = match engine.compile(&script) {
+        Ok(ast) => ast,
+        Err(e) => return Outcome::Error(e.to_string()),
+    };
+    drop(script);
+
+    match engine.run_ast(&ast) {
         Ok(()) => Outcome::Ok,
         Err(e) => match *e {
             EvalAltResult::ErrorTerminated(token, _) => {
