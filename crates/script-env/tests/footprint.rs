@@ -116,6 +116,49 @@ fn interpreter_footprint() {
         script_env::MAX_SCRIPT_BYTES,
     );
 
+    // What the script actually needs, rather than the whole library. The engine
+    // cannot be mutated during evaluation (`run` takes `&self`), so the set has
+    // to be chosen before the run — but choosing it wrong is only an
+    // `ErrorFunctionNotFound`, which is a history row, not a reboot.
+    use script_env::rhai::packages::Package;
+    let sets: [(&str, fn(&mut script_env::rhai::Engine)); 4] = [
+        ("arithmetic", |e| {
+            script_env::rhai::packages::ArithmeticPackage::new().register_into_engine(e);
+        }),
+        ("+ logic", |e| {
+            script_env::rhai::packages::ArithmeticPackage::new().register_into_engine(e);
+            script_env::rhai::packages::LogicPackage::new().register_into_engine(e);
+        }),
+        ("+ array (follow.rhai)", |e| {
+            script_env::rhai::packages::ArithmeticPackage::new().register_into_engine(e);
+            script_env::rhai::packages::LogicPackage::new().register_into_engine(e);
+            script_env::rhai::packages::BasicArrayPackage::new().register_into_engine(e);
+        }),
+        ("everything (today)", |e| {
+            script_env::rhai::packages::StandardPackage::new().register_into_engine(e);
+        }),
+    ];
+
+    println!("  selective registration — script bytes the device could then run\n");
+    println!("  package set              engine(dev)   for AST   source bytes");
+    for (name, build) in sets {
+        let bytes = cost(|| {
+            let mut e = script_env::rhai::Engine::new_raw();
+            build(&mut e);
+            script_env::apply_limits(&mut e);
+            script_env::register_api(&mut e, script_env::Handlers::stubs());
+            e
+        });
+        let dev = bytes / HOST_TO_DEVICE;
+        let room = DEVICE_FREE_HEAP - dev - SCRIPT_STACK;
+        let bytes_per = per_byte / HOST_TO_DEVICE as f64;
+        println!(
+            "  {name:<22} {dev:>9}  {room:>8}   {:>8}",
+            (room as f64 / bytes_per) as isize
+        );
+    }
+    println!("\n  follow.rhai needs {} bytes\n", minified.len());
+
     // The advertised limit has to be one the device can actually honour, or the
     // server accepts scripts that reboot the light. This is the regression that
     // matters: it is what shipped.
