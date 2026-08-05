@@ -126,7 +126,6 @@ const DEVICE_FULL_ENGINE: isize = 95_872;
 /// This exists so that trade is decided on a measurement. It asserts nothing
 /// about the result: it prints what an arena could recover, against a ceiling
 /// of about 3,500 source bytes.
-#[test]
 fn allocation_overhead_is_worth_measuring() {
     const IDF_HEADER: isize = 8;
     const TALC_HEADER: isize = 4;
@@ -245,6 +244,10 @@ fn allocation_overhead_is_worth_measuring() {
 
 #[test]
 fn interpreter_footprint() {
+    // Called, not a #[test] of its own: the allocation counters are global, so a
+    // second test running in parallel measures this one's allocations too.
+    allocation_overhead_is_worth_measuring();
+
     // The standard-library modules are built once and shared by pointer, so the
     // first engine pays for them and every later one pays a refcount. The device
     // builds an engine per run, so it is the second number that it lives with.
