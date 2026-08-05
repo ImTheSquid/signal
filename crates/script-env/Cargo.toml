@@ -5,3 +5,8 @@ edition = "2021"
 
 [dependencies]
 rhai = { workspace = true }
+
+[dev-dependencies]
+# The device is sent the minified form, so pricing the AST per source byte has
+# to measure what the server actually ships. Same minifier `/v1/script` uses.
+rhaiper = { version = "0.2", default-features = false }
