@@ -74,6 +74,10 @@ const HOST_TO_DEVICE: isize = 2;
 /// well above the tree it finally keeps. Must match the firmware's
 /// AST_BYTES_PER_SOURCE_BYTE.
 const DEVICE_AST_BYTES_PER_SOURCE_BYTE: f64 = 24.0;
+/// The full standard library, measured on the light by logging free heap either
+/// side of building it. The host reports 135320 for the same thing, so scaling
+/// the host number is what produced a guard that let a doomed script through.
+const DEVICE_FULL_ENGINE: isize = 95_872;
 
 #[test]
 fn interpreter_footprint() {
@@ -102,12 +106,54 @@ fn interpreter_footprint() {
         .expect("follow.rhai must minify")
         .text;
     let ast_min = cost(|| engine.compile(&minified).expect("minified must compile"));
+
+    // Renaming as well. rhai stores variable names as SmartString<LazyCompact>,
+    // which inlines up to `sizeof(String) - 1` — 23 bytes here but only **11 on
+    // the 32-bit device** — and `Identifier` is a plain SmartString, not a
+    // refcounted one, so a name past that threshold allocates at every use site.
+    // Short names therefore cost the device nothing at all, which is a saving
+    // this 64-bit host mostly cannot see.
+    let renamed = rhaiper::minify_with_engine(
+        &engine,
+        SCRIPT,
+        &rhaiper::Options {
+            rename: true,
+            ..Default::default()
+        },
+    )
+    .expect("follow.rhai must minify with renaming")
+    .text;
+    let ast_renamed = cost(|| engine.compile(&renamed).expect("renamed must compile"));
     drop(engine);
 
+    // How much of follow.rhai is names the device has to allocate for.
+    let mut long: Vec<&str> = Vec::new();
+    for tok in SCRIPT.split(|c: char| !c.is_alphanumeric() && c != '_') {
+        if tok.len() > 11 && !tok.chars().next().is_some_and(|c| c.is_numeric()) {
+            long.push(tok);
+        }
+    }
+    let distinct: std::collections::BTreeSet<&&str> = long.iter().collect();
+    println!(
+        "\n  renaming\
+         \n    minified             {:>8} bytes\
+         \n    minified + renamed   {:>8} bytes\
+         \n    AST minified         {ast_min:>8}\
+         \n    AST renamed          {ast_renamed:>8}\
+         \n    identifiers over 11 chars: {} uses of {} distinct names\
+         \n      (each such use allocates on the device; on this host they inline)\n",
+        minified.len(),
+        renamed.len(),
+        long.len(),
+        distinct.len(),
+    );
+
     let per_byte = ast_min as f64 / minified.len() as f64;
-    let engine_dev = validation / HOST_TO_DEVICE;
+    // The device figures, not the host ones scaled: the engine measured 95872
+    // on the light against 135320 here, and the AST does not shrink at all.
+    let engine_dev = DEVICE_FULL_ENGINE;
     let headroom = DEVICE_FREE_HEAP - engine_dev - SCRIPT_STACK;
-    let serviceable = (headroom as f64 / (per_byte / HOST_TO_DEVICE as f64)) as isize;
+    let serviceable = (headroom as f64 / DEVICE_AST_BYTES_PER_SOURCE_BYTE) as isize;
 
     println!(
         "\n  host bytes\
@@ -121,7 +167,7 @@ fn interpreter_footprint() {
          \n    new_engine, first   {first_engine:>8}   (builds the shared modules)\
          \n    new_engine, later   {later_engine:>8}   (what each run costs)\
          \n\
-         \n  device budget (host/2), against {DEVICE_FREE_HEAP} free\
+         \n  device budget, measured on the light, against {DEVICE_FREE_HEAP} free\
          \n    engine               {engine_dev:>8}\
          \n    script stack         {SCRIPT_STACK:>8}\
          \n    leaves for the AST   {headroom:>8}\
