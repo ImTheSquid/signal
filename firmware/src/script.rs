@@ -36,11 +36,13 @@ pub type SharedLastHolder = Arc<Mutex<Option<LastHolderInfo>>>;
 /// max_expr_depths rather than by script length, so this does not have to grow
 /// with the script.
 ///
-/// Measured, not guessed: the run logs its own high-water mark on the way out,
-/// and 32KB left 25812 bytes never touched. Halved on that evidence, which
-/// hands 16KB back to the heap the AST is competing for — more than the whole
-/// binary's static DRAM. Watch the log line before cutting it further.
-const SCRIPT_STACK_BYTES: usize = 16 * 1024;
+/// **Do not size this from the idle script.** 16KB looked safe on the evidence
+/// of the built-in idle run, which touches 7488 bytes and leaves the high-water
+/// log reporting most of the stack unused — and then `scripts/follow.rhai`
+/// overflowed it immediately, because its nested calls go far deeper than
+/// anything idle does. The mark this logs is only ever a statement about the
+/// script that just ran.
+const SCRIPT_STACK_BYTES: usize = 32 * 1024;
 
 /// Heap the full standard library needs, measured by
 /// `crates/script-env/tests/footprint.rs` and halved for this 32-bit target.
