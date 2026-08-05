@@ -294,6 +294,70 @@ impl Components {
     /// Inferring it from substrings would trade a reboot for a script that dies
     /// the first time an untested branch is taken, which is worse — the failure
     /// moves from startup to the middle of a set.
+    /// Every component name, in the order they are documented.
+    pub const NAMES: [&'static str; 9] = [
+        "core",
+        "array",
+        "map",
+        "string",
+        "math",
+        "iterator",
+        "blob",
+        "bitfield",
+        "functions",
+    ];
+
+    /// Parse a declaration, as submitted with a script.
+    ///
+    /// Unknown names are rejected rather than ignored: a typo that silently
+    /// dropped a component would surface much later, as the script dying at the
+    /// first call it could not resolve.
+    pub fn from_names<S: AsRef<str>>(names: impl IntoIterator<Item = S>) -> Result<Self, String> {
+        let mut c = Components::none();
+        for name in names {
+            let name = name.as_ref();
+            match name {
+                "core" => c.core = true,
+                "array" => c.array = true,
+                "map" => c.map = true,
+                "string" => c.string = true,
+                "math" => c.math = true,
+                "iterator" => c.iterator = true,
+                "blob" => c.blob = true,
+                "bitfield" => c.bit_field = true,
+                "functions" => c.functions = true,
+                other => {
+                    return Err(format!(
+                        "unknown component {other:?}; valid components are {}",
+                        Self::NAMES.join(", ")
+                    ))
+                }
+            }
+        }
+        Ok(c)
+    }
+
+    /// The declared names, for echoing back and for storing with a job.
+    pub fn names(&self) -> Vec<&'static str> {
+        let on = [
+            self.core,
+            self.array,
+            self.map,
+            self.string,
+            self.math,
+            self.iterator,
+            self.blob,
+            self.bit_field,
+            self.functions,
+        ];
+        Self::NAMES
+            .iter()
+            .zip(on)
+            .filter(|(_, on)| *on)
+            .map(|(n, _)| *n)
+            .collect()
+    }
+
     pub const fn none() -> Self {
         Components {
             core: false,
@@ -765,6 +829,95 @@ mod component_tests {
 
     /// Arithmetic and logic are always on, so the cheapest engine is still able
     /// to count and compare — which is what makes them non-optional.
+    /// What each component actually contains, established by probing rather
+    /// than by reading rhai's package list — several entries are not where they
+    /// look like they should be. Pinned so the README's table cannot rot.
+    ///
+    /// `core` and `functions` are absent deliberately: nothing reachable from
+    /// this language surface could be shown to depend on them, so the docs do
+    /// not claim they provide anything specific.
+    const PER_COMPONENT: [(&str, &str); 7] = [
+        ("array", "let a = [1, 2]; a.len() == 2"),
+        ("map", "let m = #{a: 1}; m.len() == 1"),
+        ("string", r#""abc".sub_string(1, 1) == "b""#),
+        ("math", "(4.0).sqrt() > 1.0"),
+        ("iterator", "let t = 0; for i in 0..3 { t += i } t == 3"),
+        ("blob", "let b = blob(2); b.len() == 2"),
+        ("bitfield", "let x = 6; x.get_bit(1)"),
+    ];
+
+    fn runs(c: Components, src: &str) -> bool {
+        let mut engine = new_engine(c);
+        register_api(&mut engine, Handlers::stubs());
+        matches!(engine.eval::<bool>(src), Ok(true))
+    }
+
+    /// Each component provides its own entry, and *only* its own — so the docs
+    /// can tell someone which one name to add when a call fails.
+    #[test]
+    fn components_provide_exactly_what_the_docs_say() {
+        for (name, src) in PER_COMPONENT {
+            let only = Components::from_names([name]).unwrap();
+            assert!(runs(only, src), "{name}: {src:?} did not run with only {name}");
+            assert!(
+                !runs(Components::none(), src),
+                "{name}: {src:?} runs with no components, so the docs must not \
+                 attribute it to {name}"
+            );
+            for other in Components::NAMES {
+                if other == name || other == "core" || other == "functions" {
+                    continue;
+                }
+                let only_other = Components::from_names([other]).unwrap();
+                assert!(
+                    !runs(only_other, src),
+                    "{name}: {src:?} also runs under {other}, so the docs are wrong"
+                );
+            }
+        }
+    }
+
+    /// Field access on a map is core language, not the `map` component — worth
+    /// pinning because `dmx_recv` hands scripts a map and reading it must not
+    /// require a declaration.
+    #[test]
+    fn reading_a_map_field_needs_nothing() {
+        assert!(runs(Components::none(), "let m = #{a: 1}; m.a == 1"));
+    }
+
+    /// `to_float` reads like a conversion but lives in `math`, which is why
+    /// scripts/follow.rhai needs that component despite doing no trigonometry.
+    #[test]
+    fn to_float_needs_math() {
+        assert!(!runs(Components::none(), "(1).to_float() > 0.0"));
+        assert!(runs(Components::from_names(["math"]).unwrap(), "(1).to_float() > 0.0"));
+    }
+
+    /// print and debug format their argument, so they need `string` — not the
+    /// `core` name a reader would reach for first.
+    #[test]
+    fn print_needs_string() {
+        assert!(!runs(Components::none(), "print(1); true"));
+        assert!(runs(Components::from_names(["string"]).unwrap(), "print(1); true"));
+    }
+
+    #[test]
+    fn names_round_trip() {
+        let all = Components::all();
+        assert_eq!(all.names().len(), Components::NAMES.len());
+        assert_eq!(Components::from_names(all.names()).unwrap(), all);
+        assert_eq!(Components::from_names(Vec::<&str>::new()).unwrap(), Components::none());
+    }
+
+    /// A typo must not quietly drop a component: the script would run until it
+    /// reached the first call it could not resolve, which could be hours in.
+    #[test]
+    fn unknown_names_are_rejected_and_say_what_is_valid() {
+        let e = Components::from_names(["array", "maths"]).unwrap_err();
+        assert!(e.contains("maths"), "{e}");
+        assert!(e.contains("math"), "{e}");
+    }
+
     #[test]
     fn the_cheapest_engine_still_counts_and_compares() {
         let mut engine = new_engine(Components::none());

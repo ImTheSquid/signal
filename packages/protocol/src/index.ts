@@ -1,5 +1,30 @@
 import { z } from "zod";
 
+/** Rhai standard-library components a script may declare it needs, mirrored from
+ *  `Components::NAMES` in crates/script-env.
+ *
+ *  Declaring is how a script buys heap: the device leaves out what was not
+ *  declared, and what it leaves out is room the script's own AST gets instead.
+ *  The full set costs roughly half the free heap.
+ *
+ *  Nothing here can be verified server-side. Rhai resolves calls at run time, so
+ *  compiling a script against a narrower engine still succeeds — see the
+ *  `unknown_function_compiles` test. An under-declared script fails on the
+ *  device, at the first call it cannot resolve. */
+export const COMPONENTS = [
+  "core",
+  "array",
+  "map",
+  "string",
+  "math",
+  "iterator",
+  "blob",
+  "bitfield",
+  "functions",
+] as const;
+export const ComponentsSchema = z.array(z.enum(COMPONENTS));
+export type Component = (typeof COMPONENTS)[number];
+
 // ---- Shared limits (mirrored in crates/script-env) ----
 
 /** Size of the script that reaches the device, measured after minification. */
@@ -64,6 +89,11 @@ export const JobSchema = z.object({
   map: z.string().optional(),
   /** Submitted size, for reporting what minification saved. */
   rawBytes: z.number().optional(),
+  /** Rhai standard-library components the submitter declared this script needs.
+   *  Absent means all of them, which is what the device built before scripts
+   *  could declare. Each one the device can leave out is heap the script's own
+   *  AST gets instead — the full set costs roughly half the free heap. */
+  components: z.array(z.string()).optional(),
   expiresAt: z.number(),
 });
 export type Job = z.infer<typeof JobSchema>;
@@ -171,6 +201,9 @@ export const JobMsgSchema = z.object({
   holder: z.string().default(""),
   script: z.string(),
   ttl_ms: z.number(),
+  /** See `JobSchema.components`. Omitted means all of them, so a device on
+   *  older firmware and a server that never sends this agree. */
+  components: z.array(z.string()).optional(),
 });
 
 export const ServerMsgSchema = z.discriminatedUnion("t", [

@@ -28,6 +28,9 @@ pub struct ServerMsgRaw {
     // job and idle both carry a script at the top level
     pub script: Option<String>,
     pub ttl_ms: Option<u64>,
+    /// Rhai components the submitter declared. Absent means all of them, so a
+    /// server that never sends this and this firmware still agree.
+    pub components: Option<Vec<String>>,
     pub rev: Option<u64>,
 }
 
@@ -43,6 +46,7 @@ pub enum ServerMsg {
         holder: String,
         script: String,
         ttl_ms: u64,
+        components: Option<Vec<String>>,
     },
     Abort,
     Idle {
@@ -64,6 +68,7 @@ impl TryFrom<ServerMsgRaw> for ServerMsg {
                 holder: raw.holder.unwrap_or_default(),
                 script: raw.script.ok_or("job without script")?,
                 ttl_ms: raw.ttl_ms.ok_or("job without ttl_ms")?,
+                components: raw.components,
             }),
             "abort" => Ok(ServerMsg::Abort),
             "idle" => Ok(ServerMsg::Idle {
@@ -81,6 +86,8 @@ pub struct JobPayload {
     pub holder: String,
     pub script: String,
     pub ttl_ms: u64,
+    #[serde(default)]
+    pub components: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]

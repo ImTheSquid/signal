@@ -67,7 +67,16 @@ async function currentJobMsg(): Promise<ServerMsg | null> {
 	const job = JSON.parse(raw) as Job;
 	const ttl = job.expiresAt - Date.now();
 	if (ttl <= 0) return null;
-	return { t: 'job', id: job.jobId, holder: job.holder ?? '', script: job.script, ttl_ms: ttl };
+	// `components` is omitted when the job did not declare, which the device
+	// reads as the full set — so an older device and an undeclared job agree.
+	return {
+		t: 'job',
+		id: job.jobId,
+		holder: job.holder ?? '',
+		script: job.script,
+		ttl_ms: ttl,
+		components: job.components
+	};
 }
 
 async function getIdle(): Promise<Idle | null> {

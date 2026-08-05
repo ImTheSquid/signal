@@ -5,13 +5,13 @@
 //! engine (paid once per run, whatever the script) and the AST (paid per source
 //! byte).
 //!
-//! **The engine's cost is not discretionary.** Every key holder submits
-//! arbitrary Rhai and the admin idle script runs on the same engine, and the
-//! documented surface is "Rhai with i64 and f32, no closures/modules/eval" —
-//! which promises the standard library. `new_raw` is measured here as the
-//! *floor* of what an engine could cost, not as a proposal: dropping packages
-//! would silently break other people's scripts at run time, and `MAX_*` and the
-//! validator would all have to move with it.
+//! **The engine's cost is only discretionary if the submitter says so.** Every
+//! key holder submits arbitrary Rhai and the admin idle script runs on the same
+//! engine, and the documented surface promises the standard library — so a
+//! script gets all of it unless it declares otherwise (see `Components` and the
+//! README). Rhai resolves calls at run time, so nothing can infer the set: an
+//! under-declared script fails at the first call it cannot resolve. `new_raw`
+//! is the floor, not a default.
 //!
 //! Host figures are an upper bound on the device's — this is a 64-bit target and
 //! rhai's registry is pointer-dense, so absolute bytes run roughly 2x the
@@ -129,10 +129,12 @@ fn interpreter_footprint() {
             script_env::rhai::packages::ArithmeticPackage::new().register_into_engine(e);
             script_env::rhai::packages::LogicPackage::new().register_into_engine(e);
         }),
-        ("+ array (follow.rhai)", |e| {
+        ("array + math (follow)", |e| {
             script_env::rhai::packages::ArithmeticPackage::new().register_into_engine(e);
             script_env::rhai::packages::LogicPackage::new().register_into_engine(e);
             script_env::rhai::packages::BasicArrayPackage::new().register_into_engine(e);
+            // follow.rhai calls to_float, which lives in math.
+            script_env::rhai::packages::BasicMathPackage::new().register_into_engine(e);
         }),
         ("everything (today)", |e| {
             script_env::rhai::packages::StandardPackage::new().register_into_engine(e);

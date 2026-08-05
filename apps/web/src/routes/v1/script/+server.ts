@@ -1,5 +1,5 @@
 import { json } from '@sveltejs/kit';
-import { MAX_RAW_SCRIPT_BYTES, REDIS } from '@traffic-light/protocol';
+import { COMPONENTS, ComponentsSchema, MAX_RAW_SCRIPT_BYTES, REDIS } from '@traffic-light/protocol';
 import { authenticate } from '$lib/server/keys';
 import { submitJob } from '$lib/server/locks';
 import { pushHistory } from '$lib/server/history';
@@ -29,6 +29,22 @@ export const POST: RequestHandler = async ({ request }) => {
 		return json({ error: `script exceeds ${MAX_RAW_SCRIPT_BYTES} bytes` }, { status: 413 });
 	}
 
+	// A declaration is the submitter's promise about what the script uses, and it
+	// cannot be checked by compiling — rhai resolves calls at run time. What can
+	// be checked is that every name is real, so a typo fails here instead of
+	// silently dropping a component and killing the script mid-run.
+	let components: string[] | undefined;
+	if (body?.components !== undefined) {
+		const parsed = ComponentsSchema.safeParse(body.components);
+		if (!parsed.success) {
+			return json(
+				{ error: `components must be an array of: ${COMPONENTS.join(', ')}` },
+				{ status: 400 }
+			);
+		}
+		components = parsed.data;
+	}
+
 	// Minifies as well as compile-checks. The device limit applies to what comes
 	// out, so comments and indentation no longer count against it.
 	const prepared = prepareScript(script);
@@ -43,7 +59,8 @@ export const POST: RequestHandler = async ({ request }) => {
 		holder: key.name,
 		script: prepared.script,
 		map: prepared.map,
-		rawBytes: prepared.rawBytes
+		rawBytes: prepared.rawBytes,
+		components
 	});
 	if (result.status !== 'ok') {
 		const error =
@@ -69,6 +86,7 @@ export const POST: RequestHandler = async ({ request }) => {
 			ttl_ms: result.ttlMs,
 			bytes: prepared.bytes,
 			raw_bytes: prepared.rawBytes,
+			components,
 			warning: prepared.warning
 		},
 		{ status: 202 }

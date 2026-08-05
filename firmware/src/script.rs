@@ -141,6 +141,7 @@ impl Runner {
         job_id: Option<String>,
         holder: Option<String>,
         script: String,
+        components: Option<Vec<String>>,
         ttl: Option<Duration>,
         lights: Arc<Lights>,
         last_holder: SharedLastHolder,
@@ -163,8 +164,15 @@ impl Runner {
                 .stack_size(SCRIPT_STACK_BYTES)
                 .spawn(move || {
                     let deadline = ttl.map(|t| Instant::now() + t);
-                    let outcome =
-                        run_script(script, kind, deadline, &abort, &lights, &last_holder);
+                    let outcome = run_script(
+                        script,
+                        components,
+                        kind,
+                        deadline,
+                        &abort,
+                        &lights,
+                        &last_holder,
+                    );
                     let _ = tx.send(AppEvent::ScriptDone {
                         run_gen,
                         kind,
@@ -193,17 +201,28 @@ impl Runner {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_script(
     script: String,
+    components: Option<Vec<String>>,
     kind: RunKind,
     deadline: Option<Instant>,
     abort: &Arc<AtomicBool>,
     lights: &Arc<Lights>,
     last_holder: &SharedLastHolder,
 ) -> Outcome {
-    // The full surface: a key holder's script may use anything the docs
-    // promise, and which packages it needs is not knowable before it runs.
-    let mut engine = script_env::new_engine(script_env::Components::all());
+    // What the submitter declared, or everything if they declared nothing —
+    // which is what every script got before declarations existed. Rhai resolves
+    // calls at run time, so an under-declared script fails at the call it cannot
+    // resolve; that is a reported run failure, not a crash.
+    let components = match components {
+        None => script_env::Components::all(),
+        Some(names) => match script_env::Components::from_names(&names) {
+            Ok(c) => c,
+            Err(e) => return Outcome::Error(e),
+        },
+    };
+    let mut engine = script_env::new_engine(components);
     if kind == RunKind::Idle {
         script_env::register_idle_api(&mut engine, {
             let last_holder = last_holder.clone();

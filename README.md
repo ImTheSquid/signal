@@ -41,7 +41,9 @@ curl -X POST $BASE/v1/lock -H "$AUTH" -H "$JSON" -d '{"duration_s": 120}'
 # Keys minted with the override flag may steal the lock (explicit opt-in):
 curl -X POST $BASE/v1/lock -H "$AUTH" -H "$JSON" -d '{"duration_s": 60, "override": true}'
 
-# Run a script (must hold the lock; max 16KB minified, 256KB as sent; ≤20 submissions/min)
+# Run a script (must hold the lock; 256KB as sent; ≤20 submissions/min)
+# Optional "components": what rhai standard library your script needs — see below.
+# Omitted means all of it, which caps you at ~5KB of script.
 curl -X POST $BASE/v1/script -H "$AUTH" -H "$JSON" \
   -d '{"script": "loop { set_lights(true,false,false); sleep(500); set_lights(false,false,false); sleep(500); }"}'
 # → 202 {"jobId":..., "ttl_ms":..., "bytes":..., "raw_bytes":...}
@@ -61,7 +63,7 @@ curl $BASE/v1/status
 ### Script environment
 
 Comment and indent freely. `POST /v1/script` minifies with
-[rhaiper](https://crates.io/crates/rhaiper) before storing, so the 16KB limit measures the
+[rhaiper](https://crates.io/crates/rhaiper) before storing, so the size limit measures the
 stripped text and the device never receives a comment — `scripts/follow.rhai` goes 8251 → 5054
 bytes on whitespace alone. The source map stays server-side, so runtime errors in the dashboard
 still cite the line you wrote rather than a position in text nobody has seen.
@@ -86,6 +88,75 @@ no `as float` cast. These functions are available:
 **There is no operation cap.** A run is bounded by your lock's TTL and by the kill switch,
 nothing else, so a long analysis loop is fine. A busy loop with no `sleep` will still hold
 the light for the whole lock, so include one.
+
+### Declaring components — how to get a bigger script
+
+The light is an ESP32 with about 140KB of usable heap, and three things compete for it: the
+interpreter, your script's compiled form, and the interpreter's stack. Rhai's standard library
+is most of the first, and **you pay for all of it whether you use it or not** — unless you say
+what you need.
+
+```sh
+curl -X POST $BASE/v1/script -H "$AUTH" -H "$JSON" -d '{
+  "script": "loop { set_lights(true,false,false); sleep(500); }",
+  "components": ["array", "math"]
+}'
+```
+
+Omit `components` and you get everything, which is what every script got before this existed.
+Declare, and the device leaves out the rest — and what it leaves out is heap your script gets
+instead:
+
+| you declare | interpreter costs | your script may be |
+|---|---|---|
+| nothing (the default: everything) | ~69KB | **~5KB** |
+| `["array", "math"]` — what `follow.rhai` needs | ~27KB | **~10.5KB** |
+| `[]` — arithmetic and comparison only | ~6KB | **~13KB** |
+
+Arithmetic, comparison and the traffic-light functions in the table above are always present.
+You never declare those.
+
+| component | what it gives you |
+|---|---|
+| `array` | arrays — literals, indexing, `len`, `push`, `pop`, and the rest |
+| `map` | map *functions*: `len`, `contains`, `keys`, `values`. **Reading a field needs nothing** — `dmx_recv`'s `p.ok` and `p.ch` work undeclared |
+| `string` | string methods (`sub_string`, `index_of`, `replace`, `pad`), **and `print`/`debug`**, which format their argument |
+| `math` | `sqrt`, `sin`, `cos`, `pow`, `floor`, `round` — **and `to_float`/`to_int`**, which is why a script doing no trigonometry still often needs this |
+| `iterator` | `for` loops and ranges (`0..10`) |
+| `blob` | byte blobs |
+| `bitfield` | `get_bit`, `set_bits`, and friends |
+| `core`, `functions` | rhai internals. Nothing in the documented surface was shown to need them; include them if something fails and nothing else explains it |
+
+This table is generated from probes, not from reading rhai's package list — several entries are
+not where they look like they should be. `crates/script-env` pins every row, so if a component
+stops providing what is claimed here, its tests fail.
+
+`scripts/follow.rhai` declares `["array", "math"]`: arrays for its lamp ranking, and `math`
+purely for `to_float`.
+
+#### The part that will bite you
+
+**Nothing checks your declaration.** Rhai resolves function calls when it reaches them, not
+when it compiles, so a script that calls `sqrt()` without declaring `math` compiles fine,
+validates fine, returns `202`, and then **fails on the light at the moment it first calls
+`sqrt`** — which may be an hour into a set, the first time some branch is taken.
+
+The failure is clean and legible, not a crash: the run ends and the dashboard shows
+`Function not found: sqrt (f32)`. The light returns to its idle script. But it *is* your
+script stopping, in front of people.
+
+So:
+
+- **If you are not sure, do not declare.** The default is everything and it is the safe answer.
+  Declaring buys heap; it is worth doing when your script is large enough to need it, and it is
+  not worth doing to save memory you were not going to use.
+- **Declare generously.** An unused component costs heap. A missing one costs your run.
+- **Exercise every branch before you rely on it.** The error only appears on the path that
+  makes the call, so a rarely-taken `if` is exactly where an under-declaration hides.
+- Unknown names are rejected at submit time with `400`, so a typo like `"maths"` fails
+  immediately rather than quietly dropping the component.
+
+If your script is under ~5KB you do not need any of this.
 
 Prefer `sleep_until` over `sleep` for anything rhythmic. A pattern built from relative sleeps
 adds on every delay the work between them cost, so its period drifts long and it slides off

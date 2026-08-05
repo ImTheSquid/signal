@@ -77,8 +77,12 @@ AUTH="Authorization: Bearer $TOKEN"
 #
 # Sends the script as written, comments and all: POST /v1/script minifies it before
 # storing it, so the device gets the stripped form either way.
+# `components` is what follow.rhai needs from rhai's standard library: arrays for
+# the lamp ranking, and math only for to_float. Declaring it leaves the rest out
+# on the device, which roughly doubles the script size that fits — see the README.
+# Under-declaring is not caught server-side; it fails at the call, on the light.
 body() {
-  python3 -c "import json,sys; print(json.dumps({'script': open(sys.argv[1]).read()}))" "$1"
+  python3 -c "import json,sys; print(json.dumps({'script': open(sys.argv[1]).read(), 'components': ['array', 'math']}))" "$1"
 }
 
 release() {

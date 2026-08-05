@@ -163,7 +163,14 @@ struct App {
 }
 
 impl App {
-    fn start_job(&mut self, id: String, holder: String, script: String, ttl_ms: u64) {
+    fn start_job(
+        &mut self,
+        id: String,
+        holder: String,
+        script: String,
+        ttl_ms: u64,
+        components: Option<Vec<String>>,
+    ) {
         if self.running_id.as_deref() == Some(id.as_str()) {
             return; // duplicate delivery (two server instances during recycle)
         }
@@ -178,6 +185,7 @@ impl App {
             Some(id),
             Some(holder),
             script,
+            components,
             Some(Duration::from_millis(ttl_ms)),
             self.lights.clone(),
             self.last_holder.clone(),
@@ -200,6 +208,7 @@ impl App {
                     None,
                     None,
                     script,
+                    None,
                     None,
                     self.lights.clone(),
                     self.last_holder.clone(),
@@ -372,7 +381,9 @@ impl App {
                     self.set_idle_script(idle.script);
                 }
                 match job {
-                    Some(job) => self.start_job(job.id, job.holder, job.script, job.ttl_ms),
+                    Some(job) => {
+                        self.start_job(job.id, job.holder, job.script, job.ttl_ms, job.components)
+                    }
                     None => {
                         if self.running_id.is_some() {
                             // Lock is gone (expired/released while we were away).
@@ -386,7 +397,8 @@ impl App {
                 holder,
                 script,
                 ttl_ms,
-            } => self.start_job(id, holder, script, ttl_ms),
+                components,
+            } => self.start_job(id, holder, script, ttl_ms, components),
             ServerMsg::Abort => {
                 if self.running_id.is_some() {
                     self.runner.request_abort();
