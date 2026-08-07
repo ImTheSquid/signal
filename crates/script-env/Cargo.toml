@@ -5,21 +5,25 @@ edition = "2021"
 
 [dependencies]
 rhai = { workspace = true }
+# The server lowers a script to a flat artifact and the device runs that instead
+# of parsing a tree. Measured on scripts/follow.rhai: 1069 allocations as an AST
+# against 65 as an artifact, which is what the light could not afford — ESP-IDF
+# charges ~8 bytes of header on every one.
+#
+# The restriction flags are set here rather than on rhai. They change what a
+# `Dynamic` is, so an artifact only means the same thing on both sides if the
+# two agree; rhaigrain mirrors rhai's flags for that reason and catches a
+# mismatch at compile time. Keep them in step with the workspace's rhai.
+rhaigrain = { path = "../../../rhaigrain", default-features = false, features = [
+    "sync",
+    "only_i64",
+    "f32_float",
+    "no_closure",
+    "no_module",
+    "no_time",
+] }
 
 [dev-dependencies]
 # The device is sent the minified form, so pricing the AST per source byte has
 # to measure what the server actually ships. Same minifier `/v1/script` uses.
 rhaiper = { version = "0.2", default-features = false }
-# Measuring only, for now: what follow.rhai lowers to, and how much of it the
-# compiler cannot lower and hands back to the walker as an AST fragment. That
-# residual keeps its AST cost, so it decides whether bytecode is worth adopting.
-#
-# rhaigrain goes here once it builds with this project's restriction flags. It
-# declares `no_module` and `no_closure` as pass-throughs to rhai, but only
-# `src/format/abi.rs` acts on them — the compiler and VM use `Stmt::Import`,
-# `Stmt::Share`, `FnCallExpr::namespace`, `Dynamic::is_shared` and the four-field
-# `Expr::Variable` box unguarded, so 29 errors across three files. Setting the
-# flags on rhai alone is caught rather than tolerated, which is the crate doing
-# the right thing; the guards just are not written yet.
-#
-# scripts/vendor-rhai.sh is already here for when they are.

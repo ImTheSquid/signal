@@ -481,6 +481,66 @@ pub fn new_engine(components: Components) -> Engine {
     engine
 }
 
+/// A script lowered for the device: the artifact it runs, and the position
+/// table that stays behind.
+///
+/// Split because the table is only needed to turn a fault back into a line, and
+/// that happens on the server. Sending it would put bytes on a device that has
+/// no use for them — the same reason `JobSchema.map` never leaves the server.
+pub struct Artifact {
+    /// What the device loads and runs.
+    pub program: Vec<u8>,
+    /// Maps a program counter back to a position in the submitted source. Keep
+    /// it beside the job; the device never sees it.
+    pub positions: Vec<u8>,
+    /// Nodes the compiler could not lower, which stay AST fragments and run on
+    /// rhai's walker. Zero for everything in this repo; a script that reports
+    /// more is paying the tree's per-node allocation cost for that part.
+    pub residual: usize,
+}
+
+/// Lower a compiled script to a device artifact.
+///
+/// The parser, the optimiser and the tree all stay here. What reaches the light
+/// is a flat buffer it verifies and executes, which is the difference between
+/// ~1069 allocations and ~65 for `scripts/follow.rhai`.
+pub fn lower(ast: &rhai::AST) -> Result<Artifact, String> {
+    let mut program = rhaigrain::Compiler::new().compile(ast);
+    let residual = program.residual_count();
+    let positions = program.strip_positions();
+    let program = program
+        .write()
+        .map_err(|e| format!("cannot serialise the artifact: {e}"))?;
+    Ok(Artifact {
+        program,
+        positions,
+        residual,
+    })
+}
+
+/// Run an artifact on `engine`.
+///
+/// `bytes` is borrowed for the run rather than copied into an owned program:
+/// the caller has to keep them anyway, and owning costs another ~6KB.
+///
+/// The artifact arrives over the network from a key holder, so it is verified
+/// before it executes — `Program::read` is total over arbitrary bytes precisely
+/// so that check is possible rather than assumed.
+pub fn run_artifact(engine: &Engine, bytes: &[u8]) -> Result<(), Box<rhai::EvalAltResult>> {
+    let program =
+        rhaigrain::Program::read(bytes).map_err(|e| -> Box<rhai::EvalAltResult> {
+            format!("artifact will not load: {e}").into()
+        })?;
+    program
+        .verify()
+        .map_err(|e| -> Box<rhai::EvalAltResult> { format!("artifact failed verification: {e:?}").into() })?;
+
+    let mut scope = rhai::Scope::new();
+    rhaigrain::Vm::new(engine)
+        .run(&program, &mut scope)
+        .map(|_| ())
+}
+
 /// A fully configured engine with stub handlers, for validation.
 ///
 /// Always the full surface: validation must accept anything the docs promise,

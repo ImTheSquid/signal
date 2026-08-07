@@ -242,11 +242,80 @@ fn allocation_overhead_is_worth_measuring() {
     );
 }
 
+/// What the device would hold if it loaded a compiled artifact instead of
+/// parsing a tree.
+///
+/// The AST is the reason the light can only run ~3.5KB of script: 1879
+/// allocations for follow.rhai, each charged an 8-byte header by ESP-IDF, on a
+/// heap where wifi and TLS have already taken 168KB of 323KB. An artifact is a
+/// flat buffer, so the question is what it costs and whether anything in
+/// follow.rhai fails to lower — a residual stays an AST fragment and keeps its
+/// AST cost.
+fn artifact_is_cheaper_than_the_tree() {
+    let engine = script_env::new_engine(script_env::Components::all());
+    let opts = rhaiper::Options {
+        rename: false,
+        ..Default::default()
+    };
+    let minified = rhaiper::minify_with_engine(&engine, SCRIPT, &opts)
+        .expect("follow.rhai must minify")
+        .text;
+    let ast = engine.compile(&minified).expect("minified must compile");
+
+    let (tree_bytes, tree_allocs) = cost_counted(|| engine.compile(&minified).unwrap());
+
+    let program = rhaigrain::Compiler::new().compile(&ast);
+    let residual = program.residual_count();
+    let residual_nodes = program.residual_nodes();
+    let unsupported = program.first_unsupported();
+
+    let wire = program.write().expect("follow.rhai must serialise");
+    // Borrowed against the wire buffer, which is what the device should do: it
+    // has to keep the bytes anyway, and `into_owned` copies every pool out of
+    // them. Measured both ways because the difference decides which one the
+    // firmware holds.
+    let (loaded_bytes, loaded_allocs) =
+        cost_counted(|| rhaigrain::Program::read(&wire).expect("what we just wrote must load"));
+    let (owned_bytes, owned_allocs) = cost_counted(|| {
+        rhaigrain::Program::read(&wire)
+            .expect("what we just wrote must load")
+            .into_owned()
+    });
+
+    println!(
+        "\n  follow.rhai, {} minified bytes\
+         \n    as a tree          {tree_bytes:>8} bytes  {tree_allocs:>6} allocs\
+         \n    artifact, borrowed {loaded_bytes:>8} bytes  {loaded_allocs:>6} allocs\
+         \n    artifact, owned    {owned_bytes:>8} bytes  {owned_allocs:>6} allocs\
+         \n    artifact on the wire {:>6} bytes\
+         \n    residual           {residual} ({residual_nodes} nodes){}\n",
+        minified.len(),
+        wire.len(),
+        match unsupported {
+            Some((what, pos)) => format!("  <- first unsupported: {what} at {pos:?}"),
+            None => String::new(),
+        }
+    );
+
+    // A residual is an AST fragment handed back to the walker, which keeps the
+    // per-node allocation cost this whole change exists to remove. Nothing in
+    // follow.rhai should need one.
+    assert_eq!(
+        residual, 0,
+        "follow.rhai does not lower whole; {residual_nodes} nodes stay a tree"
+    );
+    assert!(
+        loaded_allocs < tree_allocs / 10,
+        "artifact holds {loaded_allocs} allocations against the tree's {tree_allocs}"
+    );
+}
+
 #[test]
 fn interpreter_footprint() {
     // Called, not a #[test] of its own: the allocation counters are global, so a
     // second test running in parallel measures this one's allocations too.
     allocation_overhead_is_worth_measuring();
+    artifact_is_cheaper_than_the_tree();
 
     // The standard-library modules are built once and shared by pointer, so the
     // first engine pays for them and every later one pays a refcount. The device

@@ -110,6 +110,16 @@ fn run_delivered(
     frame_ms: i64,
     arrive: fn(i64) -> i64,
 ) -> Run {
+    run_delivered_as(beat_ms, gen, frame_ms, arrive, Mode::Tree)
+}
+
+fn run_delivered_as(
+    beat_ms: i64,
+    gen: fn(i64, i64) -> Vec<u8>,
+    frame_ms: i64,
+    arrive: fn(i64) -> i64,
+    mode: Mode,
+) -> Run {
     let clock = Arc::new(AtomicI64::new(0));
     let changes = Arc::new(Mutex::new(Vec::new()));
     // Newest frame index already delivered.
@@ -187,7 +197,7 @@ fn run_delivered(
         }
     });
 
-    match engine.run(SCRIPT) {
+    match execute(&engine, mode) {
         Ok(()) => panic!("follow.rhai returned; it must loop"),
         // ErrorTerminated is on_progress stopping it at RUN_MS. Anything else is
         // a real runtime fault in the script, which is exactly what this catches
@@ -202,6 +212,29 @@ fn run_delivered(
     Run {
         end_ms: clock.load(Ordering::SeqCst),
         changes,
+    }
+}
+
+/// How the script reaches the engine.
+///
+/// The device runs [`Mode::Artifact`]; everything else here runs the tree,
+/// because that is what these assertions were written against.
+/// `the_artifact_drives_the_lamps_identically` is what ties the two together.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Mode {
+    Tree,
+    Artifact,
+}
+
+fn execute(engine: &rhai::Engine, mode: Mode) -> Result<(), Box<rhai::EvalAltResult>> {
+    match mode {
+        Mode::Tree => engine.run(SCRIPT),
+        Mode::Artifact => {
+            let ast = engine.compile(SCRIPT).expect("follow.rhai must compile");
+            let artifact = script_env::lower(&ast).expect("follow.rhai must lower");
+            assert_eq!(artifact.residual, 0, "follow.rhai must lower whole");
+            script_env::run_artifact(engine, &artifact.program)
+        }
     }
 }
 
@@ -922,4 +955,52 @@ fn replays_a_capture() {
             println!("  {lamp} never lit on this capture");
         }
     }
+}
+
+/// The artifact must drive the lamps exactly as the tree does.
+///
+/// This is the claim the whole bytecode change rests on: the device stops
+/// parsing and starts loading, and nothing about what the light *does* moves.
+/// Comparing the two lamp timelines instruction for instruction is a stronger
+/// statement than any of the density or dwell assertions above, because it
+/// admits no tolerance at all.
+#[test]
+fn the_artifact_drives_the_lamps_identically() {
+    // The bunched live-loop stream, which exercises the most of the script:
+    // seq gaps, the onset detector, the PLL, the look machinery and the
+    // stillness watchdog.
+    let tree = run_delivered_as(
+        BEAT_MS_LOOP,
+        synth_live_loop,
+        FRAME_MS_LOOP,
+        arrive_bunched,
+        Mode::Tree,
+    );
+    let artifact = run_delivered_as(
+        BEAT_MS_LOOP,
+        synth_live_loop,
+        FRAME_MS_LOOP,
+        arrive_bunched,
+        Mode::Artifact,
+    );
+
+    assert_eq!(
+        tree.changes.len(),
+        artifact.changes.len(),
+        "tree wrote {} lamp changes, artifact wrote {}",
+        tree.changes.len(),
+        artifact.changes.len()
+    );
+    for (i, (t, a)) in tree.changes.iter().zip(artifact.changes.iter()).enumerate() {
+        assert_eq!(
+            t, a,
+            "lamp change {i} differs: tree {t:?} against artifact {a:?}"
+        );
+    }
+    assert_eq!(tree.end_ms, artifact.end_ms, "the runs ended at different times");
+    println!(
+        "\n  {} lamp changes over {}ms, identical either way\n",
+        tree.changes.len(),
+        tree.end_ms
+    );
 }
