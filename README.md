@@ -89,6 +89,18 @@ no `as float` cast. These functions are available:
 nothing else, so a long analysis loop is fine. A busy loop with no `sleep` will still hold
 the light for the whole lock, so include one.
 
+### What actually reaches the light
+
+Your script is **compiled to bytecode on the server**. The parser, the optimiser and the syntax
+tree all stay here; the light receives a flat artifact, verifies it and runs it. That is the
+difference between roughly 1,069 heap allocations and 65 for `scripts/follow.rhai` — and the
+ESP32's allocator charges about 8 bytes of header on every one.
+
+`POST /v1/script` reports `artifact_bytes` alongside `bytes`, and that is the number the device's
+limit is about. It also reports `residual`: anything the compiler could not lower stays a tree
+fragment and runs on rhai's walker at the old cost. It is zero for everything in this repo; if
+yours is not, that part of your script is paying for an interpreter it did not need.
+
 ### Declaring components — how to get a bigger script
 
 The light is an ESP32 with about 140KB of usable heap, and three things compete for it: the

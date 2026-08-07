@@ -1,3 +1,5 @@
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use rhaiper::map::{MapOptions, SourceMap};
 use rhaiper::{minify_with_engine, Options};
 use serde_json::json;
@@ -48,12 +50,49 @@ pub fn prepare(script: &str) -> String {
                     ..Default::default()
                 },
             );
+            // Lower to the artifact the device runs. The parser, the optimiser
+            // and the tree all stay here; what ships is a flat buffer, which is
+            // the difference between ~1069 allocations on the light and ~65.
+            let (artifact, positions, residual) = match engine.compile(&out.text) {
+                Ok(ast) => match script_env::lower(&ast) {
+                    Ok(a) => (
+                        BASE64.encode(&a.program),
+                        BASE64.encode(&a.positions),
+                        a.residual,
+                    ),
+                    Err(e) => return reject(&format!("cannot lower the script: {e}")),
+                },
+                // Unreachable: minification already compiled it. Rejected rather
+                // than unwrapped so a future change cannot turn it into a panic
+                // inside the WASM boundary.
+                Err(e) => return reject(&format!("minified script will not compile: {e}")),
+            };
+
+            // The artifact is what the device loads, so it is the size that
+            // decides whether the light can run this at all. The source limit
+            // above only bounds the wire and the validator's work.
+            if artifact.len() > script_env::MAX_ARTIFACT_BYTES {
+                return reject(&format!(
+                    "compiles to {} bytes; the device's limit is {}",
+                    artifact.len(),
+                    script_env::MAX_ARTIFACT_BYTES
+                ));
+            }
+
             json!({
                 "ok": true,
                 "script": out.text,
                 "map": map,
+                // Base64 because the frame carrying this is JSON.
+                "artifact": artifact,
+                "positions": positions,
+                // Nodes the compiler could not lower, which run on rhai's walker
+                // and keep the tree's per-node cost. Reported rather than
+                // rejected: it is a cost, not an error.
+                "residual": residual,
                 "rawBytes": script.len(),
                 "bytes": out.text.len(),
+                "artifactBytes": artifact.len(),
                 "minified": true,
             })
             .to_string()

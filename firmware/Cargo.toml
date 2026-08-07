@@ -31,6 +31,8 @@ esp-idf-svc = { version = "0.52.1", features = ["critical-section"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Artifacts are bytes and the frames carrying them are JSON.
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 toml-cfg = "0.2"
 script-env = { path = "../crates/script-env" }
 wsframe = { path = "../crates/wsframe" }
@@ -58,6 +60,17 @@ rhai = { version = "1", features = ["no_optimize"] }
 # Drawn on demand from the system allocator rather than a static arena: a fixed
 # split would starve either the scripts or the TLS handshake, and which one is
 # not knowable ahead of time.
+
+# Repeated from the root manifest rather than inherited. This crate is
+# `exclude`d from that workspace so it can use the xtensa toolchain, which makes
+# it its own build root — and Cargo only honours `[patch]` from the root it is
+# building. Without this the firmware resolves stock rhai and rhaigrain fails on
+# the internals the patch exposes.
+#
+# `scripts/vendor-rhai.sh` must have been run. The path is one level up because
+# the vendored copy is shared with the workspace rather than duplicated.
+[patch.crates-io]
+rhai = { path = "../vendor/rhai" }
 
 [build-dependencies]
 embuild = "0.33"

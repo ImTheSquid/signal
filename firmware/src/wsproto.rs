@@ -2,6 +2,8 @@
 //!
 //! Reassembly of fragmented frames lives in the `wsframe` crate, which exists so
 //! it can carry tests — see the note there.
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 pub use wsframe::JsonFramer;
@@ -31,6 +33,9 @@ pub struct ServerMsgRaw {
     /// Rhai components the submitter declared. Absent means all of them, so a
     /// server that never sends this and this firmware still agree.
     pub components: Option<Vec<String>>,
+    /// The script already lowered to bytecode, base64'd because this frame is
+    /// JSON. Present means run this instead of parsing `script`.
+    pub artifact: Option<String>,
     pub rev: Option<u64>,
 }
 
@@ -47,6 +52,7 @@ pub enum ServerMsg {
         script: String,
         ttl_ms: u64,
         components: Option<Vec<String>>,
+        artifact: Option<Vec<u8>>,
     },
     Abort,
     Idle {
@@ -69,6 +75,7 @@ impl TryFrom<ServerMsgRaw> for ServerMsg {
                 script: raw.script.ok_or("job without script")?,
                 ttl_ms: raw.ttl_ms.ok_or("job without ttl_ms")?,
                 components: raw.components,
+                artifact: decode_artifact(raw.artifact)?,
             }),
             "abort" => Ok(ServerMsg::Abort),
             "idle" => Ok(ServerMsg::Idle {
@@ -77,6 +84,21 @@ impl TryFrom<ServerMsgRaw> for ServerMsg {
             other => Err(format!("unknown message type {other:?}")),
         }
     }
+}
+
+/// Turn the base64 an artifact arrives as into the bytes the VM loads.
+///
+/// A malformed field is refused here rather than passed on: the VM verifies the
+/// artifact itself, but a base64 error means the frame is wrong, which is a
+/// different failure from a bad program and reads better said so.
+pub fn decode_artifact(field: Option<String>) -> Result<Option<Vec<u8>>, String> {
+    field
+        .map(|text| {
+            BASE64
+                .decode(text.as_bytes())
+                .map_err(|e| format!("job artifact is not valid base64: {e}"))
+        })
+        .transpose()
 }
 
 #[derive(Debug, Deserialize)]
@@ -88,6 +110,8 @@ pub struct JobPayload {
     pub ttl_ms: u64,
     #[serde(default)]
     pub components: Option<Vec<String>>,
+    #[serde(default)]
+    pub artifact: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

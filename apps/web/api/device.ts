@@ -75,7 +75,8 @@ async function currentJobMsg(): Promise<ServerMsg | null> {
 		holder: job.holder ?? '',
 		script: job.script,
 		ttl_ms: ttl,
-		components: job.components
+		components: job.components,
+		artifact: job.artifact
 	};
 }
 
@@ -98,7 +99,11 @@ async function sendHello(): Promise<void> {
 						// Without this a device that reconnects mid-job is handed the
 						// script with no declaration, so it rebuilds the whole standard
 						// library and can no longer fit what it was already running.
-						components: job.components
+						components: job.components,
+						// Same omission that cost a reboot loop last time: a
+						// device resynced through `hello` mid-job gets the same
+						// frame contents as one that got the push.
+						artifact: job.artifact
 					}
 				: null,
 		idle

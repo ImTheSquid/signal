@@ -208,6 +208,7 @@ impl App {
         script: String,
         ttl_ms: u64,
         components: Option<Vec<String>>,
+        artifact: Option<Vec<u8>>,
     ) {
         if self.running_id.as_deref() == Some(id.as_str()) {
             return; // duplicate delivery (two server instances during recycle)
@@ -224,6 +225,7 @@ impl App {
             Some(holder),
             script,
             components,
+            artifact,
             Some(Duration::from_millis(ttl_ms)),
             self.lights.clone(),
             self.last_holder.clone(),
@@ -246,6 +248,9 @@ impl App {
                     None,
                     None,
                     script,
+                    None,
+                    // The idle script is admin-set text, not a submitted job, so
+                    // there is nothing to have lowered it.
                     None,
                     None,
                     self.lights.clone(),
@@ -420,7 +425,22 @@ impl App {
                 }
                 match job {
                     Some(job) => {
-                        self.start_job(job.id, job.holder, job.script, job.ttl_ms, job.components)
+                        // A base64 error here is a malformed frame, not a bad
+                        // program; fall back to the source rather than refusing
+                        // a job the device can still run.
+                        let artifact = crate::wsproto::decode_artifact(job.artifact)
+                            .unwrap_or_else(|e| {
+                                log::warn!("{e}; running the source instead");
+                                None
+                            });
+                        self.start_job(
+                            job.id,
+                            job.holder,
+                            job.script,
+                            job.ttl_ms,
+                            job.components,
+                            artifact,
+                        )
                     }
                     None => {
                         if self.running_id.is_some() {
@@ -436,7 +456,8 @@ impl App {
                 script,
                 ttl_ms,
                 components,
-            } => self.start_job(id, holder, script, ttl_ms, components),
+                artifact,
+            } => self.start_job(id, holder, script, ttl_ms, components, artifact),
             ServerMsg::Abort => {
                 if self.running_id.is_some() {
                     self.runner.request_abort();

@@ -98,6 +98,15 @@ export const JobSchema = z.object({
    *  could declare. Each one the device can leave out is heap the script's own
    *  AST gets instead — the full set costs roughly half the free heap. */
   components: z.array(z.string()).optional(),
+  /** The script lowered to bytecode, base64. What the device actually runs: it
+   *  loads a flat buffer instead of parsing a tree, which on follow.rhai is ~65
+   *  allocations rather than ~1069 — and the light's heap charges a header on
+   *  every one. Absent falls back to running `script`. */
+  artifact: z.string().optional(),
+  /** Maps an artifact program counter back to a position in the submitted
+   *  source. Server-side only, like `map` and for the same reason: the device
+   *  has no use for it, and the `job` frame is built field by field. */
+  positions: z.string().optional(),
   expiresAt: z.number(),
 });
 export type Job = z.infer<typeof JobSchema>;
@@ -208,6 +217,9 @@ export const JobMsgSchema = z.object({
   /** See `JobSchema.components`. Omitted means all of them, so a device on
    *  older firmware and a server that never sends this agree. */
   components: z.array(z.string()).optional(),
+  /** See `JobSchema.artifact`. Omitted means the device parses `script`, which
+   *  is what firmware without a VM does with it anyway. */
+  artifact: z.string().optional(),
 });
 
 export const ServerMsgSchema = z.discriminatedUnion("t", [

@@ -60,7 +60,9 @@ export const POST: RequestHandler = async ({ request }) => {
 		script: prepared.script,
 		map: prepared.map,
 		rawBytes: prepared.rawBytes,
-		components
+		components,
+		artifact: prepared.artifact,
+		positions: prepared.positions
 	});
 	if (result.status !== 'ok') {
 		const error =
@@ -86,6 +88,12 @@ export const POST: RequestHandler = async ({ request }) => {
 			ttl_ms: result.ttlMs,
 			bytes: prepared.bytes,
 			raw_bytes: prepared.rawBytes,
+			// What the device loads, which is the size its limit is about.
+			artifact_bytes: prepared.artifactBytes,
+			// Nodes that stayed a tree and will run on rhai's walker. Reported
+			// rather than rejected: it is a cost, and the submitter is the one
+			// who can do something about it.
+			residual: prepared.residual,
 			components,
 			warning: prepared.warning
 		},

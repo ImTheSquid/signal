@@ -91,6 +91,14 @@ fn engine_heap_bytes(components: Option<&Vec<String>>) -> usize {
 /// and rhai's parser allocates well past the size of the tree it finally keeps,
 /// so the peak during `compile` is what has to fit, not the result.
 const AST_BYTES_PER_SOURCE_BYTE: usize = 24;
+
+/// Heap per byte of artifact, the same measurement taken the other way.
+///
+/// follow.rhai's 8719 wire bytes load to ~30KB on the host, so about 3.5x, and
+/// the device's share is no worse — the pools are the same shape and its
+/// pointers are half the width. Rounded to 5: being wrong here costs a reboot,
+/// while being pessimistic costs a refusal that says what it wanted.
+const ARTIFACT_BYTES_PER_WIRE_BYTE: usize = 5;
 /// Room for the run itself — scope, values, and the DMX frames a script pulls in
 /// while it works. Without it a script fits at startup and dies once busy.
 const RUN_MARGIN_BYTES: usize = 8 * 1024;
@@ -123,20 +131,33 @@ fn log_heap(stage: &str) {
     }
 }
 
-fn heap_check(script_len: usize, components: Option<&Vec<String>>) -> Result<(), String> {
+fn heap_check(
+    weight: usize,
+    is_artifact: bool,
+    components: Option<&Vec<String>>,
+) -> Result<(), String> {
     let free = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() } as usize;
     let largest =
         unsafe { esp_idf_svc::sys::heap_caps_get_largest_free_block(esp_idf_svc::sys::MALLOC_CAP_8BIT) };
     let engine = engine_heap_bytes(components);
-    let ast = script_len * AST_BYTES_PER_SOURCE_BYTE;
-    let needed = SCRIPT_STACK_BYTES + engine + ast + RUN_MARGIN_BYTES;
+    // An artifact is loaded roughly as it lies, plus its pools; a source has to
+    // be parsed into a tree that costs many times its own length. Measured on
+    // follow.rhai: 8719 artifact bytes become ~30KB loaded, where 5054 source
+    // bytes become ~78KB of tree with 1069 allocations under it.
+    let body = if is_artifact {
+        weight * ARTIFACT_BYTES_PER_WIRE_BYTE
+    } else {
+        weight * AST_BYTES_PER_SOURCE_BYTE
+    };
+    let needed = SCRIPT_STACK_BYTES + engine + body + RUN_MARGIN_BYTES;
 
     // Logged every time, not only on refusal: when this is wrong the board
     // reboots, and the only way to tell an estimate that was too generous from
     // one that was too mean is to see the numbers it decided on.
+    let kind = if is_artifact { "artifact" } else { "ast" };
     log::info!(
         "heap check: free={free} largest={largest} need={needed} \
-         (stack {SCRIPT_STACK_BYTES} + engine {engine} + ast {ast} + margin {RUN_MARGIN_BYTES})"
+         (stack {SCRIPT_STACK_BYTES} + engine {engine} + {kind} {body} + margin {RUN_MARGIN_BYTES})"
     );
 
     // The stack is one contiguous allocation, so free heap alone does not say it
@@ -150,7 +171,7 @@ fn heap_check(script_len: usize, components: Option<&Vec<String>>) -> Result<(),
     }
     if free < needed {
         return Err(format!(
-            "script too large for this device: {script_len} bytes needs about \
+            "{kind} too large for this device: {weight} bytes needs about \
              {needed} bytes of heap, {free} free"
         ));
     }
@@ -216,6 +237,8 @@ impl Runner {
         holder: Option<String>,
         script: String,
         components: Option<Vec<String>>,
+        // The compiled form, when the server sent one. Preferred over `script`.
+        artifact: Option<Vec<u8>>,
         ttl: Option<Duration>,
         lights: Arc<Lights>,
         last_holder: SharedLastHolder,
@@ -231,7 +254,10 @@ impl Runner {
 
         // Decline before allocating anything, so a script that cannot fit fails
         // as a run rather than as a reboot.
-        let spawned = match heap_check(script.len(), components.as_ref()) {
+        // An artifact costs a fraction of what its source would as a tree, so
+        // the check is sized against whichever one will actually be loaded.
+        let weight = artifact.as_ref().map_or(script.len(), Vec::len);
+        let spawned = match heap_check(weight, artifact.is_some(), components.as_ref()) {
             Err(e) => Err(std::io::Error::other(e)),
             Ok(()) => std::thread::Builder::new()
                 .name("rhai".into())
@@ -240,6 +266,7 @@ impl Runner {
                     let deadline = ttl.map(|t| Instant::now() + t);
                     let outcome = run_script(
                         script,
+                        artifact,
                         components,
                         kind,
                         deadline,
@@ -287,6 +314,7 @@ impl Runner {
 #[allow(clippy::too_many_arguments)]
 fn run_script(
     script: String,
+    artifact: Option<Vec<u8>>,
     components: Option<Vec<String>>,
     kind: RunKind,
     deadline: Option<Instant>,
@@ -435,17 +463,33 @@ fn run_script(
 
     log_heap("engine built");
 
-    // Compile first and drop the source before evaluating: `Engine::run` holds
-    // both the text and the AST live for the whole run, and on this heap the
-    // script's own bytes are worth handing back.
-    let ast = match engine.compile(&script) {
-        Ok(ast) => ast,
-        Err(e) => return Outcome::Error(e.to_string()),
+    // An artifact is loaded, not parsed: the server did the parsing and the
+    // optimising, and what arrives is a flat buffer this verifies and executes.
+    // Measured on scripts/follow.rhai, that is ~65 allocations against ~1069 for
+    // the tree, and ESP-IDF charges a header on every one.
+    //
+    // The source path stays until the artifact path has run on the hardware.
+    // Once it has, the server can stop sending source and this whole branch —
+    // and with it the parser's presence on the device — goes.
+    let outcome = if let Some(artifact) = artifact {
+        drop(script);
+        let result = script_env::run_artifact(&engine, &artifact);
+        log_heap("artifact running");
+        result
+    } else {
+        // Compile first and drop the source before evaluating: `Engine::run`
+        // holds both the text and the AST live for the whole run, and on this
+        // heap the script's own bytes are worth handing back.
+        let ast = match engine.compile(&script) {
+            Ok(ast) => ast,
+            Err(e) => return Outcome::Error(e.to_string()),
+        };
+        drop(script);
+        log_heap("ast compiled");
+        engine.run_ast(&ast)
     };
-    drop(script);
-    log_heap("ast compiled");
 
-    match engine.run_ast(&ast) {
+    match outcome {
         Ok(()) => Outcome::Ok,
         Err(e) => match *e {
             EvalAltResult::ErrorTerminated(token, _) => {

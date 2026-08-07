@@ -17,15 +17,25 @@ use rhai::Engine;
 /// device will take it — `heap_check` in the firmware gives the real answer, in
 /// a message that says how much was needed and how much was free.
 ///
-/// Sized from what the device actually managed, not from the host measurement,
-/// which was optimistic by more than 2x: 5054 bytes of script exhausted a heap
-/// reporting 154900 free, even with a narrowly declared engine. The AST does not
-/// halve on a 32-bit target, and rhai's parser peaks well above the tree it
-/// keeps. That works out near 24 device bytes per source byte, so the narrowest
-/// engine leaves room for roughly 4.5KB.
+/// This bounds the wire and the work one request can ask of the validator. It
+/// is **not** the device's constraint any more: the light loads an artifact
+/// rather than parsing this, so [`MAX_ARTIFACT_BYTES`] is what its memory is
+/// about, and `heap_check` in the firmware makes the real decision against the
+/// heap it actually has and says what it wanted.
 ///
-/// It has been 16KB and then 12KB; neither was runnable.
-pub const MAX_SCRIPT_BYTES: usize = 4 * 1024;
+/// It was briefly 4KB, sized from what a *tree* cost — 24 device bytes per
+/// source byte, which is what made a 5KB script impossible.
+pub const MAX_SCRIPT_BYTES: usize = 16 * 1024;
+
+/// Maximum size of the compiled artifact the device loads.
+///
+/// The real ceiling, and much further out than the source one it replaces:
+/// `scripts/follow.rhai` is 5054 minified bytes and 8719 of artifact, so about
+/// 1.7 bytes of artifact per source byte, loading to roughly 5x that in heap.
+/// Against ~155KB free, less a 32KB stack and a declared engine, that leaves
+/// room for something like 17KB of artifact — so this is a bound rather than a
+/// squeeze, and the device refuses anything it cannot actually fit.
+pub const MAX_ARTIFACT_BYTES: usize = 16 * 1024;
 
 /// Maximum size in bytes of a script as submitted, before minification. Comments
 /// and indentation are stripped before `MAX_SCRIPT_BYTES` applies, so this is what

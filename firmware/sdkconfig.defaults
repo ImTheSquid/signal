@@ -1,6 +1,8 @@
-# Rust often needs a bit of an extra main task stack size compared to C (the default is 3K)
-# You might have to increase this further if you allocate large stack variables in the main task
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
+# Rust needs more main-task stack than C's 3K default. 16K came from the project
+# template; the main task brings up wifi, SNTP and the websocket and then runs the
+# event loop, none of which is deep. Scripts run on their own thread with their
+# own stack, so this is not what has to grow for them.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=10240
 
 # NB: no partition table is set here, and none of the stock ones would fit.
 # Rhai plus the wifi/TLS stack builds to ~2.3MB, while single-app is 1M and
@@ -25,9 +27,19 @@ CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=6
 CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
 CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
 
-# Increase a bit these stack sizes as they are also a bit too small by default
-CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
-CONFIG_FREERTOS_IDLE_TASK_STACKSIZE=4096
+# Task stacks come out of the same heap the interpreter needs, and there are
+# several of them. Raised above their defaults by the project template rather
+# than by measurement; trimmed back towards it.
+CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=3072
+# Two of these, one per core.
+CONFIG_FREERTOS_IDLE_TASK_STACKSIZE=2048
+
+# Nothing here speaks IPv6, and the stack costs several KB of buffers and PCBs.
+CONFIG_LWIP_IPV6=n
+
+# Block-ack reordering buffers exist for sustained throughput. This device sends
+# a state frame every 20s and receives a script now and then.
+CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=n
 
 # You might have to increase this further if you spawn your own Rust threads 
 # that allocate large stack variables; or better yet - use 

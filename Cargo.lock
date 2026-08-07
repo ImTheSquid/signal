@@ -23,6 +23,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
+name = "base64"
+version = "0.22.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
 name = "bitflags"
 version = "2.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -210,8 +216,6 @@ checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
 [[package]]
 name = "rhai"
 version = "1.25.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd4dd0f8c36625202a4ba553c416c19b719947cd2a31d1bda06126e4a5727daf"
 dependencies = [
  "ahash",
  "bitflags",
@@ -235,6 +239,18 @@ dependencies = [
  "quote",
  "syn",
 ]
+
+[[package]]
+name = "rhaigrain"
+version = "0.1.0"
+dependencies = [
+ "rhai",
+ "rhaigrain-pos",
+]
+
+[[package]]
+name = "rhaigrain-pos"
+version = "0.1.0"
 
 [[package]]
 name = "rhaiper"
@@ -264,6 +280,7 @@ name = "script-env"
 version = "0.1.0"
 dependencies = [
  "rhai",
+ "rhaigrain",
  "rhaiper",
 ]
 
@@ -381,6 +398,7 @@ checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 name = "validator"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "getrandom 0.3.4",
  "rhaiper",
  "script-env",

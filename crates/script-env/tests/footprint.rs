@@ -460,26 +460,30 @@ fn interpreter_footprint() {
     }
     println!("\n  follow.rhai needs {} bytes\n", minified.len());
 
-    // The advertised limit has to be reachable by some declaration, or the API
-    // accepts sizes nothing can run. The floor engine is the best case, so that
-    // is what it is measured against; a script declaring nothing gets far less,
-    // which is the device's business to report and the README's to explain.
-    let best = {
-        let bytes = cost(|| {
-            let mut e = script_env::rhai::Engine::new_raw();
-            script_env::rhai::packages::ArithmeticPackage::new().register_into_engine(&mut e);
-            script_env::apply_limits(&mut e);
-            script_env::register_api(&mut e, script_env::Handlers::stubs());
-            e
-        }) / HOST_TO_DEVICE;
-        ((DEVICE_FREE_HEAP - bytes - SCRIPT_STACK) as f64 / (per_byte / HOST_TO_DEVICE as f64))
-            as isize
-    };
+    // The device loads artifacts, so the limit that has to be honourable is the
+    // artifact one. Against the narrowest engine, which is the best case; a
+    // script declaring nothing gets less, and the firmware's `heap_check`
+    // refuses it against the heap it actually has rather than a constant.
+    let floor_engine = cost(|| {
+        let mut e = script_env::rhai::Engine::new_raw();
+        script_env::rhai::packages::ArithmeticPackage::new().register_into_engine(&mut e);
+        script_env::apply_limits(&mut e);
+        script_env::register_api(&mut e, script_env::Handlers::stubs());
+        e
+    }) / HOST_TO_DEVICE;
+    // Matches ARTIFACT_BYTES_PER_WIRE_BYTE in firmware/src/script.rs.
+    const ARTIFACT_HEAP_PER_WIRE_BYTE: isize = 5;
+    let room = DEVICE_FREE_HEAP - floor_engine - SCRIPT_STACK;
+    let serviceable_artifact = room / ARTIFACT_HEAP_PER_WIRE_BYTE;
+    println!(
+        "  artifact ceiling: {room} bytes of heap / {ARTIFACT_HEAP_PER_WIRE_BYTE} \
+         = {serviceable_artifact} wire bytes, against a {} limit\n",
+        script_env::MAX_ARTIFACT_BYTES
+    );
     assert!(
-        best >= script_env::MAX_SCRIPT_BYTES as isize,
-        "MAX_SCRIPT_BYTES is {} but even the narrowest engine only runs about \
-         {best} bytes of script ({per_byte:.1} AST bytes per source byte against \
-         {DEVICE_FREE_HEAP} free, less a {SCRIPT_STACK} stack)",
-        script_env::MAX_SCRIPT_BYTES
+        serviceable_artifact >= script_env::MAX_ARTIFACT_BYTES as isize,
+        "MAX_ARTIFACT_BYTES is {} but the narrowest engine only leaves room for \
+         about {serviceable_artifact} bytes of artifact",
+        script_env::MAX_ARTIFACT_BYTES
     );
 }

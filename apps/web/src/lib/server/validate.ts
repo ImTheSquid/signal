@@ -13,8 +13,18 @@ export interface PreparedScript {
 	script: string;
 	/** Source Map v3 for `script`. Empty when minification was declined. */
 	map: string;
+	/** The script lowered to bytecode, base64. What the device runs. */
+	artifact: string;
+	/** Program-counter-to-source table for `artifact`. Stays server-side. */
+	positions: string;
+	/** Nodes the compiler could not lower, which fall back to rhai's walker and
+	 *  keep the tree's per-node cost. Zero for everything in this repo. */
+	residual: number;
 	rawBytes: number;
 	bytes: number;
+	/** Size of the base64 artifact, which is the figure the device's limit is
+	 *  actually about — `bytes` measures the source it came from. */
+	artifactBytes: number;
 	/** False when the original was passed through because minifying it failed. */
 	minified: boolean;
 	/** Why minification was declined, when it was. */
