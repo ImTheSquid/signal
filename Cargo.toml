@@ -18,8 +18,7 @@ exclude = ["firmware", "dmx-bridge"]
 # script API needs them — the DMX loop is straight-line integer and float math.
 # `sync` makes rhai's Shared an Arc rather than an Rc, which is what lets the
 # standard-library modules be built once at boot and handed to every per-run
-# engine by pointer. Without it each run rebuilds ~69KB and hands it back, and
-# that churn is why the board idles with 140KB free but a largest block of 108KB.
+# engine by pointer, instead of rebuilding ~69KB on every run.
 rhai = { version = "1", features = [
     "sync",
     "only_i64",
@@ -28,3 +27,15 @@ rhai = { version = "1", features = [
     "no_time",
     "f32_float",
 ] }
+
+# When rhaigrain lands, this comes back:
+#
+#   [patch.crates-io]
+#   rhai = { path = "vendor/rhai" }
+#
+# rhaigrain needs more of rhai public than the `internals` feature exposes and
+# carries the delta as a patch. Cargo only honours `[patch]` from the top-level
+# workspace, so rhaigrain's own copy does nothing when it is a dependency and
+# this repo has to apply the same patch itself — see scripts/vendor-rhai.sh.
+# Left commented because it makes every cargo command depend on having run that
+# script first, which is not a cost worth paying until the dependency is real.
