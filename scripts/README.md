@@ -11,7 +11,12 @@ Runs a script on the light for as long as you leave it running. Use this rather 
 scripts/run-follow.sh                      # runs follow.rhai until Ctrl-C
 scripts/run-follow.sh scripts/other.rhai
 LOCK_S=120 scripts/run-follow.sh           # shorter cycle
+COMPONENTS=array scripts/run-follow.sh scripts/pulse.rhai
 ```
+
+`COMPONENTS` is the rhai standard-library surface the script is given, default `array,math`.
+Declaring less leaves more heap for the script itself; under-declaring is not caught
+server-side and fails at the call, on the light.
 
 **Why a loop is necessary.** A job's TTL is fixed when it is submitted, from the lock's
 *remaining* time — re-acquiring the lock does **not** extend a script already running
@@ -249,6 +254,77 @@ All of them are `let` bindings at the top of the file, in this order:
 
 Re-run `cargo test -p script-env --test follow` after any change — the thresholds there are set
 from measurements, so a regression in density or dwell shows up immediately.
+
+## `pulse.rhai`
+
+What the light runs when the signal comes from audio rather than DMX, driven by
+**crates/audio-bridge** reading a BlackHole clone of the deck's master output.
+
+DMX carries no beat information, so `follow.rhai` has to reconstruct tempo from three colour
+channels at ~5.7 usable frames/sec, and manages 0.364 on-grid concentration. With audio the
+estimator moves to the Mac, where there is floating point and heap to spare, and this script
+keeps only the part the light owns.
+
+| | `follow.rhai` | `pulse.rhai` |
+|---|---|---|
+| on-grid @128 BPM | 0.364 | **0.871** |
+| on-grid @100 BPM | — | **0.980** |
+| relay ops/min R/Y/G | 216/90/240 | 223/169/272 |
+| components | `array,math` | `array` |
+
+**It is sent a prediction, not an event.** The block says "the next beat is in N ms, the period
+is P", so the script runs the grid forward itself. That is what lets it schedule around the
+100ms relay dwell instead of chasing a signal it is always a fraction of a beat behind, and it
+makes loss cheap: 75% packet loss costs 0.871 → 0.833 rather than the lock.
+
+### The beat block
+
+Same magic, version and header as the DMX bridge — it is the same socket and the same parser in
+`firmware/src/dmx.rs`. Two things differ.
+
+`base` is `0xFFFE`. DMX bases are 1..512, so it cannot collide, and `follow.rhai` never reads
+`base` — either script can tell the senders apart without being modified.
+
+The payload sits in the **channel bytes**, read as `p.ch[0..16]`, not in an extended header.
+The header is extensible and the firmware would skip what it does not recognise, but everything
+before `header_len` is discarded before Rhai sees it: `dmx_recv` exposes only
+`{ok, base, seq, ch}`. Beat fields in the header would mean reflashing, and the light needs
+physical access.
+
+| off | len | field | notes |
+|---|---|---|---|
+| 0 | 1 | `fmt` | `1` |
+| 1 | 1 | `flags` | b0 audio, b1 tracking, b2 coasting, b3 bass muted, b4 bar valid, b5 clipping |
+| 2 | 2 | `ms_to_next_beat` | BE, `0xFFFF` unknown |
+| 4 | 2 | `period_ms` | BE, `0` unknown |
+| 6 | 1 | `beat_index` | mod 16 |
+| 7 | 1 | `confidence` | |
+| 8–11 | 4 | `energy`, `low`, `mid`, `high` | AGC-normalised |
+| 12 | 1 | `flux` | |
+| 13 | 1 | `onset_age` | ms/4, `255` none |
+| 14 | 1 | `onset_strength` | |
+| 15 | 1 | `build` | `128` flat |
+
+Milliseconds rather than a phase fraction, so `millis() + ms_to_next_beat` works without knowing
+the period, and stays meaningful before one exists.
+
+**`bar_valid` is never set.** `beat_index` counts from an arbitrary origin; there is no downbeat
+estimator, so nothing may read `beat_index % 4 == 0` as a bar position until that bit appears.
+
+The layout is written in `crates/audio-bridge/src/wire.rs` and read in `pulse.rhai`, with a third
+copy in the test fixture. It is duplicated because the daemon has its own build root — aubio's
+bindgen needs the macOS libclang, which the firmware's espup toolchain overrides globally.
+
+### Two corrections worth keeping
+
+- An accent that ended after the relay dwell put an off-grid transition on *every* beat, because
+  100ms is not a slot boundary on a 117ms grid. Ending it on the next quarter took concentration
+  from 0.812 to 0.871.
+- The pattern cycle is forced to at least `4 × dwell`. At 175 BPM a quarter beat is 86ms and
+  simply cannot be rendered, so the cycle doubles rather than asking for transitions the relays
+  will refuse.
+
+Re-run `cargo test -p script-env --test pulse` after any change.
 
 ## `dmxcap.mjs` and `watch.mjs`
 
