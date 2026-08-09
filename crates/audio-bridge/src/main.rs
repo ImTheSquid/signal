@@ -9,6 +9,7 @@
 
 mod bands;
 mod capture;
+mod tempo;
 
 use anyhow::Result;
 

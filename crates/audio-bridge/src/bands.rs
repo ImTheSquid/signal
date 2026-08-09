@@ -189,14 +189,14 @@ impl Agc {
 
 /// Exponential moving average over a time constant, sampled per hop.
 #[derive(Clone, Copy)]
-struct Ema {
+pub struct Ema {
     coeff: f32,
     value: f32,
     primed: bool,
 }
 
 impl Ema {
-    fn new(hop_s: f32, tau_s: f32) -> Self {
+    pub fn new(hop_s: f32, tau_s: f32) -> Self {
         Ema {
             coeff: (-hop_s / tau_s).exp(),
             value: 0.0,
@@ -204,7 +204,7 @@ impl Ema {
         }
     }
 
-    fn update(&mut self, x: f32) -> f32 {
+    pub fn update(&mut self, x: f32) -> f32 {
         if self.primed {
             self.value = x + self.coeff * (self.value - x);
         } else {
