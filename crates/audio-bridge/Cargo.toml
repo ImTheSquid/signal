@@ -12,6 +12,14 @@ bliss-audio-aubio-rs = { version = "0.2.4", default-features = false, features =
     "builtin",
     # No prebuilt bindings ship for arm64-apple-darwin; the build script says so
     # and stops. bindgen generates them against the vendored headers instead,
-    # using the libclang from Xcode command line tools.
+    # using the libclang pinned in .cargo/config.toml.
     "bindgen",
 ] }
+cpal = "0.15"
+anyhow = "1"
+# Lock-free SPSC ring: the CoreAudio callback must never allocate or block, and
+# this is the handoff to the analysis thread.
+rtrb = "0.3"
+# WAV reading for the offline path, which is how the tracker gets tuned and
+# tested without a live device.
+hound = "3.5"
