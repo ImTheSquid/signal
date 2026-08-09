@@ -65,6 +65,8 @@ pub struct Grid {
     pub coasting: bool,
     /// Milliseconds since the last detected beat, for accent rendering.
     pub ms_since_beat: Option<f32>,
+    /// How strong the last detected beat was, 0..=1.
+    pub onset_strength: f32,
 }
 
 /// The seam that keeps aubio a bet rather than a commitment. Everything
@@ -86,6 +88,7 @@ pub struct AubioTracker {
     anchor_ms: f64,
     beat_index: u8,
     last_beat_ms: Option<f64>,
+    last_beat_strength: f32,
 
     confidence: f32,
     confidence_decay: f32,
@@ -106,6 +109,7 @@ impl AubioTracker {
             anchor_ms: 0.0,
             beat_index: 0,
             last_beat_ms: None,
+            last_beat_strength: 0.0,
             confidence: 0.0,
             confidence_decay: (-hop_s / CONFIDENCE_TAU_S).exp(),
             energy_fast: Ema::new(hop_s, ENERGY_FAST_S),
@@ -173,6 +177,7 @@ impl Tracker for AubioTracker {
             let at = self.tempo.get_last_ms() as f64;
             self.anchor_ms = at;
             self.last_beat_ms = Some(at);
+            self.last_beat_strength = beat.clamp(0.0, 1.0);
             self.beat_index = self.beat_index.wrapping_add(1);
         }
         Ok(())
@@ -197,6 +202,7 @@ impl Tracker for AubioTracker {
             tracking: self.confidence >= CONF_TRACKING && self.period_ms.is_some(),
             coasting: coasting && self.period_ms.is_some(),
             ms_since_beat: self.last_beat_ms.map(|at| (now - at) as f32),
+            onset_strength: self.last_beat_strength,
         }
     }
 }

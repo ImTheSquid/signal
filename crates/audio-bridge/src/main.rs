@@ -10,6 +10,7 @@
 mod bands;
 mod capture;
 mod tempo;
+mod wire;
 
 use anyhow::Result;
 

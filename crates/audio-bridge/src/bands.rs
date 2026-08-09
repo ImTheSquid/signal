@@ -44,6 +44,11 @@ const BASS_MUTED_HOLD_S: f32 = 0.3;
 const BUILD_FAST_S: f32 = 1.0;
 const BUILD_SLOW_S: f32 = 4.0;
 
+/// Short horizons for "something just happened", which is what a script needs
+/// to accent between beats — and the only such cue it has while coasting.
+const FLUX_FAST_S: f32 = 0.03;
+const FLUX_SLOW_S: f32 = 0.20;
+
 /// Section Qs for a 6th-order Butterworth, `1 / (2 cos((2k+1)pi/12))`.
 ///
 /// Three sections rather than one because 60Hz sits only 1.4 octaves below the
@@ -268,6 +273,9 @@ pub struct Levels {
     pub bass_muted: bool,
     /// Energy slope: negative falling, 0 flat, positive rising. Roughly -1..=1.
     pub build: f32,
+    /// Rectified short-horizon energy rise, 0..=1. Independent of the beat
+    /// grid, so it still says something when the tracker is coasting.
+    pub flux: f32,
 }
 
 pub struct Bands {
@@ -281,6 +289,8 @@ pub struct Bands {
     bass_muted_hold: u32,
     build_fast: Ema,
     build_slow: Ema,
+    flux_fast: Ema,
+    flux_slow: Ema,
 }
 
 impl Bands {
@@ -298,6 +308,8 @@ impl Bands {
             bass_muted_hold: (BASS_MUTED_HOLD_S / hop_s).ceil() as u32,
             build_fast: Ema::new(hop_s, BUILD_FAST_S),
             build_slow: Ema::new(hop_s, BUILD_SLOW_S),
+            flux_fast: Ema::new(hop_s, FLUX_FAST_S),
+            flux_slow: Ema::new(hop_s, FLUX_SLOW_S),
         }
     }
 
@@ -331,6 +343,14 @@ impl Bands {
             0
         };
 
+        let flux_fast = self.flux_fast.update(raw_energy);
+        let flux_slow = self.flux_slow.update(raw_energy);
+        let flux = if flux_slow > SILENCE_FLOOR {
+            ((flux_fast - flux_slow) / flux_slow).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+
         let fast = self.build_fast.update(raw_energy);
         let slow = self.build_slow.update(raw_energy);
         // Normalised against the slower horizon so the slope means the same
@@ -352,6 +372,7 @@ impl Bands {
             raw_energy,
             bass_muted: self.bass_muted_hops >= self.bass_muted_hold,
             build,
+            flux,
         }
     }
 }
