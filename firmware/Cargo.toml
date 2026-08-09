@@ -61,16 +61,14 @@ rhai = { version = "1", features = ["no_optimize"] }
 # split would starve either the scripts or the TLS handshake, and which one is
 # not knowable ahead of time.
 
-# Repeated from the root manifest rather than inherited. This crate is
+# Repeated from the root manifest rather than inherited: this crate is
 # `exclude`d from that workspace so it can use the xtensa toolchain, which makes
-# it its own build root — and Cargo only honours `[patch]` from the root it is
-# building. Without this the firmware resolves stock rhai and rhaigrain fails on
-# the internals the patch exposes.
-#
-# `scripts/vendor-rhai.sh` must have been run. The path is one level up because
-# the vendored copy is shared with the workspace rather than duplicated.
+# it its own build root, and Cargo only honours `[patch]` from the root it is
+# building. Without it the graph would hold two copies of rhai, and its feature
+# flags change what a `Dynamic` is — so two copies means two incompatible
+# `Dynamic` types either side of the artifact.
 [patch.crates-io]
-rhai = { path = "../vendor/rhai" }
+rhai = { git = "https://github.com/rhaiscript/rhai", rev = "72ad275f0db410120945d31fa686647135f1f99f" }
 
 [build-dependencies]
 embuild = "0.33"

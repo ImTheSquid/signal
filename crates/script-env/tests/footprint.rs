@@ -264,7 +264,7 @@ fn artifact_is_cheaper_than_the_tree() {
 
     let (tree_bytes, tree_allocs) = cost_counted(|| engine.compile(&minified).unwrap());
 
-    let program = rhaigrain::Compiler::new().compile(&ast);
+    let program = rhai::grain::Compiler::new().compile(&ast);
     let residual = program.residual_count();
     let residual_nodes = program.residual_nodes();
     let unsupported = program.first_unsupported();
@@ -275,9 +275,9 @@ fn artifact_is_cheaper_than_the_tree() {
     // them. Measured both ways because the difference decides which one the
     // firmware holds.
     let (loaded_bytes, loaded_allocs) =
-        cost_counted(|| rhaigrain::Program::read(&wire).expect("what we just wrote must load"));
+        cost_counted(|| rhai::grain::Program::read(&wire).expect("what we just wrote must load"));
     let (owned_bytes, owned_allocs) = cost_counted(|| {
-        rhaigrain::Program::read(&wire)
+        rhai::grain::Program::read(&wire)
             .expect("what we just wrote must load")
             .into_owned()
     });

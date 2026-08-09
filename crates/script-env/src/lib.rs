@@ -515,7 +515,7 @@ pub struct Artifact {
 /// is a flat buffer it verifies and executes, which is the difference between
 /// ~1069 allocations and ~65 for `scripts/follow.rhai`.
 pub fn lower(ast: &rhai::AST) -> Result<Artifact, String> {
-    let mut program = rhaigrain::Compiler::new().compile(ast);
+    let mut program = rhai::grain::Compiler::new().compile(ast);
     let residual = program.residual_count();
     let positions = program.strip_positions();
     let program = program
@@ -538,17 +538,16 @@ pub fn lower(ast: &rhai::AST) -> Result<Artifact, String> {
 /// so that check is possible rather than assumed.
 pub fn run_artifact(engine: &Engine, bytes: &[u8]) -> Result<(), Box<rhai::EvalAltResult>> {
     let program =
-        rhaigrain::Program::read(bytes).map_err(|e| -> Box<rhai::EvalAltResult> {
+        rhai::grain::Program::read(bytes).map_err(|e| -> Box<rhai::EvalAltResult> {
             format!("artifact will not load: {e}").into()
         })?;
     program
         .verify()
         .map_err(|e| -> Box<rhai::EvalAltResult> { format!("artifact failed verification: {e:?}").into() })?;
 
-    let mut scope = rhai::Scope::new();
-    rhaigrain::Vm::new(engine)
-        .run(&program, &mut scope)
-        .map(|_| ())
+    // Nothing here needs to read variables back out of the run, so `run` rather
+    // than `run_with_scope` — it owns the scope and returns nothing.
+    rhai::grain::Vm::new(engine).run(&program)
 }
 
 /// A fully configured engine with stub handlers, for validation.

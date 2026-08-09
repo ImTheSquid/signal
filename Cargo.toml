@@ -19,10 +19,11 @@ exclude = ["firmware", "dmx-bridge"]
 # `sync` makes rhai's Shared an Arc rather than an Rc, which is what lets the
 # standard-library modules be built once at boot and handed to every per-run
 # engine by pointer, instead of rebuilding ~69KB on every run.
-rhai = { version = "1", features = [
-    # rhaigrain is built on rhai's AST and evaluation plumbing, which is only
-    # public under this. rhai documents it as volatile.
-    "internals",
+# Pinned to a git revision because the bytecode VM is on rhai's main branch and
+# not in a release yet. `grain` is what enables it; the crate calls it
+# experimental.
+rhai = { git = "https://github.com/rhaiscript/rhai", rev = "72ad275f0db410120945d31fa686647135f1f99f", features = [
+    "grain",
     "sync",
     "only_i64",
     "no_closure",
@@ -31,12 +32,9 @@ rhai = { version = "1", features = [
     "f32_float",
 ] }
 
-# rhaigrain needs more of rhai public than the `internals` feature exposes and
-# carries the delta as a patch. Cargo only honours `[patch]` from the top-level
-# workspace, so rhaigrain's own copy does nothing when it is a dependency and
-# this repo has to apply the same patch itself.
-#
-# `scripts/vendor-rhai.sh` must have been run before any cargo command works.
-# The directory it produces is generated and gitignored.
+# rhaiper resolves rhai from crates.io, which would put two copies of the crate
+# in the graph — and rhai's feature flags change what a `Dynamic` *is*, so two
+# copies means two incompatible `Dynamic` types flowing through the same
+# minifier. Point it at the same revision as everything else.
 [patch.crates-io]
-rhai = { path = "vendor/rhai" }
+rhai = { git = "https://github.com/rhaiscript/rhai", rev = "72ad275f0db410120945d31fa686647135f1f99f" }

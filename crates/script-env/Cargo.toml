@@ -4,24 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+# Carries the bytecode VM as `rhai::grain`, so the server lowers a script to a
+# flat artifact and the device runs that instead of parsing a tree. Measured on
+# scripts/follow.rhai: 1069 allocations as an AST against 65 as an artifact,
+# which is what the light could not afford — ESP-IDF charges ~8 bytes of header
+# on every one.
 rhai = { workspace = true }
-# The server lowers a script to a flat artifact and the device runs that instead
-# of parsing a tree. Measured on scripts/follow.rhai: 1069 allocations as an AST
-# against 65 as an artifact, which is what the light could not afford — ESP-IDF
-# charges ~8 bytes of header on every one.
-#
-# The restriction flags are set here rather than on rhai. They change what a
-# `Dynamic` is, so an artifact only means the same thing on both sides if the
-# two agree; rhaigrain mirrors rhai's flags for that reason and catches a
-# mismatch at compile time. Keep them in step with the workspace's rhai.
-rhaigrain = { path = "../../../rhaigrain", default-features = false, features = [
-    "sync",
-    "only_i64",
-    "f32_float",
-    "no_closure",
-    "no_module",
-    "no_time",
-] }
 
 [dev-dependencies]
 # The device is sent the minified form, so pricing the AST per source byte has
