@@ -1,0 +1,17 @@
+[package]
+name = "audio-bridge"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Fork of aubio-rs maintained by the bliss-rs project. The upstream `aubio-rs`
+# is frozen at 2021; this one ships on macOS arm64, which is the only platform
+# this daemon runs on. `builtin` compiles aubio from vendored sources so there
+# is no system libaubio to install.
+bliss-audio-aubio-rs = { version = "0.2.4", default-features = false, features = [
+    "builtin",
+    # No prebuilt bindings ship for arm64-apple-darwin; the build script says so
+    # and stops. bindgen generates them against the vendored headers instead,
+    # using the libclang from Xcode command line tools.
+    "bindgen",
+] }
