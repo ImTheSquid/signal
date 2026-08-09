@@ -114,6 +114,13 @@ export type Job = z.infer<typeof JobSchema>;
 export const IdleSchema = z.object({
   script: z.string(),
   rev: z.number(),
+  /** See `JobSchema.components`. Absent means all of them, which is what a
+   *  record written before idle could declare still says — and what the device
+   *  reserves for it. Declaring what the script actually uses is the difference
+   *  between an engine the light can afford and one it can refuse to start. */
+  components: z.array(z.string()).optional(),
+  /** See `JobSchema.artifact`. Absent falls back to parsing `script`. */
+  artifact: z.string().optional(),
 });
 export type Idle = z.infer<typeof IdleSchema>;
 
@@ -137,6 +144,13 @@ export const DeviceStateSchema = z.object({
    *  accounting. Optional for the same reason. */
   ops: z.array(z.number()).length(3).optional(),
   fw: z.string(),
+  /** What is filling idle time: "script" or "builtin". An idle run has no job
+   *  id and so produces no history row — without this, an admin script that is
+   *  not running looks exactly like one that is. Optional for the same reason as
+   *  the two above. */
+  idle: z.enum(["script", "builtin"]).optional(),
+  /** Why the idle script is not running, when it is not. */
+  idle_error: z.string().optional(),
   ts: z.number(),
 });
 export type DeviceState = z.infer<typeof DeviceStateSchema>;
@@ -199,6 +213,11 @@ export const EventSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("job"), jobId: z.string() }),
   z.object({ type: z.literal("abort") }),
   z.object({ type: z.literal("idle") }),
+  // Deliberately not stored anywhere. Pub/sub is fire-and-forget, so a reboot
+  // reaches a device that is connected now and cannot be replayed at one that
+  // reconnects afterwards — which is the difference between a reboot and a
+  // reboot loop.
+  z.object({ type: z.literal("reboot") }),
   // Public status changed for a reason the device doesn't care about
   // (lock acquired, device state written, history edited) — tells the
   // live-dashboard function to push a fresh snapshot.
@@ -222,6 +241,12 @@ export const JobMsgSchema = z.object({
   artifact: z.string().optional(),
 });
 
+/** The idle push. Derived from `IdleSchema` rather than respelled, because the
+ *  stored record and the pushed frame are deliberately the same shape — which is
+ *  exactly why nothing server-side may live on `IdleSchema` (see `REDIS.idleMap`).
+ *  Spelling them out separately let the two drift silently. */
+export const IdleMsgSchema = IdleSchema.extend({ t: z.literal("idle") });
+
 export const ServerMsgSchema = z.discriminatedUnion("t", [
   z.object({
     t: z.literal("hello"),
@@ -230,7 +255,8 @@ export const ServerMsgSchema = z.discriminatedUnion("t", [
   }),
   JobMsgSchema,
   z.object({ t: z.literal("abort") }),
-  z.object({ t: z.literal("idle"), script: z.string(), rev: z.number() }),
+  IdleMsgSchema,
+  z.object({ t: z.literal("reboot") }),
 ]);
 export type ServerMsg = z.infer<typeof ServerMsgSchema>;
 
@@ -249,6 +275,8 @@ export const DeviceMsgSchema = z.discriminatedUnion("t", [
     heap_block: z.number().optional(),
     ops: z.array(z.number()).length(3).optional(),
     fw: z.string(),
+    idle: z.enum(["script", "builtin"]).optional(),
+    idle_error: z.string().optional(),
   }),
   z.object({
     t: z.literal("job_done"),

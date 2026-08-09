@@ -191,12 +191,39 @@ pub enum RunKind {
     Idle,
 }
 
+/// How a script that ran ended.
 #[derive(Debug)]
 pub enum Outcome {
     Ok,
     Error(String),
     Aborted,
     Deadline,
+}
+
+/// Why a run never began.
+///
+/// Deliberately not an [`Outcome`]: an `Outcome` is a statement about a script
+/// that ran, and reporting "could not start" as one makes a heap shortage that
+/// clears in seconds indistinguishable from a script that is wrong. The caller
+/// needs to tell them apart — one is worth retrying on a short ladder, the other
+/// is not.
+#[derive(Debug)]
+pub enum StartError {
+    /// The heap check declined before anything was allocated.
+    NoHeap(String),
+    /// The check passed and the thread still could not be created, so the
+    /// estimate was too optimistic. Worth telling apart in the log: it means the
+    /// constants above need revisiting, not that the caller did anything wrong.
+    Spawn(String),
+}
+
+impl std::fmt::Display for StartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StartError::NoHeap(e) => write!(f, "{e}"),
+            StartError::Spawn(e) => write!(f, "script thread could not start: {e}"),
+        }
+    }
 }
 
 pub struct Runner {
@@ -228,6 +255,11 @@ impl Runner {
 
     /// Run a script in a fresh thread; the outcome arrives on `tx` tagged
     /// with `run_gen` so the main loop can tell stale completions from current.
+    ///
+    /// A run that never starts is reported here, synchronously, rather than as
+    /// an outcome on `tx` — the caller learns it before it has told itself a
+    /// script is running, and nothing tagged `run_gen` goes into the queue to be
+    /// invalidated later.
     #[allow(clippy::too_many_arguments)]
     pub fn start(
         &mut self,
@@ -243,71 +275,54 @@ impl Runner {
         lights: Arc<Lights>,
         last_holder: SharedLastHolder,
         tx: Sender<AppEvent>,
-    ) {
+    ) -> Result<(), StartError> {
         self.stop();
         let abort = Arc::new(AtomicBool::new(false));
         self.abort = abort.clone();
-
-        let job_id_on_fail = job_id.clone();
-        let holder_on_fail = holder.clone();
-        let tx_on_fail = tx.clone();
 
         // Decline before allocating anything, so a script that cannot fit fails
         // as a run rather than as a reboot.
         // An artifact costs a fraction of what its source would as a tree, so
         // the check is sized against whichever one will actually be loaded.
         let weight = artifact.as_ref().map_or(script.len(), Vec::len);
-        let spawned = match heap_check(weight, artifact.is_some(), components.as_ref()) {
-            Err(e) => Err(std::io::Error::other(e)),
-            Ok(()) => std::thread::Builder::new()
-                .name("rhai".into())
-                .stack_size(SCRIPT_STACK_BYTES)
-                .spawn(move || {
-                    let deadline = ttl.map(|t| Instant::now() + t);
-                    let outcome = run_script(
-                        script,
-                        artifact,
-                        components,
-                        kind,
-                        deadline,
-                        &abort,
-                        &lights,
-                        &last_holder,
-                    );
-                    // What the interpreter actually needed, so SCRIPT_STACK_BYTES
-                    // can be sized from measurement rather than from caution —
-                    // it is 23% of the free heap, and rhai's depth is bounded by
-                    // max_call_levels/max_expr_depths, not by the script.
-                    let unused =
-                        unsafe { esp_idf_svc::sys::uxTaskGetStackHighWaterMark(std::ptr::null_mut()) };
-                    log::info!(
-                        "script stack: {unused} bytes never touched of {SCRIPT_STACK_BYTES}"
-                    );
-                    let _ = tx.send(AppEvent::ScriptDone {
-                        run_gen,
-                        kind,
-                        job_id,
-                        holder,
-                        outcome,
-                    });
-                }),
-        };
-        match spawned {
-            Ok(handle) => self.handle = Some(handle),
-            // Either the heap check declined or the spawn itself failed, both of
-            // which are heap exhaustion. Never worth a panic-reset: report it
-            // like a script failure so the main loop keeps its invariants.
-            Err(e) => {
-                log::error!("script not started: {e}");
-                let _ = tx_on_fail.send(AppEvent::ScriptDone {
+        heap_check(weight, artifact.is_some(), components.as_ref()).map_err(StartError::NoHeap)?;
+
+        let handle = std::thread::Builder::new()
+            .name("rhai".into())
+            .stack_size(SCRIPT_STACK_BYTES)
+            .spawn(move || {
+                let deadline = ttl.map(|t| Instant::now() + t);
+                let outcome = run_script(
+                    script,
+                    artifact,
+                    components,
+                    kind,
+                    deadline,
+                    &abort,
+                    &lights,
+                    &last_holder,
+                );
+                // What the interpreter actually needed, so SCRIPT_STACK_BYTES
+                // can be sized from measurement rather than from caution —
+                // it is 23% of the free heap, and rhai's depth is bounded by
+                // max_call_levels/max_expr_depths, not by the script.
+                let unused =
+                    unsafe { esp_idf_svc::sys::uxTaskGetStackHighWaterMark(std::ptr::null_mut()) };
+                log::info!("script stack: {unused} bytes never touched of {SCRIPT_STACK_BYTES}");
+                let _ = tx.send(AppEvent::ScriptDone {
                     run_gen,
                     kind,
-                    job_id: job_id_on_fail,
-                    holder: holder_on_fail,
-                    outcome: Outcome::Error(e.to_string()),
+                    job_id,
+                    holder,
+                    outcome,
                 });
-            }
-        }
+            })
+            // Never worth a panic-reset: the caller decides what a run that did
+            // not start means for the lamps.
+            .map_err(|e| StartError::Spawn(e.to_string()))?;
+
+        self.handle = Some(handle);
+        Ok(())
     }
 }
 

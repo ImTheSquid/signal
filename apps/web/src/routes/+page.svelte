@@ -11,6 +11,10 @@
 		heap: number;
 		heap_block?: number;
 		ops?: number[];
+		// What is filling idle time, and — when it is the built-in cycle — why the
+		// idle script is not. Absent on firmware that does not report it.
+		idle?: 'script' | 'builtin';
+		idle_error?: string;
 		fw: string;
 		ts: number;
 	}
@@ -196,7 +200,13 @@
 			</span>
 			{#if online && status?.device}
 				<span class="badge">
-					{status.device.running === 'idle' ? 'running idle script' : 'running a job'}
+					{#if status.device.running !== 'idle'}
+						running a job
+					{:else if status.device.idle === 'builtin'}
+						running built-in cycle
+					{:else}
+						running idle script
+					{/if}
 				</span>
 			{/if}
 			{#if unreachable}
@@ -228,6 +238,12 @@
 						({Math.round(status.device.heap_block / 1024)} KB block){/if}
 					{#if status.device.ops}
 						<br />relay ops {status.device.ops.join(' / ')}
+					{/if}
+					{#if status.device.idle === 'builtin'}
+						<br /><span class="idle-fallback"
+							>idle script not running — built-in cycle{#if status.device.idle_error}:
+								{status.device.idle_error}{/if}</span
+						>
 					{/if}
 				</p>
 			{/if}
@@ -441,6 +457,12 @@
 		font-size: 0.72rem;
 		color: var(--muted);
 		font-variant-numeric: tabular-nums;
+	}
+
+	/* Reads against the muted meta line: the light is on its fallback cycle. */
+	.idle-fallback {
+		color: #ffb347;
+		overflow-wrap: anywhere;
 	}
 
 	.info-col {

@@ -57,7 +57,27 @@ pub enum ServerMsg {
     Abort,
     Idle {
         script: String,
+        components: Option<Vec<String>>,
+        artifact: Option<Vec<u8>>,
     },
+    Reboot,
+}
+
+/// The source, or an empty string when an artifact will be run instead.
+///
+/// `run_script` loads the artifact and never reads the source when one is
+/// present, so the server is free to leave it out. Only a frame carrying
+/// neither is unusable.
+pub fn script_or_artifact(
+    script: Option<String>,
+    artifact: &Option<Vec<u8>>,
+    what: &str,
+) -> Result<String, String> {
+    match (script, artifact) {
+        (Some(s), _) => Ok(s),
+        (None, Some(_)) => Ok(String::new()),
+        (None, None) => Err(format!("{what} without script or artifact")),
+    }
 }
 
 impl TryFrom<ServerMsgRaw> for ServerMsg {
@@ -69,18 +89,27 @@ impl TryFrom<ServerMsgRaw> for ServerMsg {
                 job: raw.job,
                 idle: raw.idle,
             }),
-            "job" => Ok(ServerMsg::Job {
-                id: raw.id.ok_or("job without id")?,
-                holder: raw.holder.unwrap_or_default(),
-                script: raw.script.ok_or("job without script")?,
-                ttl_ms: raw.ttl_ms.ok_or("job without ttl_ms")?,
-                components: raw.components,
-                artifact: decode_artifact(raw.artifact)?,
-            }),
+            "job" => {
+                let artifact = decode_artifact(raw.artifact)?;
+                Ok(ServerMsg::Job {
+                    id: raw.id.ok_or("job without id")?,
+                    holder: raw.holder.unwrap_or_default(),
+                    script: script_or_artifact(raw.script, &artifact, "job")?,
+                    ttl_ms: raw.ttl_ms.ok_or("job without ttl_ms")?,
+                    components: raw.components,
+                    artifact,
+                })
+            }
             "abort" => Ok(ServerMsg::Abort),
-            "idle" => Ok(ServerMsg::Idle {
-                script: raw.script.ok_or("idle without script")?,
-            }),
+            "reboot" => Ok(ServerMsg::Reboot),
+            "idle" => {
+                let artifact = decode_artifact(raw.artifact)?;
+                Ok(ServerMsg::Idle {
+                    script: script_or_artifact(raw.script, &artifact, "idle")?,
+                    components: raw.components,
+                    artifact,
+                })
+            }
             other => Err(format!("unknown message type {other:?}")),
         }
     }
@@ -116,7 +145,15 @@ pub struct JobPayload {
 
 #[derive(Debug, Deserialize)]
 pub struct IdlePayload {
-    pub script: String,
+    #[serde(default)]
+    pub script: Option<String>,
+    /// Absent means the whole standard library, which is what a record written
+    /// before idle could declare still says. Declaring narrows the engine from
+    /// ~96KB to what the script actually uses.
+    #[serde(default)]
+    pub components: Option<Vec<String>>,
+    #[serde(default)]
+    pub artifact: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -144,6 +181,13 @@ pub enum DeviceMsg<'a> {
         /// lighting pattern is affordable.
         ops: [u32; 3],
         fw: &'a str,
+        /// What is filling idle time: `"script"` or `"builtin"`. An idle run
+        /// produces no history row — it has no job id — so without this the only
+        /// record that the admin script is not running is the serial console.
+        idle: &'a str,
+        /// Why the idle script is not running, when it is not.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        idle_error: Option<&'a str>,
     },
     #[serde(rename = "job_done")]
     JobDone {

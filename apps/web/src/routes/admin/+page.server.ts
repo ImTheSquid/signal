@@ -1,5 +1,12 @@
 import { fail } from '@sveltejs/kit';
-import { REDIS, type DeviceState, type Idle, type Lock } from '@traffic-light/protocol';
+import {
+	COMPONENTS,
+	ComponentsSchema,
+	REDIS,
+	type DeviceState,
+	type Idle,
+	type Lock
+} from '@traffic-light/protocol';
 import {
 	SESSION_COOKIE,
 	createSessionToken,
@@ -37,6 +44,7 @@ export const load: PageServerLoad = async ({ cookies }) => {
 			authed: false as const,
 			keys: [],
 			idle: null,
+			idleComponents: null,
 			lock: null,
 			history: [],
 			historyPublic: true,
@@ -68,6 +76,9 @@ export const load: PageServerLoad = async ({ cookies }) => {
 		authed: true as const,
 		keys,
 		idle: idle?.script ?? '',
+		// `null` means the record predates declarations, which the device reads as
+		// the full standard library — distinct from an explicit empty declaration.
+		idleComponents: idle?.components ?? null,
 		lock,
 		history,
 		historyPublic,
@@ -126,6 +137,21 @@ export const actions: Actions = {
 		if (!authed(cookies)) return fail(401, { error: 'not logged in' });
 		const form = await request.formData();
 		const script = String(form.get('script') ?? '');
+
+		// The marker distinguishes "ticked nothing" from "the fieldset never came" —
+		// a stale form posting without it would otherwise narrow the engine to
+		// nothing for a script no one re-read. Same validation as /v1/script: a
+		// declaration cannot be checked by compiling, but a typo can be caught here
+		// instead of dropping a component and killing the script mid-run.
+		let components: string[] | undefined;
+		if (form.get('declared') === '1') {
+			const parsed = ComponentsSchema.safeParse(form.getAll('components').map(String));
+			if (!parsed.success) {
+				return fail(400, { error: `components must be any of: ${COMPONENTS.join(', ')}` });
+			}
+			components = parsed.data;
+		}
+
 		const prepared = prepareScript(script);
 		if (isValidationError(prepared)) {
 			const where = prepared.line === null ? '' : `line ${prepared.line}: `;
@@ -133,13 +159,20 @@ export const actions: Actions = {
 		}
 		const r = redis();
 		const prev = await r.get<Idle>(REDIS.idle);
-		const idle: Idle = { script: prepared.script, rev: (prev?.rev ?? 0) + 1 };
+		const idle: Idle = {
+			script: prepared.script,
+			rev: (prev?.rev ?? 0) + 1,
+			components,
+			artifact: prepared.artifact
+		};
 		await r.set(REDIS.idle, JSON.stringify(idle));
 		// Separate key: the idle schema is spread straight into the `hello` frame, so
 		// a map stored on it would ride to the device.
 		await r.set(REDIS.idleMap, prepared.map);
 		await r.publish(REDIS.eventsChannel, JSON.stringify({ type: 'idle' }));
-		return { ok: true };
+		// Set only when minification was declined, which is also when there is no
+		// artifact — worth saying rather than leaving invisible.
+		return { ok: true, warning: prepared.warning };
 	},
 
 	kill: async ({ cookies }) => {
@@ -147,6 +180,18 @@ export const actions: Actions = {
 		const r = redis();
 		await forceRelease(r);
 		await r.publish(REDIS.eventsChannel, JSON.stringify({ type: 'abort' }));
+		return { ok: true };
+	},
+
+	// Admin-only, and deliberately not on /v1: a key that can run a script should
+	// not also be able to take the light down. Releasing first so the lock is not
+	// left held by a job the reboot is about to kill — the device stops answering
+	// mid-job, and its history row heals to `lost` the usual way.
+	reboot: async ({ cookies }) => {
+		if (!authed(cookies)) return fail(401, { error: 'not logged in' });
+		const r = redis();
+		await forceRelease(r);
+		await r.publish(REDIS.eventsChannel, JSON.stringify({ type: 'reboot' }));
 		return { ok: true };
 	},
 

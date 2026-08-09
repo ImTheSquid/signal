@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { enhance } from '$app/forms';
 	import type { SubmitFunction } from '@sveltejs/kit';
+	import { COMPONENTS, type Component } from '@traffic-light/protocol';
 	import type { PageProps } from './$types';
 
 	let { data, form }: PageProps = $props();
@@ -9,6 +10,17 @@
 	// the draft then wins, so unrelated invalidations don't clobber edits.
 	let draft = $state<string | null>(null);
 	const script = $derived(draft ?? data.idle ?? '');
+
+	// Same draft-wins rule for the declaration. A `null` from the server means no
+	// declaration is stored, which the device reads as the whole standard library,
+	// so every box shows ticked.
+	let draftComponents = $state<string[] | null>(null);
+	const declaredComponents = $derived(draftComponents ?? data.idleComponents ?? [...COMPONENTS]);
+
+	function toggleComponent(c: Component, on: boolean) {
+		// Rebuilt in COMPONENTS order, so the declaration reads the same way everywhere.
+		draftComponents = COMPONENTS.filter((k) => (k === c ? on : declaredComponents.includes(k)));
+	}
 
 	// Which form was submitted last — the `form` result is global to the page,
 	// so this routes success and error feedback to the right form.
@@ -22,7 +34,8 @@
 		'endTest',
 		'setHistoryVisibility',
 		'clearHistory',
-		'kill'
+		'kill',
+		'reboot'
 	];
 	const errorShownInline = $derived(
 		lastAction !== null &&
@@ -162,6 +175,18 @@
 					<button class="danger" type="submit">force release / kill script</button>
 					{@render done('kill', 'released')}
 					{@render err('kill')}
+				</form>
+				<form
+					class="reboot"
+					method="POST"
+					action="?/reboot"
+					use:enhance={submit('reboot', {
+						confirm: 'Reboot the light. This releases the lock and kills any running script. Continue?'
+					})}
+				>
+					<button class="danger" type="submit">reboot light</button>
+					{@render done('reboot', 'rebooting — back in a few seconds')}
+					{@render err('reboot')}
 				</form>
 			</section>
 
@@ -360,6 +385,38 @@
 						spellcheck="false"
 						bind:value={() => script, (v) => (draft = v)}
 					></textarea>
+					<!-- Tells the action a declaration was posted, so ticking nothing is
+					     distinguishable from a form that carries no fieldset. -->
+					<input type="hidden" name="declared" value="1" />
+					<fieldset class="components">
+						<legend>components</legend>
+						<p class="caption">
+							what the script needs from Rhai's standard library. All of it costs about 96KB of
+							the light's ~140KB of heap — enough that a script can fail to start at all — so
+							tick only what the script calls.
+						</p>
+						{#if data.idleComponents === null}
+							<p class="warn">
+								this script was saved without a declaration, so the light reserves the whole
+								standard library for it and may fail to start it — tick only what it uses and
+								save
+							</p>
+						{/if}
+						<div class="component-list">
+							{#each COMPONENTS as c (c)}
+								<label class="checkbox">
+									<input
+										type="checkbox"
+										name="components"
+										value={c}
+										checked={declaredComponents.includes(c)}
+										onchange={(e) => toggleComponent(c, e.currentTarget.checked)}
+									/>
+									{c}
+								</label>
+							{/each}
+						</div>
+					</fieldset>
 					<button class="primary" type="submit">save idle script</button>
 					{@render done('setIdle', 'saved — the light picks it up immediately')}
 					{@render err('setIdle', true)}
@@ -705,7 +762,8 @@
 		box-shadow: 0 0 6px color-mix(in srgb, var(--green) 60%, transparent);
 	}
 
-	.end-test {
+	.end-test,
+	.reboot {
 		margin-top: 0.6rem;
 	}
 
@@ -817,6 +875,28 @@
 		line-height: 1.5;
 		resize: vertical;
 		margin-bottom: 0.75rem;
+	}
+
+	.components {
+		margin: 0 0 0.9rem;
+		padding: 0.8rem 1rem;
+		border: 1px solid var(--border);
+		border-radius: 8px;
+	}
+
+	.components legend {
+		padding: 0 0.4rem;
+		font-size: 0.7rem;
+		font-weight: 600;
+		text-transform: uppercase;
+		letter-spacing: 0.1em;
+		color: var(--muted);
+	}
+
+	.component-list {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.5rem 1.25rem;
 	}
 
 	button {

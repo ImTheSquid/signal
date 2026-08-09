@@ -16,6 +16,7 @@ import {
 	DeviceMsgSchema,
 	EventSchema,
 	HISTORY_LENGTH,
+	IdleSchema,
 	REDIS,
 	WS_MAX_PAYLOAD,
 	type DeviceState,
@@ -24,6 +25,9 @@ import {
 	type Job,
 	type ServerMsg
 } from '@traffic-light/protocol';
+// Relative, not `$lib`: that alias only resolves inside SvelteKit, and this runs
+// as a plain Node server. tsx loads the TypeScript source directly.
+import { buildHelloFrame, buildIdleFrame, buildJobFrame } from '../src/lib/server/frames.js';
 // Imported straight from the wasm package rather than through `$lib`, which only
 // resolves inside SvelteKit. The nodejs-target build is CJS, so plain Node loads it.
 import { remap as remapError } from '@traffic-light/validator-wasm';
@@ -61,53 +65,29 @@ function send(msg: ServerMsg): void {
 	if (device?.readyState === WebSocket.OPEN) device.send(Buffer.from(JSON.stringify(msg)));
 }
 
-async function currentJobMsg(): Promise<ServerMsg | null> {
+async function currentJob(): Promise<Job | null> {
 	const raw = await redis.get(REDIS.jobCurrent);
-	if (!raw) return null;
-	const job = JSON.parse(raw) as Job;
-	const ttl = job.expiresAt - Date.now();
-	if (ttl <= 0) return null;
-	// `components` is omitted when the job did not declare, which the device
-	// reads as the full set — so an older device and an undeclared job agree.
-	return {
-		t: 'job',
-		id: job.jobId,
-		holder: job.holder ?? '',
-		script: job.script,
-		ttl_ms: ttl,
-		components: job.components,
-		artifact: job.artifact
-	};
+	return raw ? (JSON.parse(raw) as Job) : null;
 }
 
 async function getIdle(): Promise<Idle | null> {
 	const raw = await redis.get(REDIS.idle);
-	return raw ? (JSON.parse(raw) as Idle) : null;
+	if (!raw) return null;
+	// Parsed rather than cast. The record is spread straight into a frame, so
+	// zod dropping unknown keys is what keeps a server-only field from riding to
+	// the device. An unreadable record means the built-in cycle, which is the
+	// conservative answer.
+	const parsed = IdleSchema.safeParse(JSON.parse(raw));
+	if (!parsed.success) {
+		console.warn('idle record does not parse; the light will use its built-in cycle');
+		return null;
+	}
+	return parsed.data;
 }
 
 async function sendHello(): Promise<void> {
-	const [job, idle] = await Promise.all([currentJobMsg(), getIdle()]);
-	send({
-		t: 'hello',
-		job:
-			job && job.t === 'job'
-				? {
-						id: job.id,
-						holder: job.holder,
-						script: job.script,
-						ttl_ms: job.ttl_ms,
-						// Without this a device that reconnects mid-job is handed the
-						// script with no declaration, so it rebuilds the whole standard
-						// library and can no longer fit what it was already running.
-						components: job.components,
-						// Same omission that cost a reboot loop last time: a
-						// device resynced through `hello` mid-job gets the same
-						// frame contents as one that got the push.
-						artifact: job.artifact
-					}
-				: null,
-		idle
-	});
+	const [job, idle] = await Promise.all([currentJob(), getIdle()]);
+	send(buildHelloFrame(job, idle, Date.now()));
 }
 
 async function writeDeviceState(state: Omit<DeviceState, 'ts'>): Promise<void> {
@@ -167,13 +147,16 @@ async function ensureSubscribed(): Promise<void> {
 			if (!parsed.success) return;
 			const event = parsed.data;
 			if (event.type === 'job') {
-				const msg = await currentJobMsg();
+				const job = await currentJob();
+				const msg = job === null ? null : buildJobFrame(job, Date.now());
 				if (msg) send(msg);
 			} else if (event.type === 'abort') {
 				send({ t: 'abort' });
+			} else if (event.type === 'reboot') {
+				send({ t: 'reboot' });
 			} else if (event.type === 'idle') {
 				const idle = await getIdle();
-				if (idle) send({ t: 'idle', script: idle.script, rev: idle.rev });
+				if (idle) send(buildIdleFrame(idle));
 			}
 		});
 	}
@@ -218,7 +201,9 @@ wss.on('connection', async (ws) => {
 				heap: msg.heap,
 				heap_block: msg.heap_block,
 				ops: msg.ops,
-				fw: msg.fw
+				fw: msg.fw,
+				idle: msg.idle,
+				idle_error: msg.idle_error
 			});
 		} else if (msg.t === 'job_done') {
 			await recordJobDone(msg);

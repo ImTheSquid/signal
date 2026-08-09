@@ -67,6 +67,40 @@ const WIFI_CHECK: Duration = Duration::from_secs(10);
 const IDLE_RESTART_PAUSE: Duration = Duration::from_millis(500);
 const FW_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// A run that could not start is waiting on someone else's heap, and that comes
+/// back: the receive transient behind it is measured in seconds. Start well above
+/// [`IDLE_RESTART_PAUSE`] so this is a backoff and not a poll — each attempt
+/// builds an engine — and cap low enough that a light which has recovered picks
+/// its script back up within a minute, with no reconnect and no admin save.
+const IDLE_NOSTART_RETRY: Duration = Duration::from_secs(2);
+const IDLE_NOSTART_RETRY_MAX: Duration = Duration::from_secs(60);
+
+/// A script that ran and threw will mostly throw again. It is retried at all
+/// because the alternative — never — leaves the light wrong until someone
+/// notices, and because the dependency that failed may not be the script's
+/// fault.
+const IDLE_ERROR_RETRY: Duration = Duration::from_secs(30);
+const IDLE_ERROR_RETRY_MAX: Duration = Duration::from_secs(300);
+
+/// An idle run that lasted this long counts as recovery, so the ladder is not a
+/// ratchet: a script that ran for hours before failing starts again at the
+/// bottom rather than at the slowest rung.
+const IDLE_HEALTHY: Duration = Duration::from_secs(60);
+
+/// Show the fault on every Nth consecutive refusal. Roughly five minutes at the
+/// ladder above, by which point "transient" is no longer the right word.
+const NOSTART_FAULT_EVERY: u32 = 10;
+
+/// Long enough for the log to drain and the websocket close to go out, short
+/// enough that the operator who asked sees the light go down.
+const REBOOT_DELAY: Duration = Duration::from_millis(250);
+
+/// Exponential backoff, saturating at `cap`.
+fn idle_backoff(base: Duration, cap: Duration, fails: u32) -> Duration {
+    base.saturating_mul(1u32.checked_shl(fails.saturating_sub(1)).unwrap_or(u32::MAX))
+        .min(cap)
+}
+
 /// The built-in cycle, run natively from the main loop rather than as a Rhai
 /// script.
 ///
@@ -183,7 +217,22 @@ struct App {
     run_gen: u64,
     running_id: Option<String>,
     idle_script: Option<String>,
-    idle_broken: bool,
+    /// Declared alongside the script and kept with it. Both outlive the frame
+    /// they arrived on: `start_idle` also runs after a job, after a fault clears
+    /// and off the retry timer, with no `hello` in sight.
+    idle_components: Option<Vec<String>>,
+    idle_artifact: Option<Vec<u8>>,
+    /// Consecutive idle failures, driving the retry ladder.
+    idle_fails: u32,
+    /// Earliest the idle script may be tried again. Checked inside `start_idle`
+    /// rather than at its call sites, so every path back into idle — reconnect,
+    /// finished job, cleared fault, timer — obeys one policy.
+    idle_retry_after: Option<Instant>,
+    /// Why idle is on the built-in cycle, reported in `state`.
+    idle_error: Option<String>,
+    /// When the running idle script started, so a long healthy run resets the
+    /// ladder.
+    idle_since: Option<Instant>,
     /// Whether idle time is filled by the interpreter or the native cycle.
     idle: Idle,
     idle_restart_at: Option<Instant>,
@@ -214,15 +263,13 @@ impl App {
             return; // duplicate delivery (two server instances during recycle)
         }
         log::info!("starting job {id} for {holder} (ttl {ttl_ms}ms)");
-        self.fault = None;
         self.run_gen += 1;
         self.idle_restart_at = None;
-        self.running_id = Some(id.clone());
-        self.runner.start(
+        match self.runner.start(
             self.run_gen,
             RunKind::Job,
-            Some(id),
-            Some(holder),
+            Some(id.clone()),
+            Some(holder.clone()),
             script,
             components,
             artifact,
@@ -230,42 +277,119 @@ impl App {
             self.lights.clone(),
             self.last_holder.clone(),
             self.tx.clone(),
-        );
+        ) {
+            Ok(()) => {
+                self.running_id = Some(id);
+                // Only once something is driving the lamps. Clearing it before a
+                // start that then fails would leave all three lit with nothing
+                // left to turn them off.
+                self.fault = None;
+            }
+            // The submitter is waiting and the job has a deadline, so it is
+            // reported rather than queued; the message already says what did not
+            // fit. Retrying is the submitter's call.
+            Err(e) => {
+                log::error!("job {id} not started: {e}");
+                self.finish_job(id, Some(holder), "error", Some(e.to_string()));
+                self.running_id = None;
+                self.start_idle();
+            }
+        }
     }
 
     fn start_idle(&mut self) {
+        // The fault owns the lamps while it is up; a script started under one
+        // would fight it for the relays.
+        if self.fault.is_some() {
+            return;
+        }
         self.run_gen += 1;
         self.idle_restart_at = None;
         self.running_id = None;
 
-        match (&self.idle_script, self.idle_broken) {
-            (Some(script), false) => {
-                let script = script.clone();
+        let Some(script) = self.idle_script.clone() else {
+            self.fill_idle_natively();
+            return;
+        };
+        if self.idle_retry_after.is_some_and(|at| Instant::now() < at) {
+            self.idle_restart_at = self.idle_retry_after;
+            self.fill_idle_natively();
+            return;
+        }
+
+        match self.runner.start(
+            self.run_gen,
+            RunKind::Idle,
+            None,
+            None,
+            script,
+            self.idle_components.clone(),
+            self.idle_artifact.clone(),
+            None,
+            self.lights.clone(),
+            self.last_holder.clone(),
+            self.tx.clone(),
+        ) {
+            Ok(()) => {
                 self.idle = Idle::Script;
-                self.runner.start(
-                    self.run_gen,
-                    RunKind::Idle,
-                    None,
-                    None,
-                    script,
-                    None,
-                    // The idle script is admin-set text, not a submitted job, so
-                    // there is nothing to have lowered it.
-                    None,
-                    None,
-                    self.lights.clone(),
-                    self.last_holder.clone(),
-                    self.tx.clone(),
-                );
+                self.idle_since = Some(Instant::now());
             }
-            _ => {
-                // Free the interpreter rather than leave 96.7KB resident for as
-                // long as the light is idle.
-                self.runner.stop();
-                self.idle = Idle::Builtin {
-                    since: Instant::now(),
-                };
-            }
+            Err(e) => self.idle_failed(true, e.to_string()),
+        }
+    }
+
+    /// Hand idle time to the built-in cycle, freeing the interpreter rather than
+    /// leaving 96.7KB resident for as long as the light is idle.
+    fn fill_idle_natively(&mut self) {
+        self.runner.stop();
+        self.idle_since = None;
+        // Keep the phase. `start_idle` runs on every rung of the retry ladder,
+        // and a fresh `since` each time would hitch the cycle back to green.
+        if !matches!(self.idle, Idle::Builtin { .. }) {
+            self.idle = Idle::Builtin {
+                since: Instant::now(),
+            };
+        }
+    }
+
+    /// An idle run that did not start, or ran and threw.
+    fn idle_failed(&mut self, could_not_start: bool, why: String) {
+        // A run that stayed up counts as recovery, so a script that worked for
+        // hours before failing starts again at the bottom of the ladder.
+        if self.idle_since.is_some_and(|at| at.elapsed() >= IDLE_HEALTHY) {
+            self.idle_fails = 0;
+        }
+        self.idle_fails = self.idle_fails.saturating_add(1);
+        let wait = if could_not_start {
+            idle_backoff(IDLE_NOSTART_RETRY, IDLE_NOSTART_RETRY_MAX, self.idle_fails)
+        } else {
+            idle_backoff(IDLE_ERROR_RETRY, IDLE_ERROR_RETRY_MAX, self.idle_fails)
+        };
+        log::warn!(
+            "idle script {} ({why}); built-in cycle, retry in {wait:?} (failure {})",
+            if could_not_start { "did not start" } else { "failed" },
+            self.idle_fails
+        );
+        self.idle_error = Some(why);
+        // Before any fault: `raise_fault` clears `idle_restart_at` and stops the
+        // runner, so a gate armed after it would be thrown away.
+        self.idle_retry_after = Some(Instant::now() + wait);
+
+        // During a refusal the light shows the built-in cycle, which is correct
+        // and safe — saying so every time would spend 60 relay operations to
+        // announce that nothing is wrong, and wear out a signal that means "the
+        // light is not doing what you think". A script that is actually wrong is
+        // worth showing once, to whoever just saved it.
+        let loud = if could_not_start {
+            self.idle_fails % NOSTART_FAULT_EVERY == 0
+        } else {
+            self.idle_fails == 1
+        };
+        if loud {
+            self.raise_fault("idle script failed", Some(FAULT_BLIP));
+        } else {
+            self.fill_idle_natively();
+            self.idle_restart_at = self.idle_retry_after;
         }
     }
 
@@ -327,17 +451,63 @@ impl App {
         }
     }
 
-    fn set_idle_script(&mut self, script: String) {
+    /// The idle script and its declaration, which move as one — a restart that
+    /// paired a new script with a stale artifact would run the wrong program.
+    fn set_idle(
+        &mut self,
+        script: String,
+        components: Option<Vec<String>>,
+        artifact: Option<Vec<u8>>,
+        pushed: bool,
+    ) {
+        let changed = self.idle_script.as_deref() != Some(script.as_str());
         self.idle_script = Some(script);
-        self.idle_broken = false;
-        // Restart unconditionally when idle, not only when the text changed.
-        // The built-in cycle never ends on its own, so gating on `changed` meant
-        // that once it was running, re-saving the *same* script was a permanent
-        // no-op — and the admin form is prefilled from the server, so the natural
-        // retry submits byte-identical text and could never recover.
+        self.idle_components = components;
+        self.idle_artifact = artifact;
+
+        // A push is an admin acting now, so it restarts even when the text is
+        // byte-identical: the form is prefilled from the server, and the natural
+        // retry resubmits exactly what is already there.
+        //
+        // A `hello` is resync and arrives on every reconnect. Clearing the ladder
+        // there would retry a failing script every time the link flapped, which
+        // is how one transient refusal turned into a fault on every reconnect.
+        if !(pushed || changed) {
+            return;
+        }
+        self.idle_fails = 0;
+        self.idle_error = None;
+        self.idle_retry_after = None;
         if self.running_id.is_none() {
             self.start_idle();
         }
+    }
+
+    /// Queue a result for the server and record the holder for idle scripts.
+    fn finish_job(
+        &mut self,
+        id: String,
+        holder: Option<String>,
+        result: &'static str,
+        error: Option<String>,
+    ) {
+        if let Some(prev) = self.pending_done.as_ref() {
+            // One slot. An unsent result dropped here is a row the server heals
+            // to `lost`, so it is worth a line rather than silence.
+            log::warn!("job_done for {} dropped before it was sent", prev.id);
+        }
+        self.pending_done = Some(PendingDone {
+            id,
+            result,
+            error,
+            since: Instant::now(),
+            last_try: None,
+        });
+        *self.last_holder.lock().unwrap() = Some(LastHolderInfo {
+            name: holder.unwrap_or_default(),
+            result: result.to_string(),
+            ended: Instant::now(),
+        });
     }
 
     fn handle(&mut self, event: AppEvent, client: &mut EspWebSocketClient<'_>) {
@@ -357,6 +527,8 @@ impl App {
                 outcome,
             } => {
                 log::info!("script done ({kind:?}): {outcome:?}");
+                // A superseded job still owes the server a result, so this runs
+                // whether or not the run is stale.
                 if let Some(id) = job_id {
                     let (result, error) = match &outcome {
                         Outcome::Ok => ("ok", None),
@@ -364,44 +536,31 @@ impl App {
                         Outcome::Aborted => ("aborted", None),
                         Outcome::Deadline => ("deadline", None),
                     };
-                    self.pending_done = Some(PendingDone {
-                        id: id.clone(),
-                        result,
-                        error: error.map(str::to_owned),
-                        since: Instant::now(),
-                        last_try: None,
-                    });
+                    self.finish_job(id, holder, result, error.map(str::to_owned));
                     self.flush_done(client);
-                    *self.last_holder.lock().unwrap() = Some(LastHolderInfo {
-                        name: holder.unwrap_or_default(),
-                        result: result.to_string(),
-                        ended: Instant::now(),
-                    });
                 }
-                if kind == RunKind::Idle && matches!(outcome, Outcome::Error(_)) {
-                    log::warn!("idle script failed; falling back to built-in cycle");
-                    self.idle_broken = true;
-                    self.raise_fault("idle script failed", Some(FAULT_BLIP));
+                // Everything below acts on the lamps, so none of it may run for a
+                // run that has already been superseded: `stop()` joins the
+                // outgoing thread, which reports as it exits, so the stale result
+                // of a preempted job arrives while its replacement is running.
+                if run_gen != self.run_gen {
                     return;
                 }
-                if kind == RunKind::Job && matches!(outcome, Outcome::Error(_)) {
-                    self.raise_fault("job script failed", Some(FAULT_BLIP));
-                    return;
-                }
-                if run_gen == self.run_gen {
-                    // The active run ended on its own (not superseded).
-                    match (kind, &outcome) {
-                        // One-shot idle scripts run once per idle transition;
-                        // the lamps hold whatever they set.
-                        (RunKind::Idle, Outcome::Ok) => {}
-                        // A failed idle script must not freeze the light —
-                        // restart (now marked broken → built-in cycle).
-                        (RunKind::Idle, _) => {
-                            self.idle_restart_at = Some(Instant::now() + IDLE_RESTART_PAUSE);
-                            self.running_id = None;
-                        }
-                        (RunKind::Job, _) => self.start_idle(),
+                match (kind, &outcome) {
+                    // One-shot idle scripts run once per idle transition; the
+                    // lamps hold whatever they set.
+                    (RunKind::Idle, Outcome::Ok) => self.idle_error = None,
+                    (RunKind::Idle, Outcome::Error(e)) => self.idle_failed(false, e.clone()),
+                    // Aborted or out of time is not the script's failure, so it
+                    // restarts without touching the ladder.
+                    (RunKind::Idle, _) => {
+                        self.idle_restart_at = Some(Instant::now() + IDLE_RESTART_PAUSE);
+                        self.running_id = None;
                     }
+                    (RunKind::Job, Outcome::Error(_)) => {
+                        self.raise_fault("job script failed", Some(FAULT_BLIP))
+                    }
+                    (RunKind::Job, _) => self.start_idle(),
                 }
             }
         }
@@ -421,7 +580,7 @@ impl App {
                     }
                 }
                 if let Some(idle) = idle {
-                    self.set_idle_script(idle.script);
+                    self.set_idle_from(idle, false);
                 }
                 match job {
                     Some(job) => {
@@ -463,7 +622,33 @@ impl App {
                     self.runner.request_abort();
                 }
             }
-            ServerMsg::Idle { script } => self.set_idle_script(script),
+            ServerMsg::Idle {
+                script,
+                components,
+                artifact,
+            } => self.set_idle(script, components, artifact, true),
+            // Not stored anywhere: pub/sub is fire-and-forget, so a reboot cannot
+            // be replayed at the device once it comes back up.
+            ServerMsg::Reboot => {
+                log::warn!("reboot requested");
+                // Let the log drain and the close frame go out; the server heals
+                // any running job's history row once the device stops answering.
+                std::thread::sleep(REBOOT_DELAY);
+                unsafe { esp_idf_svc::sys::esp_restart() };
+            }
+        }
+    }
+
+    /// The idle payload as it arrives on `hello`, where a malformed artifact is
+    /// worth degrading over rather than dropping the whole frame.
+    fn set_idle_from(&mut self, idle: crate::wsproto::IdlePayload, pushed: bool) {
+        let artifact = crate::wsproto::decode_artifact(idle.artifact).unwrap_or_else(|e| {
+            log::warn!("{e}; running the idle source instead");
+            None
+        });
+        match crate::wsproto::script_or_artifact(idle.script, &artifact, "idle") {
+            Ok(script) => self.set_idle(script, idle.components, artifact, pushed),
+            Err(e) => log::warn!("{e}"),
         }
     }
 
@@ -485,6 +670,11 @@ impl App {
                 heap_block,
                 ops: [or_, oy, og],
                 fw: FW_VERSION,
+                idle: match self.idle {
+                    Idle::Script => "script",
+                    Idle::Builtin { .. } => "builtin",
+                },
+                idle_error: self.idle_error.as_deref(),
             },
         );
     }
@@ -602,7 +792,12 @@ fn main() -> Result<()> {
         run_gen: 0,
         running_id: None,
         idle_script: None,
-        idle_broken: false,
+        idle_components: None,
+        idle_artifact: None,
+        idle_fails: 0,
+        idle_retry_after: None,
+        idle_error: None,
+        idle_since: None,
         idle: Idle::Builtin { since: Instant::now() },
         idle_restart_at: None,
         pending_done: None,
@@ -738,7 +933,9 @@ fn main() -> Result<()> {
 
         app.flush_done(&mut client);
 
-        if app.idle_restart_at.is_some_and(|at| Instant::now() >= at) {
+        // `start_idle` refuses under a fault anyway; checking here too keeps the
+        // timer from firing once a second for the length of the blip.
+        if app.fault.is_none() && app.idle_restart_at.is_some_and(|at| Instant::now() >= at) {
             app.start_idle();
         }
 
