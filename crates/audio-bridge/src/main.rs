@@ -7,35 +7,134 @@
 //! Predictions are what let the light schedule around its 100ms relay dwell
 //! instead of chasing a signal it is always a fraction of a beat behind.
 
+mod analysis;
 mod bands;
 mod capture;
 mod tempo;
 mod wire;
 
-use anyhow::Result;
+use std::time::{Duration, Instant};
+
+use anyhow::{bail, Context, Result};
+use cpal::traits::DeviceTrait;
+
+use crate::analysis::{to_beat, Analyzer, HopResult};
+use crate::tempo::HOP;
+
+/// Where the light listens. Matches `dmx-bridge`'s destination, and the two are
+/// never run together — the light keeps one sequence number per socket, not per
+/// sender, so whichever is numerically ahead starves the other.
+const DEFAULT_PORT: u16 = 49500;
+
+/// How long the loop tolerates no callbacks before rebuilding the stream.
+/// CoreAudio often does not report a device-side sample-rate change as an
+/// error; the callbacks simply stop.
+const STREAM_STALL: Duration = Duration::from_millis(500);
+
+/// With no samples arriving, keep the wire alive at the base cadence anyway.
+/// Silence on the wire reads as "sender died" to the light, which is a
+/// different thing from "the room is quiet".
+const IDLE_SEND: Duration = Duration::from_millis(100);
+
+/// Sample rate used for synthesised audio, matching what BlackHole offers.
+const SYNTH_RATE: u32 = 48_000;
+const SYNTH_SECONDS: f32 = 600.0;
+
+struct Args {
+    host: Option<String>,
+    port: u16,
+    device: Option<String>,
+    wav: Option<String>,
+    synth_bpm: Option<f32>,
+    offset_ms: f32,
+    probe: bool,
+}
 
 fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.first().map(String::as_str) {
-        Some("--list-devices") => list_devices(),
-        Some("--help" | "-h") | None => {
-            print_usage();
-            Ok(())
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.is_empty() || argv.iter().any(|a| a == "--help" || a == "-h") {
+        print_usage();
+        return Ok(());
+    }
+    if argv.iter().any(|a| a == "--list-devices") {
+        return list_devices();
+    }
+
+    let args = parse_args(&argv)?;
+    match (&args.wav, args.synth_bpm) {
+        (Some(path), _) => {
+            let (samples, rate) = analysis::read_wav_mono(path)?;
+            run_offline(path, samples, rate, &args)
         }
-        Some(other) => {
-            eprintln!("unknown argument: {other}\n");
-            print_usage();
-            std::process::exit(2);
+        (None, Some(bpm)) => {
+            let samples = analysis::synth_click_train(bpm, SYNTH_SECONDS, SYNTH_RATE);
+            run_offline(&format!("{bpm} BPM metronome"), samples, SYNTH_RATE, &args)
         }
+        (None, None) => run_live(&args),
     }
 }
 
 fn print_usage() {
     eprintln!(
-        "audio-bridge — audio beat source for the traffic light\n\n\
-         USAGE:\n  \
-           audio-bridge --list-devices    show every input device CoreAudio offers\n"
+        "audio-bridge — audio beat source for the traffic light\n\
+\n\
+USAGE:\n  \
+  audio-bridge --list-devices\n  \
+  audio-bridge --host HOST [OPTIONS]          capture live and send to the light\n  \
+  audio-bridge --wav FILE [OPTIONS]           analyse a file instead of a device\n  \
+  audio-bridge --synth BPM [OPTIONS]          drive from a perfect metronome\n\
+\n\
+OPTIONS:\n  \
+  --host HOST        where the light listens\n  \
+  --port N           default {DEFAULT_PORT}\n  \
+  --device NAME      exact input name; defaults to the first starting \"BlackHole\"\n  \
+  --offset MS        shift the reported beat, negative fires early (default 0)\n  \
+  --probe            per-hop TSV on stdout, for plotting and tuning\n\
+\n\
+--synth is the calibration signal: the grid is known-perfect, so any offset\n\
+seen on camera belongs to the rig rather than the tracker. Sweep --offset\n\
+against it to find the lamp lead.\n"
     );
+}
+
+fn parse_args(argv: &[String]) -> Result<Args> {
+    let mut args = Args {
+        host: None,
+        port: DEFAULT_PORT,
+        device: None,
+        wav: None,
+        synth_bpm: None,
+        offset_ms: 0.0,
+        probe: false,
+    };
+    let mut i = 0;
+    while i < argv.len() {
+        let take = |i: &mut usize| -> Result<String> {
+            *i += 1;
+            argv.get(*i)
+                .cloned()
+                .with_context(|| format!("{} needs a value", argv[*i - 1]))
+        };
+        match argv[i].as_str() {
+            "--host" => args.host = Some(take(&mut i)?),
+            "--port" => args.port = take(&mut i)?.parse().context("--port must be a number")?,
+            "--device" => args.device = Some(take(&mut i)?),
+            "--wav" => args.wav = Some(take(&mut i)?),
+            "--synth" => {
+                args.synth_bpm = Some(take(&mut i)?.parse().context("--synth must be a BPM")?)
+            }
+            "--offset" => {
+                args.offset_ms = take(&mut i)?.parse().context("--offset must be a number")?
+            }
+            "--probe" => args.probe = true,
+            other => bail!("unknown argument: {other}"),
+        }
+        i += 1;
+    }
+    if args.host.is_none() && args.wav.is_none() && args.synth_bpm.is_none() {
+        bail!("need --host (live), --wav, or --synth; see --help");
+    }
+    Ok(args)
 }
 
 fn list_devices() -> Result<()> {
@@ -61,4 +160,198 @@ fn list_devices() -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn probe_header() {
+    // Raw levels alongside the normalised ones: the normalised values are
+    // relative by construction and so can never show a bass kill, which is
+    // exactly what you go looking for when tuning.
+    println!(
+        "t\tlow\tmid\thigh\tenergy\traw_low\traw_mid\traw_high\tflux\tbuild\tbpm\tconf\tnext_ms\tbeat\tflags"
+    );
+}
+
+fn probe_row(t: f64, r: &HopResult, flags: u8) {
+    let bpm = r.grid.period_ms.map(|p| 60_000.0 / p).unwrap_or(0.0);
+    println!(
+        "{t:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.5}\t{:.5}\t{:.5}\t{:.3}\t{:+.3}\t{bpm:.2}\t{:.3}\t{}\t{}\t{flags:#06b}",
+        r.levels.low,
+        r.levels.mid,
+        r.levels.high,
+        r.levels.energy,
+        r.levels.raw_low,
+        r.levels.raw_mid,
+        r.levels.raw_high,
+        r.levels.flux,
+        r.levels.build,
+        r.grid.confidence,
+        r.grid
+            .ms_to_next_beat
+            .map(|v| format!("{v:.1}"))
+            .unwrap_or_else(|| "-".into()),
+        u8::from(r.beat),
+    );
+}
+
+/// Analyse a file. Sends too, if a host is given, paced to real time so the
+/// light sees the same cadence it would at a gig.
+fn run_offline(label: &str, samples: Vec<f32>, sample_rate: u32, args: &Args) -> Result<()> {
+    let mut analyzer = Analyzer::new(sample_rate)?;
+    let mut sender = match &args.host {
+        Some(host) => {
+            let s = wire::Sender::new(host, args.port)?;
+            eprintln!("replaying {label} to {} in real time", s.dest());
+            Some(s)
+        }
+        None => None,
+    };
+
+    if args.probe {
+        probe_header();
+    }
+
+    let started = Instant::now();
+    let mut confidence_sum = 0.0f64;
+    let mut tracking_hops = 0u64;
+    let mut hops = 0u64;
+
+    for hop in samples.chunks_exact(HOP) {
+        let result = analyzer.push_hop(hop)?;
+        let audio_time = analyzer.elapsed_s();
+
+        if let Some(sender) = &mut sender {
+            // Pace to the audio clock, so the light is driven at the rate the
+            // music actually plays rather than as fast as the file reads.
+            let target = Duration::from_secs_f64(audio_time);
+            if let Some(wait) = target.checked_sub(started.elapsed()) {
+                std::thread::sleep(wait);
+            }
+            let beat = to_beat(&result, hop, args.offset_ms);
+            sender.maybe_send(&beat, result.beat, Instant::now())?;
+        }
+
+        if args.probe {
+            let beat = to_beat(&result, hop, args.offset_ms);
+            probe_row(audio_time, &result, wire::encode_block(&beat)[1]);
+        }
+
+        confidence_sum += result.grid.confidence as f64;
+        tracking_hops += u64::from(result.grid.tracking);
+        hops += 1;
+    }
+
+    if hops == 0 {
+        bail!("{label} is shorter than one {HOP}-sample hop");
+    }
+    let grid = analyzer.push_hop(&vec![0.0; HOP])?.grid;
+    eprintln!(
+        "{label}: {:.1}s at {sample_rate}Hz\n\
+         final tempo   {}\n\
+         mean conf     {:.3}\n\
+         tracking      {:.1}% of hops",
+        analyzer.elapsed_s(),
+        grid.period_ms
+            .map(|p| format!("{:.2} BPM ({p:.1}ms)", 60_000.0 / p))
+            .unwrap_or_else(|| "never established".into()),
+        confidence_sum / hops as f64,
+        100.0 * tracking_hops as f64 / hops as f64,
+    );
+    Ok(())
+}
+
+fn run_live(args: &Args) -> Result<()> {
+    let host = args.host.as_deref().expect("checked in parse_args");
+    let mut sender = wire::Sender::new(host, args.port)?;
+    eprintln!("sending to {}", sender.dest());
+
+    let device = capture::pick_input(args.device.as_deref())?;
+    let name = device.name().unwrap_or_else(|_| "<unnamed>".into());
+    let mut config = capture::choose_config(&device)?;
+    let mut cap = capture::start(&device, &config)?;
+    eprintln!(
+        "capturing {name} at {}Hz, {} channels",
+        cap.sample_rate, config.channels
+    );
+
+    let mut analyzer = Analyzer::new(cap.sample_rate)?;
+    if args.probe {
+        probe_header();
+    }
+
+    let mut hop = vec![0.0f32; HOP];
+    let mut last_result: Option<HopResult> = None;
+    let mut last_activity = Instant::now();
+    let mut warned_silent = false;
+
+    loop {
+        // Drain whatever has arrived, in whole hops.
+        while cap.samples.slots() >= HOP {
+            for slot in hop.iter_mut() {
+                *slot = cap.samples.pop().unwrap_or(0.0);
+            }
+            let result = analyzer.push_hop(&hop)?;
+            let beat = to_beat(&result, &hop, args.offset_ms);
+            sender.maybe_send(&beat, result.beat, Instant::now())?;
+            if args.probe {
+                probe_row(analyzer.elapsed_s(), &result, wire::encode_block(&beat)[1]);
+            }
+            last_result = Some(result);
+            last_activity = Instant::now();
+        }
+
+        // Keep the wire alive even with nothing arriving. The light reads
+        // silence as a dead sender, so a stalled device must still be
+        // reported rather than merely producing nothing.
+        if last_activity.elapsed() >= IDLE_SEND {
+            if let Some(result) = &last_result {
+                let mut beat = to_beat(result, &[], args.offset_ms);
+                beat.audio_present = false;
+                sender.maybe_send(&beat, false, Instant::now())?;
+            }
+        }
+
+        if cap.health.split_legs() {
+            eprintln!("clone legs are out of polarity; using the left channel only");
+        }
+
+        let stalled = cap
+            .health
+            .since_last_callback()
+            .is_some_and(|d| d > STREAM_STALL);
+        if stalled || cap.health.errored() {
+            eprintln!("audio stream stopped; rebuilding");
+            drop(cap);
+            std::thread::sleep(Duration::from_millis(250));
+            config = capture::choose_config(&device)?;
+            cap = capture::start(&device, &config)?;
+            // A rate change invalidates every filter state and the tracker's
+            // whole time base, so start clean rather than reinterpreting old
+            // history at a new rate.
+            if cap.sample_rate != analyzer.sample_rate() {
+                eprintln!(
+                    "sample rate changed {} -> {}; resetting the tracker",
+                    analyzer.sample_rate(),
+                    cap.sample_rate
+                );
+                analyzer = Analyzer::new(cap.sample_rate)?;
+            }
+            last_activity = Instant::now();
+        }
+
+        if let Some(result) = &last_result {
+            let silent = !result.levels.raw_energy.is_normal();
+            if silent && !warned_silent && last_activity.elapsed() > Duration::from_secs(5) {
+                eprintln!(
+                    "5s of silence from {name} — is the DJ software actually \
+                     outputting to it? A Multi-Output Device keeps that one \
+                     setting rather than two."
+                );
+                warned_silent = true;
+            } else if !silent {
+                warned_silent = false;
+            }
+        }
+
+        std::thread::sleep(Duration::from_millis(2));
+    }
 }

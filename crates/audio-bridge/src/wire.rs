@@ -43,7 +43,10 @@ pub mod flags {
     pub const COASTING: u8 = 1 << 2;
     pub const BASS_MUTED: u8 = 1 << 3;
     /// Reserved: set only once a real downbeat estimator exists. Until then
-    /// nothing may read `beat_index % 4 == 0` as a downbeat.
+    /// nothing may read `beat_index % 4 == 0` as a downbeat. Declared rather
+    /// than left as a bare bit so the reservation is visible to whoever adds
+    /// the estimator, and so a test can hold it down.
+    #[allow(dead_code)]
     pub const BAR_VALID: u8 = 1 << 4;
     pub const CLIPPING: u8 = 1 << 5;
 }
@@ -230,7 +233,8 @@ impl Sender {
     }
 }
 
-/// The light's view of a datagram, for tests and for sniffing.
+/// The light's view of a datagram.
+#[cfg(test)]
 #[derive(Debug, PartialEq)]
 pub struct Parsed {
     pub seq: u32,
@@ -238,8 +242,12 @@ pub struct Parsed {
     pub channels: Vec<u8>,
 }
 
-/// Mirrors `parse` in `firmware/src/dmx.rs`. Kept here so the tests check what
-/// the light will actually see rather than what we meant to send.
+/// Mirrors `parse` in `firmware/src/dmx.rs`, so the tests check what the light
+/// will actually see rather than what we meant to send.
+///
+/// Test-only: sniffing a live stream is already covered by `scripts/dmxcap.mjs`,
+/// which needs no changes because the port and magic are unchanged.
+#[cfg(test)]
 pub fn parse(buf: &[u8]) -> Option<Parsed> {
     if buf.len() < HEADER_LEN || buf[0..2] != MAGIC || buf[2] != VERSION {
         return None;
