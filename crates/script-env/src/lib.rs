@@ -1062,4 +1062,57 @@ mod component_tests {
         register_api(&mut engine, Handlers::stubs());
         assert!(engine.eval::<bool>("let n = 7 + 3 * 2; n > 5 && n != 0").unwrap());
     }
+
+    /// The light's default idle script, run the way the device runs it: lowered
+    /// to an artifact, on an engine that declares nothing.
+    ///
+    /// This is the premise the idle heap budget rests on. Undeclared, the device
+    /// reserves ~96KB for the standard library and can refuse to start a script
+    /// that calls one function — so what matters is not just that this script
+    /// works, but that it works with nothing declared.
+    #[test]
+    fn the_idle_script_needs_no_components() {
+        let src = "set_lights(false, false, false);";
+        let artifact = lower(&validation_engine().compile(src).unwrap()).unwrap();
+        assert_eq!(artifact.residual, 0, "idle would fall back to the tree walker");
+
+        let mut engine = new_engine(Components::none());
+        register_api(&mut engine, Handlers::stubs());
+        assert!(run_artifact(&engine, &artifact.program).is_ok());
+        assert!(engine.eval::<()>(src).is_ok(), "source path must agree");
+    }
+
+    /// `get_last_holder` returns a map and idle scripts are its only callers, so
+    /// what it takes to *use* one is what an idle declaration has to cover.
+    ///
+    /// Reading its fields, comparing them and joining them needs nothing —
+    /// map-field access and `+` on two strings are both core. An idle script that
+    /// greets the last holder can therefore declare nothing at all, which is the
+    /// case the heap budget cares about.
+    #[test]
+    fn using_the_last_holder_needs_no_components() {
+        fn idle_runs(c: Components, src: &str) -> bool {
+            let mut engine = new_engine(c);
+            register_api(&mut engine, Handlers::stubs());
+            register_idle_api(
+                &mut engine,
+                Box::new(|| {
+                    Some(LastHolder {
+                        name: "amy".into(),
+                        result: "ok".into(),
+                        ended_ms_ago: 1234,
+                    })
+                }),
+            );
+            matches!(engine.eval::<bool>(src), Ok(true))
+        }
+
+        let none = Components::none();
+        assert!(idle_runs(none, r#"get_last_holder().name == "amy""#));
+        assert!(idle_runs(none, r#"get_last_holder().ended_ms_ago > 1000"#));
+        assert!(idle_runs(
+            none,
+            r#"get_last_holder().name + ":" + get_last_holder().result == "amy:ok""#
+        ));
+    }
 }

@@ -486,4 +486,27 @@ fn interpreter_footprint() {
          about {serviceable_artifact} bytes of artifact",
         script_env::MAX_ARTIFACT_BYTES
     );
+
+    // The idle script's budget, priced the way firmware/src/script.rs prices it.
+    //
+    // Declaring is not tidiness. The light's default idle script is one call,
+    // and undeclared it is charged the whole standard library — which put it
+    // within ~2.4KB of the free heap, close enough that the receive transient
+    // after a reconnect refused it.
+    const RUN_MARGIN: isize = 8 * 1024;
+    let idle_src = "set_lights(false, false, false);".len() as isize;
+    let ast = (idle_src as f64 * DEVICE_AST_BYTES_PER_SOURCE_BYTE) as isize;
+    let declared_engine =
+        cost(|| script_env::new_engine(script_env::Components::none())) / HOST_TO_DEVICE;
+    let undeclared = SCRIPT_STACK + DEVICE_FULL_ENGINE + ast + RUN_MARGIN;
+    let declared = SCRIPT_STACK + declared_engine + ast + RUN_MARGIN;
+    println!(
+        "  idle script ({idle_src} bytes): undeclared needs {undeclared}, \
+         declaring nothing needs {declared}, against {DEVICE_FREE_HEAP} free\n"
+    );
+    assert!(
+        declared * 2 < DEVICE_FREE_HEAP,
+        "declaring nothing should leave the idle script most of the heap, but it \
+         needs {declared} of {DEVICE_FREE_HEAP}"
+    );
 }
