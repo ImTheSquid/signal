@@ -34,15 +34,21 @@ redis.call('DEL', KEYS[2])
 return {'released', cur}
 `;
 
+// The job payload is stamped with expiresAt by appending, never by decoding it.
+// Lua's cjson has one representation for an empty table, so a round-trip turns
+// `"components":[]` — "this script needs nothing", the declaration that buys back
+// 96KB — into `"components":{}`, which the device cannot deserialize. It rejects
+// the whole frame, so the job silently never arrives. The payload also carries
+// user script text and base64, none of which is worth re-encoding to insert one
+// number. ARGV[2] is a JSON object, so it ends in '}' and is never empty.
 const SUBMIT_JOB = `
 local cur = redis.call('GET', KEYS[1])
 if not cur then return {'nolock', '0'} end
 if cjson.decode(cur).keyId ~= ARGV[1] then return {'notyours', '0'} end
 local ttl = redis.call('PTTL', KEYS[1])
 if ttl <= 0 then return {'nolock', '0'} end
-local job = cjson.decode(ARGV[2])
-job.expiresAt = tonumber(ARGV[3]) + ttl
-redis.call('SET', KEYS[2], cjson.encode(job), 'PX', ttl)
+local job = string.sub(ARGV[2], 1, -2) .. ',"expiresAt":' .. (tonumber(ARGV[3]) + ttl) .. '}'
+redis.call('SET', KEYS[2], job, 'PX', ttl)
 return {'ok', tostring(ttl)}
 `;
 
@@ -95,7 +101,7 @@ export async function submitJob(
 	const [status, ttl] = (await r.eval(
 		SUBMIT_JOB,
 		[REDIS.lock, REDIS.jobCurrent],
-		[keyId, JSON.stringify({ ...job, expiresAt: 0 }), String(Date.now())]
+		[keyId, JSON.stringify(job), String(Date.now())]
 	)) as [string, string];
 
 	if (status !== 'ok') return { status: status as 'nolock' | 'notyours' };

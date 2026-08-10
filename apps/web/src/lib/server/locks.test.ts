@@ -111,4 +111,43 @@ describe('job submission', () => {
 		expect(job?.expiresAt).toBeGreaterThan(Date.now());
 		expect(job?.expiresAt).toBeLessThanOrEqual(Date.now() + 1_700);
 	});
+
+	// "This script needs nothing" is the declaration that buys back the 96KB, and
+	// it is the one Lua's cjson cannot round-trip: an empty table re-encodes as
+	// `{}`, which the device refuses to deserialize — dropping the whole frame, so
+	// the job never arrives and nothing says why.
+	it('stores an empty declaration as an array, not an object', async () => {
+		await acquireLock(r, { keyId: 'a', name: 'A', durationMs: 5_000, override: false });
+		const result = await submitJob(r, 'a', {
+			jobId: 'j',
+			keyId: 'a',
+			holder: 'A',
+			script: 'set_lights(false,false,false)',
+			components: []
+		});
+		expect(result.status).toBe('ok');
+		const raw = (await r.get('job:current')) as unknown;
+		const stored = typeof raw === 'string' ? JSON.parse(raw) : raw;
+		expect(Array.isArray(stored.components)).toBe(true);
+		expect(stored.components).toEqual([]);
+	});
+
+	// The payload carries script text and base64; stamping the expiry must not
+	// re-encode any of it.
+	it('leaves every other field byte-identical', async () => {
+		await acquireLock(r, { keyId: 'a', name: 'A', durationMs: 5_000, override: false });
+		const submitted = {
+			jobId: 'j',
+			keyId: 'a',
+			holder: 'A',
+			script: 'print("héllo — \\" {} [] \\\\");',
+			components: ['string'],
+			artifact: 'UkdSTgcACARRAgAAAAEK'
+		};
+		expect((await submitJob(r, 'a', submitted)).status).toBe('ok');
+		const raw = (await r.get('job:current')) as unknown;
+		const stored = typeof raw === 'string' ? JSON.parse(raw) : raw;
+		const { expiresAt: _expiresAt, ...rest } = stored;
+		expect(rest).toEqual(submitted);
+	});
 });
