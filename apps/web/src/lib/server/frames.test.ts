@@ -32,9 +32,9 @@ describe('idle frames', () => {
 		const push = buildIdleFrame(idle);
 		const hello = buildHelloFrame(null, idle, NOW);
 		if (push.t !== 'idle' || hello.t !== 'hello') throw new Error('wrong frame');
-		expect(hello.idle).toEqual({ script: push.script, rev: push.rev, ...idle });
-		expect(push.components).toEqual([]);
-		expect(push.artifact).toBe(idle.artifact);
+		const { t: _t, ...pushFields } = push;
+		expect(pushFields).toEqual(idle);
+		expect(hello.idle).toEqual(idle);
 	});
 
 	// Absent is not the same as empty: the device reads a missing declaration as
