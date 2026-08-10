@@ -228,7 +228,9 @@ the version worth actually running; see `scripts/README.md` for the measurements
 
 The script is killed when your lock expires (blocking calls wake every 10ms to check) and its last `set_lights` is applied on the way out. Runtime errors (wrong arity, unknown function) surface in the dashboard history *and* on the light itself as the fault signal below; only parse errors are caught at `POST /v1/script`.
 
-The **idle script** (admin-set, runs when nobody holds a lock) has different semantics: it runs **once per idle transition** — a one-shot script sets a state and the lamps hold it; write your own `loop { … }` for an animation. If it errors, the fault signal shows for 10s and the built-in cycle takes over.
+The **idle script** (admin-set, runs when nobody holds a lock) has different semantics: it runs **once per idle transition** — a one-shot script sets a state and the lamps hold it; write your own `loop { … }` for an animation. If it errors, the fault signal shows once and the built-in cycle takes over, and it is retried on a 30s→300s ladder rather than left broken until someone saves again.
+
+The idle script declares its components the same way a job does, from the checkboxes in the admin panel — and for the same reason, priced by the same table under "Declaring components" above. Declaring nothing reserves the whole standard library, which for a one-call idle script is ~96KB against ~140KB free: enough that it can fail to start at all. A run that could not start is not a broken script, so it does not raise the fault; it retries on a 2s→60s ladder and reports itself as `idle: builtin` on the dashboard until it fits.
 
 Idle scripts (and only idle scripts) also get `get_last_holder()`, returning `#{ name, result, ended_ms_ago }` for the most recent job (`name: ""`, `ended_ms_ago: -1` if nobody has held the light since boot):
 
