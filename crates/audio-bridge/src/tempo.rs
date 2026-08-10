@@ -180,8 +180,12 @@ impl AubioTracker {
         }
         let candidate = 60_000.0 / bpm;
         let adopted = match self.period_ms {
-            // Nothing held yet, or firm evidence: take it.
-            None => Some(candidate),
+            // Nothing held yet — but still require some evidence. aubio reports
+            // a tempo through pure silence, and adopting it latches a phantom
+            // period that the bands below then freeze: once held, only firm
+            // confidence can replace it, so a daemon started before the music
+            // would carry a made-up grid into the set.
+            None => (self.confidence >= CONF_COASTING).then_some(candidate),
             Some(_) if self.confidence >= CONF_TRACKING => Some(candidate),
             // Degraded: follow a drifting tempo, refuse a jump. During a
             // two-deck transition the alternative is oscillating between them.

@@ -31,6 +31,12 @@ const DEFAULT_PORT: u16 = 49500;
 /// error; the callbacks simply stop.
 const STREAM_STALL: Duration = Duration::from_millis(500);
 
+/// Settling time after a stream starts, before stalls are believed. CoreAudio
+/// delivers a first callback and then pauses while it finishes negotiating the
+/// buffer size, which read as a stall and produced one spurious rebuild on
+/// every startup.
+const STREAM_GRACE: Duration = Duration::from_millis(1500);
+
 /// With no samples arriving, keep the wire alive at the base cadence anyway.
 /// Silence on the wire reads as "sender died" to the light, which is a
 /// different thing from "the room is quiet".
@@ -268,6 +274,7 @@ fn run_live(args: &Args) -> Result<()> {
     let name = device.name().unwrap_or_else(|_| "<unnamed>".into());
     let mut config = capture::choose_config(&device)?;
     let mut cap = capture::start(&device, &config)?;
+    let mut stream_started = Instant::now();
     eprintln!(
         "capturing {name} at {}Hz, {} channels",
         cap.sample_rate, config.channels
@@ -314,16 +321,18 @@ fn run_live(args: &Args) -> Result<()> {
             eprintln!("clone legs are out of polarity; using the left channel only");
         }
 
-        let stalled = cap
-            .health
-            .since_last_callback()
-            .is_some_and(|d| d > STREAM_STALL);
+        let stalled = stream_started.elapsed() > STREAM_GRACE
+            && cap
+                .health
+                .since_last_callback()
+                .is_some_and(|d| d > STREAM_STALL);
         if stalled || cap.health.errored() {
             eprintln!("audio stream stopped; rebuilding");
             drop(cap);
             std::thread::sleep(Duration::from_millis(250));
             config = capture::choose_config(&device)?;
             cap = capture::start(&device, &config)?;
+            stream_started = Instant::now();
             // A rate change invalidates every filter state and the tracker's
             // whole time base, so start clean rather than reinterpreting old
             // history at a new rate.
