@@ -592,14 +592,17 @@ impl App {
                                 log::warn!("{e}; running the source instead");
                                 None
                             });
-                        self.start_job(
-                            job.id,
-                            job.holder,
-                            job.script,
-                            job.ttl_ms,
-                            job.components,
-                            artifact,
-                        )
+                        match crate::wsproto::script_or_artifact(job.script, &artifact, "job") {
+                            Ok(script) => self.start_job(
+                                job.id,
+                                job.holder,
+                                script,
+                                job.ttl_ms,
+                                job.components,
+                                artifact,
+                            ),
+                            Err(e) => log::warn!("{e}"),
+                        }
                     }
                     None => {
                         if self.running_id.is_some() {

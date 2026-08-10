@@ -135,7 +135,11 @@ pub struct JobPayload {
     pub id: String,
     #[serde(default)]
     pub holder: String,
-    pub script: String,
+    /// Absent when `artifact` is present. Required here would be worse than it
+    /// looks: this rides inside `hello`, and serde failing one field drops the
+    /// whole frame — including the idle script sharing it.
+    #[serde(default)]
+    pub script: Option<String>,
     pub ttl_ms: u64,
     #[serde(default)]
     pub components: Option<Vec<String>>,

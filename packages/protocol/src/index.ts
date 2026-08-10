@@ -231,7 +231,10 @@ export const JobMsgSchema = z.object({
   t: z.literal("job"),
   id: z.string(),
   holder: z.string().default(""),
-  script: z.string(),
+  /** Omitted when `artifact` is present. The device loads the artifact and never
+   *  reads the source, so sending both spends receive buffer — the scarcest
+   *  thing it has — on bytes it will discard. A frame with neither is refused. */
+  script: z.string().optional(),
   ttl_ms: z.number(),
   /** See `JobSchema.components`. Omitted means all of them, so a device on
    *  older firmware and a server that never sends this agree. */
@@ -245,13 +248,21 @@ export const JobMsgSchema = z.object({
  *  stored record and the pushed frame are deliberately the same shape — which is
  *  exactly why nothing server-side may live on `IdleSchema` (see `REDIS.idleMap`).
  *  Spelling them out separately let the two drift silently. */
-export const IdleMsgSchema = IdleSchema.extend({ t: z.literal("idle") });
+export const IdleMsgSchema = IdleSchema.extend({
+  t: z.literal("idle"),
+  /** See `JobMsgSchema.script`: omitted when `artifact` is present. Required in
+   *  `IdleSchema` because the stored record is what the artifact is rebuilt
+   *  from, and what the admin form edits. */
+  script: z.string().optional(),
+});
 
 export const ServerMsgSchema = z.discriminatedUnion("t", [
   z.object({
     t: z.literal("hello"),
     job: JobMsgSchema.omit({ t: true }).nullable(),
-    idle: IdleSchema.nullable(),
+    // The message shape, not the stored one — `hello` must hand a device the
+    // same frame contents the push would.
+    idle: IdleMsgSchema.omit({ t: true }).nullable(),
   }),
   JobMsgSchema,
   z.object({ t: z.literal("abort") }),

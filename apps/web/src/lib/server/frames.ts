@@ -10,6 +10,21 @@
 import type { Idle, Job, ServerMsg } from '@traffic-light/protocol';
 
 type HelloJob = Extract<ServerMsg, { t: 'hello' }>['job'];
+type HelloIdle = NonNullable<Extract<ServerMsg, { t: 'hello' }>['idle']>;
+
+/**
+ * The source, unless there is a lowered form that makes it dead weight.
+ *
+ * The device loads the artifact and never reads the source, so a frame carrying
+ * both spends receive buffer — the scarcest thing it has, and what a reboot loop
+ * was once traced to — on bytes it discards. Sending neither is not an option:
+ * the device refuses that frame rather than guess.
+ */
+function sourceUnlessLowered<T extends { script: string; artifact?: string }>(
+	record: T
+): { script?: string } {
+	return record.artifact ? {} : { script: record.script };
+}
 
 /**
  * The device's view of a job, field by field so server-only fields (`map`,
@@ -24,7 +39,7 @@ export function jobFrameFields(job: Job, now: number): HelloJob {
 	return {
 		id: job.jobId,
 		holder: job.holder ?? '',
-		script: job.script,
+		...sourceUnlessLowered(job),
 		ttl_ms,
 		// Without these a device that reconnects mid-job is handed the script with
 		// no declaration, so it rebuilds the whole standard library and can no
@@ -40,18 +55,25 @@ export function buildJobFrame(job: Job, now: number): ServerMsg | null {
 }
 
 /**
- * Spread rather than respelled: `IdleSchema` *is* the wire shape, so a field
- * added to the stored record reaches the device without a second edit here.
- * That is also why nothing server-side may be stored on it.
+ * The stored record minus its source when that is redundant.
+ *
+ * Every other field is carried by spread rather than respelled: `IdleSchema` is
+ * the wire shape, so a field added to the record reaches the device without a
+ * second edit here — which is also why nothing server-side may be stored on it.
  */
+export function idleFrameFields(idle: Idle): HelloIdle {
+	const { script: _script, ...rest } = idle;
+	return { ...rest, ...sourceUnlessLowered(idle) };
+}
+
 export function buildIdleFrame(idle: Idle): ServerMsg {
-	return { t: 'idle', ...idle };
+	return { t: 'idle', ...idleFrameFields(idle) };
 }
 
 export function buildHelloFrame(job: Job | null, idle: Idle | null, now: number): ServerMsg {
 	return {
 		t: 'hello',
 		job: job === null ? null : jobFrameFields(job, now),
-		idle
+		idle: idle === null ? null : idleFrameFields(idle)
 	};
 }

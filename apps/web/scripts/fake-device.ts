@@ -51,14 +51,19 @@ function finishJob(result: 'ok' | 'error' | 'aborted' | 'deadline', error?: stri
 	log(`job ${id} finished: ${result}`);
 }
 
-function startJob(job: { id: string; script: string; ttl_ms: number }) {
+function startJob(job: { id: string; script?: string; artifact?: string; ttl_ms: number }) {
 	if (running === job.id) return; // dedupe — two instances may forward the same event
 	if (running !== 'idle') finishJob('aborted');
 	running = job.id;
 	lights = { r: true, y: false, g: false };
 	jobTimer = setTimeout(() => finishJob('deadline'), job.ttl_ms);
 	sendState();
-	log(`started job ${job.id} (ttl ${job.ttl_ms}ms), script: ${JSON.stringify(job.script)}`);
+	// The source is omitted once there is an artifact, and this harness cannot run
+	// either — so report which arrived rather than printing `undefined`.
+	const body = job.script
+		? `script: ${JSON.stringify(job.script)}`
+		: `artifact: ${job.artifact?.length ?? 0} wire bytes`;
+	log(`started job ${job.id} (ttl ${job.ttl_ms}ms), ${body}`);
 }
 
 function connect() {

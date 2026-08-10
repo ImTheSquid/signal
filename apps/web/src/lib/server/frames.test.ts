@@ -33,8 +33,26 @@ describe('idle frames', () => {
 		const hello = buildHelloFrame(null, idle, NOW);
 		if (push.t !== 'idle' || hello.t !== 'hello') throw new Error('wrong frame');
 		const { t: _t, ...pushFields } = push;
-		expect(pushFields).toEqual(idle);
-		expect(hello.idle).toEqual(idle);
+		expect(pushFields).toEqual(hello.idle);
+		expect(pushFields).toMatchObject({ rev: idle.rev, components: [], artifact: idle.artifact });
+	});
+
+	// The device loads the artifact and never reads the source, so carrying both
+	// spends receive buffer on bytes it discards.
+	it('drop the source once there is an artifact to run', () => {
+		const push = buildIdleFrame(idle);
+		const hello = buildHelloFrame(null, idle, NOW);
+		if (push.t !== 'idle' || hello.t !== 'hello') throw new Error('wrong frame');
+		expect('script' in push).toBe(false);
+		expect(hello.idle && 'script' in hello.idle).toBe(false);
+	});
+
+	// Nothing to run otherwise: the device refuses a frame with neither.
+	it('keep the source when nothing lowered it', () => {
+		const { artifact: _artifact, ...unlowered } = idle;
+		const push = buildIdleFrame(unlowered);
+		if (push.t !== 'idle') throw new Error('wrong frame');
+		expect(push.script).toBe(idle.script);
 	});
 
 	// Absent is not the same as empty: the device reads a missing declaration as
@@ -57,6 +75,17 @@ describe('job frames', () => {
 		expect(hello.job).toEqual(pushFields);
 		expect(pushFields.components).toEqual(['math']);
 		expect(pushFields.artifact).toBe(job.artifact);
+	});
+
+	it('drop the source once there is an artifact, and keep it otherwise', () => {
+		const lowered = buildJobFrame(job, NOW);
+		if (lowered?.t !== 'job') throw new Error('wrong frame');
+		expect('script' in lowered).toBe(false);
+
+		const { artifact: _artifact, ...unlowered } = job;
+		const plain = buildJobFrame(unlowered, NOW);
+		if (plain?.t !== 'job') throw new Error('wrong frame');
+		expect(plain.script).toBe(job.script);
 	});
 
 	// `map` and `positions` exist to translate a device-reported error back to the
