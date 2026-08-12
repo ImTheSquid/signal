@@ -26,6 +26,15 @@ use crate::tempo::HOP;
 /// sender, so whichever is numerically ahead starves the other.
 const DEFAULT_PORT: u16 = 49500;
 
+/// Same default as `dmx-bridge/cfg.toml`. The light binds `0.0.0.0:49500` and
+/// accepts whatever arrives, so nothing needs to know its address — which is
+/// the point, since it takes a DHCP lease and has no fixed one.
+///
+/// Limited broadcast leaves by the default route only. On a machine with both
+/// wifi and ethernet up, name the subnet broadcast (`192.168.1.255`) or the
+/// light itself to choose the interface.
+const DEFAULT_HOST: &str = "255.255.255.255";
+
 /// How long the loop tolerates no callbacks before rebuilding the stream.
 /// CoreAudio often does not report a device-side sample-rate change as an
 /// error; the callbacks simply stop.
@@ -47,9 +56,12 @@ const SYNTH_RATE: u32 = 48_000;
 const SYNTH_SECONDS: f32 = 600.0;
 
 struct Args {
-    host: Option<String>,
+    host: String,
     port: u16,
     device: Option<String>,
+    /// Offline replays to the light only when a host was named explicitly;
+    /// analysing a file should not start driving lamps by surprise.
+    host_given: bool,
     wav: Option<String>,
     synth_bpm: Option<f32>,
     offset_ms: f32,
@@ -86,12 +98,15 @@ fn print_usage() {
 \n\
 USAGE:\n  \
   audio-bridge --list-devices\n  \
-  audio-bridge --host HOST [OPTIONS]          capture live and send to the light\n  \
+  audio-bridge [OPTIONS]                      capture live and drive the light\n  \
   audio-bridge --wav FILE [OPTIONS]           analyse a file instead of a device\n  \
   audio-bridge --synth BPM [OPTIONS]          drive from a perfect metronome\n\
 \n\
 OPTIONS:\n  \
-  --host HOST        where the light listens\n  \
+  --host HOST        default {DEFAULT_HOST}; the light binds 0.0.0.0 and takes\n                     \
+                     whatever arrives, so its own address is never needed.\n                     \
+                     Name a subnet broadcast or the light to pick an interface.\n                     \
+                     With --wav or --synth, giving this also replays to it.\n  \
   --port N           default {DEFAULT_PORT}\n  \
   --device NAME      exact input name; defaults to the first starting \"BlackHole\"\n  \
   --offset MS        shift the reported beat, negative fires early (default 0)\n  \
@@ -105,7 +120,8 @@ against it to find the lamp lead.\n"
 
 fn parse_args(argv: &[String]) -> Result<Args> {
     let mut args = Args {
-        host: None,
+        host: DEFAULT_HOST.to_string(),
+        host_given: false,
         port: DEFAULT_PORT,
         device: None,
         wav: None,
@@ -122,7 +138,10 @@ fn parse_args(argv: &[String]) -> Result<Args> {
                 .with_context(|| format!("{} needs a value", argv[*i - 1]))
         };
         match argv[i].as_str() {
-            "--host" => args.host = Some(take(&mut i)?),
+            "--host" => {
+                args.host = take(&mut i)?;
+                args.host_given = true;
+            }
             "--port" => args.port = take(&mut i)?.parse().context("--port must be a number")?,
             "--device" => args.device = Some(take(&mut i)?),
             "--wav" => args.wav = Some(take(&mut i)?),
@@ -136,9 +155,6 @@ fn parse_args(argv: &[String]) -> Result<Args> {
             other => bail!("unknown argument: {other}"),
         }
         i += 1;
-    }
-    if args.host.is_none() && args.wav.is_none() && args.synth_bpm.is_none() {
-        bail!("need --host (live), --wav, or --synth; see --help");
     }
     Ok(args)
 }
@@ -203,13 +219,13 @@ fn probe_row(t: f64, r: &HopResult, flags: u8) {
 /// light sees the same cadence it would at a gig.
 fn run_offline(label: &str, samples: Vec<f32>, sample_rate: u32, args: &Args) -> Result<()> {
     let mut analyzer = Analyzer::new(sample_rate)?;
-    let mut sender = match &args.host {
-        Some(host) => {
-            let s = wire::Sender::new(host, args.port)?;
+    let mut sender = match args.host_given {
+        true => {
+            let s = wire::Sender::new(&args.host, args.port)?;
             eprintln!("replaying {label} to {} in real time", s.dest());
             Some(s)
         }
-        None => None,
+        false => None,
     };
 
     if args.probe {
@@ -266,8 +282,7 @@ fn run_offline(label: &str, samples: Vec<f32>, sample_rate: u32, args: &Args) ->
 }
 
 fn run_live(args: &Args) -> Result<()> {
-    let host = args.host.as_deref().expect("checked in parse_args");
-    let mut sender = wire::Sender::new(host, args.port)?;
+    let mut sender = wire::Sender::new(&args.host, args.port)?;
     eprintln!("sending to {}", sender.dest());
 
     let device = capture::pick_input(args.device.as_deref())?;
