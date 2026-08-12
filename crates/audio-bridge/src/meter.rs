@@ -34,7 +34,20 @@ const RELEASE_DB_PER_S: f32 = 20.0;
 /// Silence tolerated before the display starts suggesting why.
 const HINT_AFTER: Duration = Duration::from_secs(3);
 
+/// Widest the bar is ever drawn; it shrinks to whatever the pane leaves.
 const METER_WIDTH: usize = 24;
+
+/// Assumed width when there is no terminal to ask.
+const ASSUMED_WIDTH: usize = 80;
+
+/// Everything on the line that is not the bar, measured in columns. Recomputing
+/// this from the format string would be neater and also wrong the moment the
+/// format changes without it; it is asserted in the tests instead.
+const FIXED_COLUMNS: usize = 57;
+
+/// The bar's own brackets and trailing space, on top of its width.
+const BAR_CHROME: usize = 3;
+
 const FLOOR_DB: f32 = -60.0;
 
 const BLOCKS: [char; 9] = ['·', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
@@ -52,6 +65,23 @@ pub struct Meter {
     beat_at: Option<Instant>,
     audio_since: Option<Instant>,
     dirty: bool,
+    hinted: bool,
+}
+
+/// Columns available on stderr, if it is a terminal.
+fn terminal_width() -> Option<usize> {
+    if !std::io::stderr().is_terminal() {
+        return None;
+    }
+    // SAFETY: TIOCGWINSZ fills a winsize we own; a failed call leaves it zeroed
+    // and is reported by the return value.
+    unsafe {
+        let mut size: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(libc::STDERR_FILENO, libc::TIOCGWINSZ, &mut size) != 0 {
+            return None;
+        }
+        (size.ws_col > 0).then_some(size.ws_col as usize)
+    }
 }
 
 impl Meter {
@@ -68,6 +98,7 @@ impl Meter {
             beat_at: None,
             audio_since: None,
             dirty: false,
+            hinted: false,
         }
     }
 
@@ -122,7 +153,17 @@ impl Meter {
         }
         self.last_draw = now;
 
-        let line = self.render(grid, present, now);
+        // Said once, on its own line. It is far too long to live in something
+        // that redraws, and repeating it adds nothing.
+        if !self.hinted && !present && self.quiet_for(now) > HINT_AFTER {
+            self.hinted = true;
+            self.note("no audio yet — is anything routed into BlackHole? A Multi-Output Device is the usual fix.");
+        }
+        if present {
+            self.hinted = false;
+        }
+
+        let line = self.render(grid, present, now, terminal_width().unwrap_or(ASSUMED_WIDTH));
         let mut err = std::io::stderr().lock();
         if self.tty {
             let _ = write!(err, "\r\x1b[2K{line}");
@@ -135,18 +176,22 @@ impl Meter {
 
     /// Reads only the ballistic state, never the raw levels: the instant a hop
     /// happens to be drawn on is almost never representative.
-    fn render(&self, grid: &Grid, present: bool, now: Instant) -> String {
+    fn render(&self, grid: &Grid, present: bool, now: Instant, width: usize) -> String {
         let db = self.display_db;
         let peak_db = to_db(self.peak);
 
-        let bar = if self.tty {
-            format!(
-                "{}{}\x1b[0m",
-                zone_colour(db),
-                bar(db_fraction(db), METER_WIDTH)
-            )
-        } else {
-            bar(db_fraction(db), METER_WIDTH)
+        // Fit the bar to whatever the pane leaves, and drop it entirely rather
+        // than overrun: a wrapped line cannot be redrawn in place, so every
+        // update would scroll instead of replacing.
+        // One column spare: writing the final cell makes many terminals wrap,
+        // which is the failure this is all guarding against.
+        let bar_width = width
+            .saturating_sub(1 + FIXED_COLUMNS + BAR_CHROME)
+            .min(METER_WIDTH);
+        let bar = match bar_width {
+            0 => String::new(),
+            n if self.tty => format!("▐{}{}\x1b[0m▐ ", zone_colour(db), bar(db_fraction(db), n)),
+            n => format!("▐{}▐ ", bar(db_fraction(db), n)),
         };
 
         let tempo = match grid.period_ms {
@@ -163,40 +208,42 @@ impl Meter {
             (false, _) => " ",
         };
 
-        format!(
-            "▐{bar}▐ {:>6} pk {:>6}  L{} M{} H{}  {tempo} c{:.2} {beat} {}",
+        let line = format!(
+            "{bar}{:>7} pk {:>7}  L{} M{} H{} {tempo} c{:.2} {beat} {:<9}",
             fmt_db(db),
             fmt_db(peak_db),
             BLOCKS[level_index(self.bands[0])],
             BLOCKS[level_index(self.bands[1])],
             BLOCKS[level_index(self.bands[2])],
             grid.confidence,
-            self.state(grid, present, now),
-        )
+            self.state(grid, present),
+        );
+
+        // In a pane too narrow even for the fixed part, cut it. Safe only
+        // because a pane that narrow drew no bar, and the bar is the only
+        // place an escape sequence appears — slicing one of those in half
+        // would leave the terminal wearing the colour.
+        if bar_width == 0 && line.chars().count() > width {
+            return line.chars().take(width).collect();
+        }
+        line
     }
 
-    fn state(&self, grid: &Grid, present: bool, now: Instant) -> String {
-        if !present {
-            let quiet_for = self
-                .audio_since
-                .map(|at| now.duration_since(at))
-                .unwrap_or_else(|| now.duration_since(self.started));
-            // The failure this exists to catch: BlackHole selected, nothing
-            // routed into it. Silent capture and broken capture look identical
-            // otherwise, and the fix is never in this program.
-            return if quiet_for > HINT_AFTER {
-                "no audio — is anything routed into BlackHole?".into()
-            } else {
-                "no audio".into()
-            };
+    fn quiet_for(&self, now: Instant) -> Duration {
+        self.audio_since
+            .map(|at| now.duration_since(at))
+            .unwrap_or_else(|| now.duration_since(self.started))
+    }
+
+    /// Padded to a fixed width so a shorter word cannot leave the tail of a
+    /// longer one behind on the line.
+    fn state(&self, grid: &Grid, present: bool) -> &'static str {
+        match (present, grid.tracking, grid.coasting) {
+            (false, ..) => "no audio",
+            (_, true, _) => "tracking",
+            (_, _, true) => "coasting",
+            _ => "listening",
         }
-        if grid.tracking {
-            return "tracking".into();
-        }
-        if grid.coasting {
-            return "coasting".into();
-        }
-        "listening".into()
     }
 
     /// Leave the cursor somewhere sane on the way out.
@@ -271,6 +318,53 @@ mod tests {
         assert_eq!(db_fraction(to_db(1.0)), 1.0);
         assert!(bar(1.0, 4).chars().all(|c| c == '█'));
         assert!(bar(0.0, 4).chars().all(|c| c == '░'));
+    }
+
+    fn plain_meter() -> Meter {
+        let mut m = Meter::new();
+        // Force the no-ANSI path so a rendered line can be counted directly.
+        m.tty = false;
+        m
+    }
+
+    /// A line wider than the pane wraps, and a wrapped line cannot be redrawn
+    /// in place — `\r` and erase-line reach only the last physical row, so
+    /// every update scrolls a fresh copy instead of replacing the old one.
+    /// That turns the status line into an unbounded flood, which is exactly
+    /// what this guards.
+    #[test]
+    fn the_line_never_exceeds_the_terminal() {
+        let m = plain_meter();
+        let grid = Grid {
+            period_ms: Some(468.75),
+            confidence: 1.0,
+            tracking: true,
+            ..Grid::default()
+        };
+        for width in [20, 40, 58, 60, 72, 80, 100, 200] {
+            let line = m.render(&grid, true, Instant::now(), width);
+            assert!(
+                line.chars().count() <= width,
+                "at width {width} the line is {} chars: {line:?}",
+                line.chars().count()
+            );
+        }
+    }
+
+    /// `FIXED_COLUMNS` is the cost of everything but the bar, and it is written
+    /// down rather than derived — so it has to be checked, or it silently rots
+    /// the next time the format changes and the flood comes back.
+    #[test]
+    fn the_fixed_cost_matches_what_the_format_actually_spends() {
+        let m = plain_meter();
+        // Wide enough not to be truncated, narrow enough to draw no bar.
+        let line = m.render(&Grid::default(), false, Instant::now(), FIXED_COLUMNS);
+        assert_eq!(
+            line.chars().count(),
+            FIXED_COLUMNS,
+            "FIXED_COLUMNS says {FIXED_COLUMNS}, format spends {}: {line:?}",
+            line.chars().count()
+        );
     }
 
     /// The meter has to distinguish quiet-but-present from absent, since that

@@ -23,3 +23,7 @@ rtrb = "0.3"
 # WAV reading for the offline path, which is how the tracker gets tuned and
 # tested without a live device.
 hound = "3.5"
+# Only for the terminal width. A status line that overruns the pane wraps, and
+# then the in-place redraw clears one physical row of several and the rest
+# scrolls away forever.
+libc = "0.2"

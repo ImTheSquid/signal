@@ -47,6 +47,7 @@ dependencies = [
  "bliss-audio-aubio-rs",
  "cpal",
  "hound",
+ "libc",
  "rtrb",
 ]
 
