@@ -6,9 +6,9 @@
 # the light for a whole set means re-acquiring and resubmitting on a cycle, which
 # is what this loop does. Ctrl-C releases the lock so nobody is left blocked.
 #
-#   scripts/run-follow.sh                      # runs scripts/follow.rhai
-#   scripts/run-follow.sh scripts/other.rhai
-#   COMPONENTS=array scripts/run-follow.sh scripts/pulse.rhai
+#   scripts/run-script.sh                      # runs scripts/follow.rhai
+#   scripts/run-script.sh scripts/other.rhai
+#   COMPONENTS=array scripts/run-script.sh scripts/pulse.rhai
 #
 # Token, first match wins:
 #   $TRAFFIC_LIGHT_TOKEN

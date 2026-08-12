@@ -2,16 +2,16 @@
 
 Helpers that aren't part of a build.
 
-## `run-follow.sh`
+## `run-script.sh`
 
 Runs a script on the light for as long as you leave it running. Use this rather than a one-off
 `curl`:
 
 ```sh
-scripts/run-follow.sh                      # runs follow.rhai until Ctrl-C
-scripts/run-follow.sh scripts/other.rhai
-LOCK_S=120 scripts/run-follow.sh           # shorter cycle
-COMPONENTS=array scripts/run-follow.sh scripts/pulse.rhai
+scripts/run-script.sh                      # runs follow.rhai until Ctrl-C
+scripts/run-script.sh scripts/other.rhai
+LOCK_S=120 scripts/run-script.sh           # shorter cycle
+COMPONENTS=array scripts/run-script.sh scripts/pulse.rhai
 ```
 
 `COMPONENTS` is the rhai standard-library surface the script is given, default `array,math`.
@@ -48,7 +48,7 @@ firmware change, so tune it freely.
 transient on a device that reboots on a failed allocation, and the explanation is more useful
 here than inline; the design rationale below is the comment block that used to be at the top.
 
-`run-follow.sh` is the easy way to run it; by hand it is:
+`run-script.sh` is the easy way to run it; by hand it is:
 
 ```sh
 BASE=https://signal.jackhogan.me
@@ -329,7 +329,7 @@ Re-run `cargo test -p script-env --test pulse` after any change.
 ## `dmxcap.mjs` and `watch.mjs`
 
 The two ends of the DMX path, recorded so they can be compared. Run both through a set, alongside
-`run-follow.sh`:
+`run-script.sh`:
 
 ```sh
 node scripts/dmxcap.mjs dmx.txt      # what the light was told  (udp/49500)
