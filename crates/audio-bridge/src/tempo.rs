@@ -423,6 +423,60 @@ mod tests {
         );
     }
 
+    /// A DJ set is one tempo change after another, so how fast the reported
+    /// tempo arrives after the music changes is a headline number.
+    ///
+    /// Measured on a hard cut from 128 to 100: **12.9 seconds**, and all of it
+    /// is aubio's. Its `get_bpm` holds the old value for that long, then jumps
+    /// straight to the new one; the fit and the confidence bands here follow it
+    /// within a second. Two things were tried and abandoned:
+    ///
+    /// - Scoring detections against the predicted grid, to notice the grid had
+    ///   failed before aubio did. aubio stops emitting beats while it is
+    ///   confused rather than emitting wrong ones — there were no detections at
+    ///   all across the 4 seconds spanning the change — so there is nothing to
+    ///   score. Detections are sparse enough (one beat in five) that a wrong
+    ///   period usually lands near *some* beat of the wrong grid anyway.
+    /// - Shortening the fit window. The lag is not in the fit.
+    ///
+    /// Beating this means replacing the estimator, which is what the `Tracker`
+    /// trait is for. Worth measuring on real music first: a click train gives a
+    /// beat tracker nothing to work with, no strong/weak pattern and no
+    /// harmonic change, so this is close to a worst case.
+    #[test]
+    fn follows_a_tempo_change() {
+        let mut signal = click_train(128.0, 40.0);
+        signal.extend(click_train(100.0, 60.0));
+
+        let mut tracker = AubioTracker::new(FS).unwrap();
+        let mut bands = Bands::new(FS, HOP);
+        let mut settled_at = None;
+        for (i, hop) in signal.chunks_exact(HOP).enumerate() {
+            for &s in hop {
+                bands.push(s);
+            }
+            let levels = bands.sample();
+            tracker.push(hop, &levels).unwrap();
+
+            let t = (i * HOP) as f32 / FS as f32;
+            let on_new_tempo = tracker
+                .grid()
+                .period_ms
+                .is_some_and(|p| (60_000.0 / p - 100.0).abs() < 2.0);
+            if t > 40.0 && on_new_tempo && settled_at.is_none() {
+                settled_at = Some(t - 40.0);
+            }
+        }
+
+        let settled = settled_at.expect("never reached the new tempo");
+        println!("followed a 128 -> 100 cut in {settled:.1}s");
+        assert!(
+            settled < 20.0,
+            "took {settled:.1}s to follow a tempo change; \
+             12.9s is the figure this was measured at"
+        );
+    }
+
     #[test]
     fn silence_does_not_hold_confidence_up() {
         let mut signal = click_train(128.0, 20.0);
