@@ -88,7 +88,10 @@ pub fn to_beat(result: &HopResult, hop: &[f32], offset_ms: f32) -> Beat {
     Beat {
         grid,
         levels: result.levels,
-        audio_present: result.levels.raw_energy > PRESENCE_FLOOR,
+        // The decaying peak, not the instantaneous envelope: a kick pattern is
+        // silence between hits, and testing the instant would report "no audio"
+        // to the light on every offbeat.
+        audio_present: result.levels.raw_peak > PRESENCE_FLOOR,
         clipping: hop.iter().any(|s| s.abs() >= CLIP_THRESHOLD),
     }
 }

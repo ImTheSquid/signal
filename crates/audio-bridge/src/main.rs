@@ -10,6 +10,7 @@
 mod analysis;
 mod bands;
 mod capture;
+mod meter;
 mod tempo;
 mod wire;
 
@@ -70,7 +71,7 @@ struct Args {
 
 fn main() -> Result<()> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    if argv.is_empty() || argv.iter().any(|a| a == "--help" || a == "-h") {
+    if argv.iter().any(|a| a == "--help" || a == "-h") {
         print_usage();
         return Ok(());
     }
@@ -232,6 +233,10 @@ fn run_offline(label: &str, samples: Vec<f32>, sample_rate: u32, args: &Args) ->
         probe_header();
     }
 
+    // Only when paced to real time. Running a file at full speed would redraw
+    // hundreds of times a second and show nothing legible.
+    let mut meter = sender.is_some().then(meter::Meter::new);
+
     let started = Instant::now();
     let mut confidence_sum = 0.0f64;
     let mut tracking_hops = 0u64;
@@ -250,6 +255,9 @@ fn run_offline(label: &str, samples: Vec<f32>, sample_rate: u32, args: &Args) ->
             }
             let beat = to_beat(&result, hop, args.offset_ms);
             sender.maybe_send(&beat, result.beat, Instant::now())?;
+            if let Some(meter) = &mut meter {
+                meter.update(&result.levels, &result.grid, result.beat, beat.audio_present);
+            }
         }
 
         if args.probe {
@@ -262,6 +270,9 @@ fn run_offline(label: &str, samples: Vec<f32>, sample_rate: u32, args: &Args) ->
         hops += 1;
     }
 
+    if let Some(meter) = &mut meter {
+        meter.finish();
+    }
     if hops == 0 {
         bail!("{label} is shorter than one {HOP}-sample hop");
     }
@@ -282,6 +293,15 @@ fn run_offline(label: &str, samples: Vec<f32>, sample_rate: u32, args: &Args) ->
 }
 
 fn run_live(args: &Args) -> Result<()> {
+    let mut meter = meter::Meter::new();
+    let outcome = capture_loop(args, &mut meter);
+    // The loop only ends by failing, which is precisely when a half-drawn
+    // status line would swallow the reason.
+    meter.finish();
+    outcome
+}
+
+fn capture_loop(args: &Args, meter: &mut meter::Meter) -> Result<()> {
     let mut sender = wire::Sender::new(&args.host, args.port)?;
     eprintln!("sending to {}", sender.dest());
 
@@ -303,7 +323,6 @@ fn run_live(args: &Args) -> Result<()> {
     let mut hop = vec![0.0f32; HOP];
     let mut last_result: Option<HopResult> = None;
     let mut last_activity = Instant::now();
-    let mut warned_silent = false;
 
     loop {
         // Drain whatever has arrived, in whole hops.
@@ -317,6 +336,7 @@ fn run_live(args: &Args) -> Result<()> {
             if args.probe {
                 probe_row(analyzer.elapsed_s(), &result, wire::encode_block(&beat)[1]);
             }
+            meter.update(&result.levels, &result.grid, result.beat, beat.audio_present);
             last_result = Some(result);
             last_activity = Instant::now();
         }
@@ -333,7 +353,7 @@ fn run_live(args: &Args) -> Result<()> {
         }
 
         if cap.health.split_legs() {
-            eprintln!("clone legs are out of polarity; using the left channel only");
+            meter.note("clone legs are out of polarity; using the left channel only");
         }
 
         let stalled = stream_started.elapsed() > STREAM_GRACE
@@ -342,7 +362,7 @@ fn run_live(args: &Args) -> Result<()> {
                 .since_last_callback()
                 .is_some_and(|d| d > STREAM_STALL);
         if stalled || cap.health.errored() {
-            eprintln!("audio stream stopped; rebuilding");
+            meter.note("audio stream stopped; rebuilding");
             drop(cap);
             std::thread::sleep(Duration::from_millis(250));
             config = capture::choose_config(&device)?;
@@ -352,28 +372,14 @@ fn run_live(args: &Args) -> Result<()> {
             // whole time base, so start clean rather than reinterpreting old
             // history at a new rate.
             if cap.sample_rate != analyzer.sample_rate() {
-                eprintln!(
+                meter.note(&format!(
                     "sample rate changed {} -> {}; resetting the tracker",
                     analyzer.sample_rate(),
                     cap.sample_rate
-                );
+                ));
                 analyzer = Analyzer::new(cap.sample_rate)?;
             }
             last_activity = Instant::now();
-        }
-
-        if let Some(result) = &last_result {
-            let silent = !result.levels.raw_energy.is_normal();
-            if silent && !warned_silent && last_activity.elapsed() > Duration::from_secs(5) {
-                eprintln!(
-                    "5s of silence from {name} — is the DJ software actually \
-                     outputting to it? A Multi-Output Device keeps that one \
-                     setting rather than two."
-                );
-                warned_silent = true;
-            } else if !silent {
-                warned_silent = false;
-            }
         }
 
         std::thread::sleep(Duration::from_millis(2));

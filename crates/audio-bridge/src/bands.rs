@@ -49,6 +49,15 @@ const BUILD_SLOW_S: f32 = 4.0;
 const FLUX_FAST_S: f32 = 0.03;
 const FLUX_SLOW_S: f32 = 0.20;
 
+/// Decay of the presence peak.
+///
+/// "Is there audio" cannot be asked of the instantaneous envelope: a kick
+/// pattern is silence between hits, so an instantaneous test flickers between
+/// present and absent at the tempo of the music. Long enough to bridge a gap at
+/// the slowest tempo worth following, short enough that a real stop is noticed
+/// within a beat or two.
+const PRESENCE_HALF_LIFE_S: f32 = 1.0;
+
 /// Section Qs for a 6th-order Butterworth, `1 / (2 cos((2k+1)pi/12))`.
 ///
 /// Three sections rather than one because 60Hz sits only 1.4 octaves below the
@@ -267,6 +276,9 @@ pub struct Levels {
     pub raw_mid: f32,
     pub raw_high: f32,
     pub raw_energy: f32,
+    /// Decaying peak of `raw_energy`. This is what answers "is anything
+    /// playing" — the instantaneous value is zero between drum hits.
+    pub raw_peak: f32,
     /// Low band sustained far below its own long-run reference. A DJ killing
     /// the bass is one of the most reliable build cues in a set, so this ships
     /// to the script as information rather than being treated as damage.
@@ -291,6 +303,8 @@ pub struct Bands {
     build_slow: Ema,
     flux_fast: Ema,
     flux_slow: Ema,
+    presence_peak: f32,
+    presence_decay: f32,
 }
 
 impl Bands {
@@ -310,6 +324,8 @@ impl Bands {
             build_slow: Ema::new(hop_s, BUILD_SLOW_S),
             flux_fast: Ema::new(hop_s, FLUX_FAST_S),
             flux_slow: Ema::new(hop_s, FLUX_SLOW_S),
+            presence_peak: 0.0,
+            presence_decay: 0.5f32.powf(hop_s / PRESENCE_HALF_LIFE_S),
         }
     }
 
@@ -326,6 +342,7 @@ impl Bands {
     pub fn sample(&mut self) -> Levels {
         let (raw_low, raw_mid, raw_high) = (self.low.level(), self.mid.level(), self.high.level());
         let raw_energy = self.broadband.value;
+        self.presence_peak = (self.presence_peak * self.presence_decay).max(raw_energy);
 
         // Broadband first: it sets the floor the per-band references cannot
         // sink below.
@@ -370,6 +387,7 @@ impl Bands {
             raw_mid,
             raw_high,
             raw_energy,
+            raw_peak: self.presence_peak,
             bass_muted: self.bass_muted_hops >= self.bass_muted_hold,
             build,
             flux,
