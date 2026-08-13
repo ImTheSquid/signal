@@ -53,9 +53,29 @@ and hence `run.sh` printing the links it actually got.
 ## What will stop it
 
 **Sleep.** An idle Deck suspends — measured at 8 minutes, `PM: suspend entry (deep)` — and a
-suspended Deck is a light that dies mid-set. The daemon holds `systemd-inhibit
---what=idle:sleep` for as long as it runs, which covers the idle timer but not the lid or the
-power button. Nothing holds it while the daemon is *not* running.
+suspended Deck is a light that dies mid-set. Three things stand against it, in order of how
+much they cover:
+
+```sh
+cp deck/keep-awake.service ~/.config/systemd/user/
+systemctl --user enable --now keep-awake      # no root, survives reboot
+```
+
+That holds an idle inhibitor permanently, covering the gaps the daemon cannot: soundcheck, a
+stopped daemon, the walk between sets. The daemon holds one of its own while it runs, and
+Audacity holds one while it plays or records — worth confirming with `systemd-inhibit --list`,
+since it only helps while a stream is actually active.
+
+None of them covers the lid or the power button; an inhibitor blocks the idle timer, not a
+deliberate suspend. `systemctl --user disable --now keep-awake` is the whole of undoing it.
+
+**WiFi power save**, which is on by default, but read the numbers before caring: measured
+outbound — the only direction the light uses — 750/750 packets, 0% loss, p50 gap 19.7ms against
+20ms nominal. Inbound was 12% loss with 780ms spikes, which costs ssh and nothing else. If you
+want it off anyway, `deck/sudoers.audio-bridge` installs a digest-pinned NOPASSWD entry for
+`deck/wifi-powersave-off.sh` and `launch.sh` then uses it automatically; without that file
+nothing asks for a password. `nmcli` cannot do it from an ssh session — there is no polkit agent
+to authenticate against — but KDE's network settings can, from the Deck's own screen.
 
 **Logout.** SteamOS sets logind's `KillUserProcesses=True`, so a backgrounded process or a tmux
 server dies with the ssh session that started it. That is why the daemon is a transient user

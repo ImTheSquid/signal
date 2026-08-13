@@ -44,6 +44,14 @@ if [[ -z $node ]]; then
 fi
 echo "capturing from $node" >&2
 
+# Power save costs the inbound path far more than the outbound one the light
+# actually uses, so this is optional and stays quiet when it is not set up: with
+# the sudoers entry installed it needs no password, and without it nothing here
+# asks for one. See sudoers.audio-bridge.
+if [[ -f /etc/sudoers.d/audio-bridge ]]; then
+    sudo -n "$here/wifi-powersave-off.sh" >&2 || echo "wifi power save left alone" >&2
+fi
+
 # The `scarlett` PCM in deck/asound.conf reads AUDIO_BRIDGE_NODE at open, and is
 # what stops capture following the system default source — which moves the moment
 # anything else audio-shaped is plugged in. By name rather than id, so it still
