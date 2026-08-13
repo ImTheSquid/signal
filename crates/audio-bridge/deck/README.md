@@ -53,21 +53,17 @@ and hence `run.sh` printing the links it actually got.
 ## What will stop it
 
 **Sleep.** An idle Deck suspends — measured at 8 minutes, `PM: suspend entry (deep)` — and a
-suspended Deck is a light that dies mid-set. Three things stand against it, in order of how
-much they cover:
+suspended Deck is a light that dies mid-set. `launch.sh` runs the daemon under `systemd-inhibit
+--what=idle:sleep`, so the lock exists for exactly as long as the daemon does and the Deck is
+free to sleep and save its battery the rest of the time.
 
-```sh
-cp deck/keep-awake.service ~/.config/systemd/user/
-systemctl --user enable --now keep-awake      # no root, survives reboot
-```
+Nothing holds it while the daemon is stopped, which is deliberate: this is a battery-powered
+machine that spends most of its life not driving a light. Audacity holds an inhibitor of its own
+while it plays or records — worth confirming with `systemd-inhibit --list`, since it covers a
+running stream and not the hour before one.
 
-That holds an idle inhibitor permanently, covering the gaps the daemon cannot: soundcheck, a
-stopped daemon, the walk between sets. The daemon holds one of its own while it runs, and
-Audacity holds one while it plays or records — worth confirming with `systemd-inhibit --list`,
-since it only helps while a stream is actually active.
-
-None of them covers the lid or the power button; an inhibitor blocks the idle timer, not a
-deliberate suspend. `systemctl --user disable --now keep-awake` is the whole of undoing it.
+No inhibitor covers the lid or the power button. They block the idle timer, not a deliberate
+suspend.
 
 **WiFi power save**, which is on by default, but read the numbers before caring: measured
 outbound — the only direction the light uses — 750/750 packets, 0% loss, p50 gap 19.7ms against
