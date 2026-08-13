@@ -258,12 +258,13 @@ from measurements, so a regression in density or dwell shows up immediately.
 ## `pulse.rhai`
 
 What the light runs when the signal comes from audio rather than DMX, driven by
-**crates/audio-bridge** reading a BlackHole clone of the deck's master output.
+**crates/audio-bridge** reading the master output — a BlackHole clone of it on macOS, or a
+Scarlett capturing it on the Steam Deck (`crates/audio-bridge/deck/`).
 
 DMX carries no beat information, so `follow.rhai` has to reconstruct tempo from three colour
 channels at ~5.7 usable frames/sec, and manages 0.364 on-grid concentration. With audio the
-estimator moves to the Mac, where there is floating point and heap to spare, and this script
-keeps only the part the light owns.
+estimator moves off the light, onto a host with floating point and heap to spare, and this
+script keeps only the part the light owns.
 
 | | `follow.rhai` | `pulse.rhai` |
 |---|---|---|

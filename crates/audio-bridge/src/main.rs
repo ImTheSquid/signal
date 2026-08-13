@@ -1,7 +1,8 @@
-//! Turns the deck's audio into a beat grid the traffic light can render.
+//! Turns the master output into a beat grid the traffic light can render.
 //!
-//! rekordbox's DMX output carries no beat information, so the musical signal
-//! comes from a virtual audio device cloning the master output instead. This
+//! rekordbox's DMX output carries no beat information, so the musical signal is
+//! taken from the audio itself: a virtual device cloning the master output on
+//! macOS, or an audio interface capturing it on the Steam Deck. This
 //! daemon tracks tempo and band energy, and sends the light a prediction —
 //! "the next beat is in N ms, the period is P" — rather than beat events.
 //! Predictions are what let the light schedule around its 100ms relay dwell
@@ -36,9 +37,9 @@ const DEFAULT_PORT: u16 = 49500;
 /// light itself to choose the interface.
 const DEFAULT_HOST: &str = "255.255.255.255";
 
-/// How long the loop tolerates no callbacks before rebuilding the stream.
-/// CoreAudio often does not report a device-side sample-rate change as an
-/// error; the callbacks simply stop.
+/// How long the loop tolerates no callbacks before rebuilding the stream. A
+/// device-side sample-rate change is often not reported as an error at all; the
+/// callbacks simply stop.
 const STREAM_STALL: Duration = Duration::from_millis(500);
 
 /// Settling time after a stream starts, before stalls are believed. CoreAudio
@@ -52,7 +53,8 @@ const STREAM_GRACE: Duration = Duration::from_millis(1500);
 /// different thing from "the room is quiet".
 const IDLE_SEND: Duration = Duration::from_millis(100);
 
-/// Sample rate used for synthesised audio, matching what BlackHole offers.
+/// Sample rate used for synthesised audio, matching what both capture paths run
+/// at — the virtual device on macOS and the interface on the Deck.
 const SYNTH_RATE: u32 = 48_000;
 const SYNTH_SECONDS: f32 = 600.0;
 
@@ -109,13 +111,15 @@ OPTIONS:\n  \
                      Name a subnet broadcast or the light to pick an interface.\n                     \
                      With --wav or --synth, giving this also replays to it.\n  \
   --port N           default {DEFAULT_PORT}\n  \
-  --device NAME      exact input name; defaults to the first starting \"BlackHole\"\n  \
+  --device NAME      exact input name; defaults to the first starting\n                     \
+                     \"{}\"\n  \
   --offset MS        shift the reported beat, negative fires early (default 0)\n  \
   --probe            per-hop TSV on stdout, for plotting and tuning\n\
 \n\
 --synth is the calibration signal: the grid is known-perfect, so any offset\n\
 seen on camera belongs to the rig rather than the tracker. Sweep --offset\n\
-against it to find the lamp lead.\n"
+against it to find the lamp lead.\n",
+        capture::DEFAULT_DEVICE
     );
 }
 

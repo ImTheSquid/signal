@@ -1,0 +1,22 @@
+# Build environment for the Steam Deck.
+#
+# SteamOS has a read-only rootfs and ships no compiler, no pkg-config and no
+# ALSA headers, so nothing can be built on the host at all. Everything below is
+# what the crate needs beyond a stock rust image.
+#
+# bookworm rather than an Arch base: the binary runs on the host against its
+# glibc 2.41, and bookworm's 2.36 is older, which is the direction that links
+# safely. An Arch base can outrun the Deck's glibc and fail at load time.
+FROM docker.io/library/rust:1-bookworm
+
+# cpal's Linux backend is ALSA, and alsa-sys locates libasound through
+# pkg-config. On the Deck that library is PipeWire's ALSA plugin, which is what
+# lets this run alongside Audacity on the same capture device.
+#
+# No clang: the aubio bindings ship prebuilt for x86_64-linux-gnu, so this
+# target never runs bindgen.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      libasound2-dev \
+      pkg-config \
+ && rm -rf /var/lib/apt/lists/*

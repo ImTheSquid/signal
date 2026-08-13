@@ -1,8 +1,12 @@
-//! CoreAudio input, and the handoff to the analysis thread.
+//! Audio input, and the handoff to the analysis thread.
 //!
 //! The callback runs on a realtime thread: it must not allocate, lock, or log.
 //! All it does is downmix to mono, push into a lock-free ring, and stamp a
 //! timestamp the supervisor uses to notice the stream has died.
+//!
+//! Two backends, both through cpal: CoreAudio on macOS, and ALSA on Linux —
+//! which on the Steam Deck is PipeWire's ALSA plugin, so capture is shared with
+//! whatever else is recording rather than owning the interface.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -27,6 +31,24 @@ const CORRELATION_FLOOR: f32 = -0.3;
 /// five seconds, long enough that a single centred-bass passage cannot swing it.
 const CORRELATION_WINDOW: usize = 240_000;
 
+/// Name prefix `--device` defaults to, and the advice when nothing matches.
+///
+/// On Linux this is PipeWire's own ALSA PCM rather than `default`, which may be
+/// aliased to the Pulse plugin. Only the PipeWire one honours `PIPEWIRE_NODE`,
+/// and that is what pins capture to the interface instead of letting it follow
+/// whatever the system default source happens to be.
+#[cfg(target_os = "linux")]
+pub const DEFAULT_DEVICE: &str = "pipewire";
+#[cfg(target_os = "linux")]
+const NO_DEVICE_HINT: &str = "`pipewire` is the PCM PipeWire's ALSA plugin installs. \
+     If it is absent, PipeWire is not running or that plugin is missing.";
+
+#[cfg(target_os = "macos")]
+pub const DEFAULT_DEVICE: &str = "blackhole";
+#[cfg(target_os = "macos")]
+const NO_DEVICE_HINT: &str = "If BlackHole was just installed, it needs a reboot \
+     before CoreAudio offers it.";
+
 pub struct DeviceInfo {
     pub name: String,
     pub channels: u16,
@@ -34,11 +56,14 @@ pub struct DeviceInfo {
     pub supported_rates: Vec<u32>,
 }
 
-/// Every input device CoreAudio is currently offering.
+/// Every input device the host is currently offering.
 ///
 /// Worth having as a subcommand rather than a log line: a driver that is
 /// installed on disk but not loaded (BlackHole before its reboot) is invisible
 /// here, and that is the single most confusing failure this daemon has.
+///
+/// Enumerating on ALSA opens every PCM the system advertises to see which are
+/// real, so expect driver complaints on stderr for the ones already in use.
 pub fn list_inputs() -> Result<Vec<DeviceInfo>> {
     let host = cpal::default_host();
     let mut out = Vec::new();
@@ -71,10 +96,13 @@ pub fn list_inputs() -> Result<Vec<DeviceInfo>> {
 
 /// Find the capture device.
 ///
-/// Deliberately never falls back to the default input. The default is whatever
-/// was last chosen in System Settings, and when that is the built-in mic the
-/// daemon still produces a plausible-looking signal from room sound — a tracker
-/// that half-works is far worse to diagnose than one that refuses to start.
+/// Deliberately never falls back to the host's default input. That default is
+/// whatever was last chosen elsewhere, and when it turns out to be a built-in
+/// mic the daemon still produces a plausible-looking signal from room sound — a
+/// tracker that half-works is far worse to diagnose than one that refuses to
+/// start. On Linux the named PCM is a PipeWire endpoint rather than a device, so
+/// which node it draws from is pinned outside the process; `deck/run.sh` sets it
+/// and checks the link that results.
 pub fn pick_input(hint: Option<&str>) -> Result<cpal::Device> {
     let host = cpal::default_host();
     let devices: Vec<_> = host
@@ -85,7 +113,7 @@ pub fn pick_input(hint: Option<&str>) -> Result<cpal::Device> {
     let matches = |name: &str| -> bool {
         match hint {
             Some(h) => name.eq_ignore_ascii_case(h),
-            None => name.to_ascii_lowercase().starts_with("blackhole"),
+            None => name.to_ascii_lowercase().starts_with(DEFAULT_DEVICE),
         }
     };
 
@@ -100,11 +128,12 @@ pub fn pick_input(hint: Option<&str>) -> Result<cpal::Device> {
         .filter_map(|d| d.name().ok())
         .map(|n| format!("  {n}"))
         .collect();
-    let wanted = hint.unwrap_or("a device whose name starts with \"BlackHole\"");
     bail!(
-        "no input device matching {wanted}.\navailable inputs:\n{}\n\n\
-         If BlackHole was just installed, it needs a reboot before CoreAudio \
-         offers it.",
+        "no input device matching {}.\navailable inputs:\n{}\n\n{NO_DEVICE_HINT}",
+        match hint {
+            Some(h) => format!("\"{h}\""),
+            None => format!("a name starting with \"{DEFAULT_DEVICE}\""),
+        },
         if available.is_empty() {
             "  (none)".to_string()
         } else {
@@ -146,8 +175,9 @@ pub fn choose_config(device: &cpal::Device) -> Result<cpal::StreamConfig> {
 /// Health shared between the callback and the supervisor.
 pub struct Health {
     /// Micros since process start, stamped every callback. Staleness is the
-    /// only reliable signal that a CoreAudio stream has stopped: a device-side
-    /// sample rate change often just makes callbacks cease without an error.
+    /// only reliable signal that a stream has stopped: a device-side sample rate
+    /// change, or the interface being unplugged, often just makes callbacks
+    /// cease without an error.
     last_callback_us: AtomicU64,
     errored: AtomicBool,
     /// Set when the correlation guard has switched to left-only.
@@ -224,7 +254,7 @@ impl Correlation {
     }
 }
 
-/// Start capture, falling back to CoreAudio's own buffer size if the device
+/// Start capture, falling back to the backend's own buffer size if the device
 /// refuses a fixed one. Nothing downstream depends on the buffer length — it
 /// only shifts a few milliseconds of latency — so the fallback is free.
 pub fn start(device: &cpal::Device, config: &cpal::StreamConfig) -> Result<Capture> {
