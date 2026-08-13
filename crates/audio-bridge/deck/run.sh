@@ -1,91 +1,57 @@
 #!/usr/bin/env bash
-# Launch the daemon on the Deck. Run this on the Deck, or over ssh.
+# Start the daemon as a user service, so it outlives the ssh session that started
+# it. Run this on the Deck, or over ssh. Arguments are passed through:
 #
-# Arguments are passed through, so: run.sh --offset -30 --host 192.168.1.255
+#   run.sh --offset -30 --host 192.168.1.255
+#
+# SteamOS sets logind's KillUserProcesses=True, so everything in a session's
+# cgroup dies at logout — a backgrounded process and a tmux server alike. A unit
+# under the user manager is what actually survives, and it also restarts the
+# daemon if it fails.
 set -euo pipefail
 
-session=${SESSION:-audio-bridge}
+unit=${UNIT:-audio-bridge}
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-bin=$(dirname "$here")/target-steamos/release/audio-bridge
-# The PCM the daemon defaults to on Linux; see capture::DEFAULT_DEVICE.
-device=pipewire
 
-[[ -x $bin ]] || { echo "no binary at $bin — run deck/build.sh first" >&2; exit 1; }
+# Lingering keeps the user manager alive with nobody logged in, which is what the
+# unit hangs off. Allowed for one's own user through polkit, so no root.
+loginctl enable-linger
 
-if tmux has-session -t "$session" 2>/dev/null; then
-    echo "already running; attach with: tmux attach -t $session" >&2
-    echo "or stop it with: tmux kill-session -t $session" >&2
+if systemctl --user is-active --quiet "$unit"; then
+    echo "already running; stop it with: systemctl --user stop $unit" >&2
     exit 1
 fi
 
-card=$(pactl list short cards | awk '/Focusrite/ {print $2; exit}')
-[[ -n $card ]] || { echo "no Focusrite card — is the interface plugged in?" >&2; exit 1; }
-
-# The interface has to be on the pro-audio profile: the default HiFi profile
-# splits the two inputs into separate mono sources, and the tracker wants the
-# pair as one stereo node so the downmix and the polarity guard see both legs.
-#
-# Matching the raw node and not the `alsa_loopback_device.*` one SteamOS layers
-# on top: same audio, one less hop of buffering.
-scarlett() {
-    pactl list short sources | awk '$2 ~ /^alsa_input\..*Focusrite.*pro-input/ {print $2; exit}'
-}
-node=$(scarlett)
-if [[ -z $node ]]; then
-    echo "switching $card to pro-audio"
-    pactl set-card-profile "$card" pro-audio
-    for _ in $(seq 20); do
-        node=$(scarlett) && [[ -n $node ]] && break
-        sleep 0.25
-    done
-fi
-if [[ -z $node ]]; then
-    echo "no pro-audio input node appeared. sources:" >&2
-    pactl list short sources >&2
-    exit 1
-fi
-echo "capturing from $node"
-
-# Pre-flight, because a daemon that dies inside tmux takes its own error message
-# with it: the pane is gone the moment the process is. This catches the two that
-# actually happen — a binary that will not load, and a missing PCM.
-if ! "$bin" --list-devices 2>/dev/null | awk -v want="$device" '$1 == want {found = 1} END {exit !found}'; then
-    echo "the daemon does not see a \"$device\" input. it reports:" >&2
-    "$bin" --list-devices >&2
-    exit 1
-fi
-
-# PIPEWIRE_NODE is what stops capture following the system default source, which
-# moves the moment anything else audio-shaped is plugged in. By name rather than
-# id, so it still resolves if the stream is rebuilt after a replug.
-#
-# systemd-inhibit because an idle Deck suspends, and a suspended Deck is a light
-# that stops mid-set. This holds the lock only while the daemon runs.
-inner=$(printf '%q ' \
-    systemd-inhibit --what=idle:sleep --who=audio-bridge \
-    --why="driving the traffic light" \
-    "$bin" "$@")
-tmux new-session -d -s "$session" "PIPEWIRE_NODE=$(printf '%q' "$node") exec $inner"
+# Transient rather than an installed unit file: the arguments above belong to the
+# invocation, and there is no second copy of them to drift. --collect so a failed
+# unit does not linger and block the next start.
+systemd-run --user \
+    --unit="$unit" \
+    --collect \
+    --property=Restart=on-failure \
+    --property=RestartSec=2 \
+    "$here/launch.sh" "$@" >/dev/null
 
 sleep 2
-if ! tmux has-session -t "$session" 2>/dev/null; then
-    echo "the daemon exited immediately. run it in the foreground to see why:" >&2
-    echo "  PIPEWIRE_NODE=$node $bin $*" >&2
+if ! systemctl --user is-active --quiet "$unit"; then
+    echo "the daemon did not stay up:" >&2
+    journalctl --user -u "$unit" -n 20 --no-pager >&2
     exit 1
 fi
 
-# Startup is the only place a wrong link is cheap to catch. The daemon reports
+# Startup is the only place a wrong input is cheap to catch. The daemon reports
 # the PCM it opened, which on Linux is an endpoint name and says nothing about
-# which node it landed on — so ask the interface's own ports what is attached to
-# them instead.
-links=$(pw-link -l 2>/dev/null | grep -A3 -F "$node:capture_AUX" || true)
-if [[ $links == *'->'* ]]; then
+# which node it landed on — so ask the graph what its ports are attached to.
+links=$(pw-link -l 2>/dev/null | grep -B1 -A1 -F 'alsa_capture.audio-bridge' || true)
+if [[ $links == *Focusrite* ]]; then
     echo "$links" | sed 's/^/  /'
 else
-    echo "warning: nothing is linked to $node yet" >&2
+    echo "warning: the daemon is not linked to the interface" >&2
     echo "         check with: pw-link -l" >&2
 fi
 
 echo
-echo "watch it:  tmux attach -t $session          (detach: ctrl-b d)"
-echo "stop it:   tmux kill-session -t $session"
+echo "watch it:  journalctl --user -u $unit -f"
+echo "stop it:   systemctl --user stop $unit"
+echo
+echo "for the live meter instead, run it in a terminal: deck/launch.sh"

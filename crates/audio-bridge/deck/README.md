@@ -11,6 +11,10 @@ ssh steamdeck audio-bridge/deck/run.sh --offset -30
 `sync.sh` takes `DECK_HOST` (default `steamdeck`) and `DECK_DIR` (default `audio-bridge`).
 Arguments to `run.sh` are passed through to the daemon.
 
+`run.sh` starts it as a service and reports to the journal. To watch the live meter instead —
+which is what calibrating `--offset` wants — run `deck/launch.sh` in a terminal: same interface
+pinning, same inhibit, just in the foreground.
+
 ## Why it is built in a container
 
 SteamOS has a read-only rootfs and ships no compiler, no pkg-config and no ALSA headers, and
@@ -29,26 +33,35 @@ cpal's Linux backend is ALSA, and on the Deck `libasound` is PipeWire's ALSA plu
 daemon is a PipeWire client like anything else and the interface is not owned by whoever opened
 it first. Audacity (the flatpak) reaches the same node through the Pulse socket.
 
-Two things `run.sh` sets up for that to hold:
+Measured: the daemon, `arecord` and `parec` captured the same node at once, with no stream
+errors and no xruns on any of them.
+
+Two things `launch.sh` sets up for that to hold:
 
 - **The `pro-audio` card profile.** The default `HiFi` profile splits the Scarlett's two inputs
   into separate mono sources, and the tracker wants the pair as one stereo node so the downmix
   and the polarity guard see both legs.
-- **`PIPEWIRE_NODE`**, pinned to the Scarlett by name. `--device` names a PipeWire endpoint, not
-  a device, so without this capture follows the system default source — which moves the moment
-  anything else audio-shaped is plugged in. `run.sh` prints the resulting links so a wrong one
-  is caught at startup rather than mid-set.
+- **The `scarlett` PCM** from `asound.conf`, selected with `--device` and pointed at the node by
+  `AUDIO_BRIDGE_NODE`. Without it capture follows PipeWire's default source, which moves the
+  moment anything else audio-shaped is plugged in.
 
-## Two things that will stop it
+`PIPEWIRE_NODE` does nothing here — it belongs to `pw-cat` and friends, not to the ALSA plugin,
+which routes by its own `capture_node` key. That is worth knowing because when the target does
+not resolve, nothing fails: the plugin quietly falls back to the default source. Hence the PCM,
+and hence `run.sh` printing the links it actually got.
 
-An idle Deck suspends, and a suspended Deck is a light that dies mid-set, so the daemon runs
-under `systemd-inhibit --what=idle:sleep`. That holds only while it runs, and it does not
-survive the lid being closed or the power button.
+## What will stop it
 
-The daemon runs inside tmux so it outlives the ssh session. It also means the status meter is
-still there to look at:
+**Sleep.** An idle Deck suspends — measured at 8 minutes, `PM: suspend entry (deep)` — and a
+suspended Deck is a light that dies mid-set. The daemon holds `systemd-inhibit
+--what=idle:sleep` for as long as it runs, which covers the idle timer but not the lid or the
+power button. Nothing holds it while the daemon is *not* running.
+
+**Logout.** SteamOS sets logind's `KillUserProcesses=True`, so a backgrounded process or a tmux
+server dies with the ssh session that started it. That is why the daemon is a transient user
+unit and why `run.sh` enables lingering, which needs no root.
 
 ```sh
-ssh steamdeck -t tmux attach -t audio-bridge      # detach with ctrl-b d
-ssh steamdeck tmux kill-session -t audio-bridge
+journalctl --user -u audio-bridge -f      # one status line every 10s
+systemctl --user stop audio-bridge
 ```

@@ -34,9 +34,10 @@ const CORRELATION_WINDOW: usize = 240_000;
 /// Name prefix `--device` defaults to, and the advice when nothing matches.
 ///
 /// On Linux this is PipeWire's own ALSA PCM rather than `default`, which may be
-/// aliased to the Pulse plugin. Only the PipeWire one honours `PIPEWIRE_NODE`,
-/// and that is what pins capture to the interface instead of letting it follow
-/// whatever the system default source happens to be.
+/// aliased to the Pulse plugin. It follows PipeWire's default source, so it is
+/// the right thing to fall back to and the wrong thing to rely on: pinning to a
+/// particular interface takes a PCM that names the node, which is what
+/// `deck/asound.conf` adds and `deck/launch.sh` selects.
 #[cfg(target_os = "linux")]
 pub const DEFAULT_DEVICE: &str = "pipewire";
 #[cfg(target_os = "linux")]
@@ -101,8 +102,8 @@ pub fn list_inputs() -> Result<Vec<DeviceInfo>> {
 /// mic the daemon still produces a plausible-looking signal from room sound — a
 /// tracker that half-works is far worse to diagnose than one that refuses to
 /// start. On Linux the named PCM is a PipeWire endpoint rather than a device, so
-/// which node it draws from is pinned outside the process; `deck/run.sh` sets it
-/// and checks the link that results.
+/// which node it draws from is decided outside the process; `deck/launch.sh` sets
+/// it and checks the link that results.
 pub fn pick_input(hint: Option<&str>) -> Result<cpal::Device> {
     let host = cpal::default_host();
     let devices: Vec<_> = host

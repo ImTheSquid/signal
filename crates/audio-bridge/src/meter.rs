@@ -34,6 +34,15 @@ const RELEASE_DB_PER_S: f32 = 20.0;
 /// Silence tolerated before the display starts suggesting why.
 const HINT_AFTER: Duration = Duration::from_secs(3);
 
+/// What to suggest after that silence. The device is connected either way, so
+/// the useful advice is about what feeds it, and that differs per platform.
+#[cfg(target_os = "macos")]
+const SILENCE_HINT: &str =
+    "no audio yet — is anything routed into BlackHole? A Multi-Output Device is the usual fix.";
+#[cfg(target_os = "linux")]
+const SILENCE_HINT: &str =
+    "no audio yet — check the interface's gain, and that AUDIO_BRIDGE_NODE names the right input.";
+
 /// Widest the bar is ever drawn; it shrinks to whatever the pane leaves.
 const METER_WIDTH: usize = 24;
 
@@ -157,7 +166,7 @@ impl Meter {
         // that redraws, and repeating it adds nothing.
         if !self.hinted && !present && self.quiet_for(now) > HINT_AFTER {
             self.hinted = true;
-            self.note("no audio yet — is anything routed into BlackHole? A Multi-Output Device is the usual fix.");
+            self.note(SILENCE_HINT);
         }
         if present {
             self.hinted = false;
