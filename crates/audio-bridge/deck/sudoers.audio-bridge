@@ -1,0 +1,20 @@
+# Lets the launcher turn WiFi power save off without a password.
+#
+# Install once, which is the only time root is needed:
+#
+#   sudo install -m 0440 -o root -g root \
+#       ~/audio-bridge/deck/sudoers.audio-bridge /etc/sudoers.d/audio-bridge
+#
+# The digest is the point. The script sits in a user-writable directory, so a
+# bare NOPASSWD entry pointing at it would be a way to become root by editing a
+# file. sudo hashes the script before running it and refuses on any mismatch, so
+# editing it revokes its own privilege instead. Regenerate after any change:
+#
+#   sha256sum ~/audio-bridge/deck/wifi-powersave-off.sh
+#
+# Note that setuid would not have worked here: Linux ignores the setuid bit on
+# interpreted scripts, so sudo is the mechanism, not file permissions.
+#
+# /etc is not guaranteed to survive a SteamOS update. This file lives in the repo
+# so reinstalling it is one command rather than an archaeology exercise.
+deck ALL=(root) NOPASSWD: sha256:80e30ac070e69efb9e925a60121dc0b4934c79986d3eaeb6fc95a096c916beea /home/deck/audio-bridge/deck/wifi-powersave-off.sh

@@ -2,6 +2,7 @@ node_modules/
 .svelte-kit/
 dist/
 target/
+target-steamos/
 .env
 .DS_Store
 .vercel

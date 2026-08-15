@@ -1,0 +1,10 @@
+# aubio ships no prebuilt bindings for arm64-apple-darwin, so bindgen generates
+# them — and bindgen loads whatever LIBCLANG_PATH points at. The espup install
+# the firmware needs exports that globally as the xtensa cross-clang, which
+# defaults to a 32-bit target and makes bindgen abort on a pointer-size
+# assertion. Force the macOS libclang for this crate only.
+#
+# CommandLineTools rather than the Xcode.app toolchain: the path does not carry
+# a version number, so an Xcode upgrade cannot silently break the build.
+[env]
+LIBCLANG_PATH = { value = "/Library/Developer/CommandLineTools/usr/lib", force = true }

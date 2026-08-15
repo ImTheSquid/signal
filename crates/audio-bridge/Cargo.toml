@@ -1,0 +1,40 @@
+[package]
+name = "audio-bridge"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cpal = "0.15"
+anyhow = "1"
+# Lock-free SPSC ring: the audio callback must never allocate or block, and this
+# is the handoff to the analysis thread.
+rtrb = "0.3"
+# WAV reading for the offline path, which is how the tracker gets tuned and
+# tested without a live device.
+hound = "3.5"
+# Only for the terminal width. A status line that overruns the pane wraps, and
+# then the in-place redraw clears one physical row of several and the rest
+# scrolls away forever.
+libc = "0.2"
+
+# Fork of aubio-rs maintained by the bliss-rs project; the upstream crate is
+# frozen at 2021. `builtin` compiles aubio from vendored sources, so neither
+# platform needs a system libaubio — only a C compiler. The two tables differ
+# only in how the FFI bindings are obtained, and are declared per-target so a
+# build for one platform never pulls in the other's requirements.
+#
+# arm64-apple-darwin has no prebuilt bindings, so bindgen generates them against
+# the vendored headers, using the libclang pinned in .cargo/config.toml.
+[target.'cfg(target_os = "macos")'.dependencies]
+bliss-audio-aubio-rs = { version = "0.2.4", default-features = false, features = [
+    "builtin",
+    "bindgen",
+] }
+
+# x86_64-linux-gnu bindings ship prebuilt, so the Steam Deck build needs no
+# libclang at all — which is what keeps its build container to a stock rust
+# image plus the ALSA headers.
+[target.'cfg(target_os = "linux")'.dependencies]
+bliss-audio-aubio-rs = { version = "0.2.4", default-features = false, features = [
+    "builtin",
+] }

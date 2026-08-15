@@ -2,7 +2,11 @@
 resolver = "2"
 members = ["crates/script-env", "crates/validator", "crates/wsframe"]
 # Different toolchain (xtensa) and build env; built from their own dirs.
-exclude = ["firmware", "dmx-bridge"]
+# audio-bridge is here for the same reason: aubio's bindgen needs the macOS
+# libclang, while the espup toolchain exports LIBCLANG_PATH pointing at the
+# xtensa one. Both settings are correct for their own crate and cannot coexist
+# in one config tree, so audio-bridge gets its own build root.
+exclude = ["firmware", "dmx-bridge", "crates/audio-bridge"]
 
 [workspace.dependencies]
 # Restriction features shared by validator and firmware so both sides parse
