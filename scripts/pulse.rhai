@@ -24,6 +24,7 @@ let BLOCK_LEN = 16;
 let UNKNOWN = 65535;
 let DEAD_MS = 8000;
 let LOOK_BEATS = 8;
+let GROUP = 4;
 let PATTERN_MAX = 700;
 let WANDER_MS = 700;
 let COLOUR_DEAD = 77;
@@ -42,6 +43,8 @@ let was_muted = false;
 
 let look = 0;
 let look_until = 0;
+let hold_lamp = -1;
+let hold_until = 0;
 let last_slot = -1;
 let scatter_start = 0;
 let scatter_w = 1;
@@ -153,28 +156,58 @@ loop {
         look = rand_int(0, 5);
     }
 
+    // A four-beat sentence. At 128 BPM the pattern cycle is exactly one beat, so
+    // every look repeats itself once a beat and the eye finishes it after two.
+    // Ending the group differently is what makes it read as phrasing.
+    let group = beat_count % GROUP;
+
+    // One lamp rides through a whole group, some groups. Uniform business is
+    // most of what makes a pattern feel mechanical, and a lamp that sits still
+    // while the others move gives the rest something to move against. It is also
+    // the cheapest thing here in relay wear rather than the most expensive.
+    if beat_count >= hold_until {
+        hold_until = beat_count + GROUP;
+        hold_lamp = -1;
+        if rand_int(0, 2) == 0 { hold_lamp = ord[rand_int(0, 2)]; }
+    }
+
+    // The last beat of the group plays the same rhythm on different lamps, so
+    // the sentence has an ending rather than four identical words.
+    //
+    // Rotating rather than scattering on purpose: a busier fill costs extra
+    // transitions inside the beat, and at 117ms quarters against a 100ms dwell
+    // those arrive late and land off the grid. Same count, different lamps, and
+    // the grid survives.
+    let play = ord;
+    if group == GROUP - 1 { play = [ord[1], ord[2], ord[0]]; }
+
     let s = [false, false, false];
 
     if !live {
-        s = pickn(ord, beat_count, 2);
+        s = pickn(play,beat_count, 2);
     } else if now < accent_until {
-        s = pickn(ord, 0, 3);
-    } else if look == 0 {
-        if quarter < 2 { s = pickn(ord, 0, w); } else { s = pickn(ord, 0, rest); }
-    } else if look == 1 {
-        s = pickn(ord, beat_count * 2 + half, 1);
-    } else if look == 2 {
-        if quarter == 0 || quarter == 2 { s = pickn(ord, 0, w); } else { s = pickn(ord, half, rest); }
-    } else if look == 3 {
-        if quarter >= 2 { s = pickn(ord, half, w); } else { s = pickn(ord, beat_count, rest); }
-    } else if look == 4 {
+        s = pickn(play,0, 3);
+    } else if look ==0 {
+        if quarter < 2 { s = pickn(play,0, w); } else { s = pickn(play,0, rest); }
+    } else if look ==1 {
+        s = pickn(play,beat_count * 2 + half, 1);
+    } else if look ==2 {
+        if quarter == 0 || quarter == 2 { s = pickn(play,0, w); } else { s = pickn(play,half, rest); }
+    } else if look ==3 {
+        if quarter >= 2 { s = pickn(play,half, w); } else { s = pickn(play,beat_count, rest); }
+    } else if look ==4 {
         let k = quarter + 1;
         if k > 3 { k = 1; }
         if k > w + 1 { k = w + 1; }
-        s = pickn(ord, 0, k);
+        s = pickn(play,0, k);
     } else {
-        s = pickn(ord, scatter_start, scatter_w);
+        s = pickn(play,scatter_start, scatter_w);
     }
+
+    // The held lamp overrides the look, but never the accent or the dead-stream
+    // pattern: one is the loudest moment in the track and the other is the only
+    // sign the daemon is gone.
+    if live && now >= accent_until && hold_lamp >= 0 { s[hold_lamp] = true; }
 
     // Guarantee something moves every half cycle, so a steady passage cannot
     // leave the light frozen.
@@ -182,10 +215,11 @@ loop {
         nudge = true;
         if cur_r || cur_y || cur_g {
             nudge_s = [false, false, false];
+            if hold_lamp >= 0 { nudge_s[hold_lamp] = true; }
         } else {
             let k = w;
             if k < 1 { k = 1; }
-            nudge_s = pickn(ord, beat_count, k);
+            nudge_s = pickn(play,beat_count, k);
         }
     }
     if nudge { s = nudge_s; }

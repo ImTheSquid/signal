@@ -249,6 +249,83 @@ fn rides_through_packet_loss() {
     assert!(hit > 0.80, "lost the grid under packet loss: {hit:.3}");
 }
 
+/// Lamp states as a 3-bit code, at an instant.
+fn state_at(changes: &[(i64, bool, bool, bool)], t: i64) -> u8 {
+    let mut s = 0;
+    for &(at, r, y, g) in changes {
+        if at > t {
+            break;
+        }
+        s = u8::from(r) | (u8::from(y) << 1) | (u8::from(g) << 2);
+    }
+    s
+}
+
+/// What a single beat renders, sampled across its length.
+fn beat_shape(run: &Run, period_ms: i64, beat: i64) -> Vec<u8> {
+    const SUB: i64 = 8;
+    (0..SUB)
+        .map(|k| state_at(&run.changes, beat * period_ms + k * period_ms / SUB))
+        .collect()
+}
+
+/// How often a beat renders exactly what the beat before it did.
+///
+/// Predictability is a property of a lighting look, not only a matter of taste:
+/// a pattern the eye can finish for itself stops being watched. Skips the first
+/// ten seconds, which are startup rather than the look.
+fn repeat_rate(run: &Run, period_ms: i64) -> f64 {
+    let first = 10_000 / period_ms;
+    let last = RUN_MS / period_ms - 1;
+    let mut same = 0;
+    let mut total = 0;
+    for beat in first + 1..last {
+        if beat_shape(run, period_ms, beat) == beat_shape(run, period_ms, beat - 1) {
+            same += 1;
+        }
+        total += 1;
+    }
+    same as f64 / total as f64
+}
+
+/// The longest any one lamp stays continuously lit, in beats.
+fn longest_hold_beats(run: &Run, period_ms: i64) -> f64 {
+    let mut worst = 0;
+    for lamp in 0..3 {
+        let mut on_since: Option<i64> = None;
+        for &(at, r, y, g) in &run.changes {
+            let on = [r, y, g][lamp];
+            match (on, on_since) {
+                (true, None) => on_since = Some(at),
+                (false, Some(start)) => {
+                    worst = worst.max(at - start);
+                    on_since = None;
+                }
+                _ => {}
+            }
+        }
+    }
+    worst as f64 / period_ms as f64
+}
+
+/// Measured, so "it gets bland" stops being a matter of opinion.
+///
+/// The pattern cycle at 128 BPM is exactly one beat long, so without the
+/// four-beat group every look repeats itself once a beat: 0.337 of beats
+/// rendered the previous beat exactly, and the eye finishes a one-beat sentence
+/// after two of them. The group took that to 0.163.
+#[test]
+fn the_pattern_breaks_itself_up() {
+    let run = run_pulse(BEAT_MS);
+    let repeat = repeat_rate(&run, BEAT_MS);
+    let hold = longest_hold_beats(&run, BEAT_MS);
+    println!("repeat rate {repeat:.3}   longest hold {hold:.2} beats");
+    assert!(repeat < 0.25, "every {repeat:.3} of beats repeats the last one");
+    // Uniform business is most of what reads as mechanical. Something has to sit
+    // still for the rest to move against.
+    assert!(hold > 2.0, "no lamp ever holds longer than {hold:.2} beats");
+}
+
 /// A stalled daemon must not leave the light frozen.
 #[test]
 fn keeps_moving_when_the_stream_never_starts() {
