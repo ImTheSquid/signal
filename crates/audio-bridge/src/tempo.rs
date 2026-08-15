@@ -33,6 +33,24 @@ const CONF_COASTING: f32 = 0.25;
 /// jump to the other deck mid-transition.
 const DEGRADED_TOLERANCE: f32 = 0.02;
 
+/// How long a refused estimate must persist, unchanged, before it is taken
+/// anyway.
+///
+/// Without this the degraded band is a latch rather than a delay: aubio's
+/// confidence on a real PA spends long stretches below CONF_TRACKING, and a set
+/// that moves further than DEGRADED_TOLERANCE is then refused for the rest of
+/// the night. Taking a new tempo late is a few seconds of wrong; refusing it is
+/// the whole set on a grid the music left.
+///
+/// Longer than a transition, so a blend cannot trip it: a beatmatched mix holds
+/// both decks at the same tempo by construction, and an unmatched one does not
+/// hold a *stable* wrong estimate for this long.
+const ESCAPE_AFTER_S: f32 = 8.0;
+
+/// How closely successive refused estimates must agree to count as the same one.
+/// A wandering estimate is aubio being lost, not the music having moved.
+const ESCAPE_STABILITY: f32 = 0.02;
+
 /// Broadband energy below this fraction of its own long-run reference is
 /// treated as no evidence at all.
 ///
@@ -129,6 +147,15 @@ pub struct AubioTracker {
     confidence_decay: f32,
     energy_fast: Ema,
     energy_slow: Ema,
+    /// Whether this hop carries energy, as opposed to `confidence`, which is a
+    /// decaying memory of hops that did. The escape below keys off evidence
+    /// arriving now — a breakdown must not be able to talk the grid into a new
+    /// tempo just because its confidence has not finished decaying.
+    audible: bool,
+
+    /// An estimate the bands refused, and when it first appeared.
+    pending_period_ms: Option<f32>,
+    pending_since_ms: f64,
 }
 
 impl AubioTracker {
@@ -151,6 +178,9 @@ impl AubioTracker {
             confidence_decay: (-hop_s / CONFIDENCE_TAU_S).exp(),
             energy_fast: Ema::new(hop_s, ENERGY_FAST_S),
             energy_slow: Ema::new(hop_s, ENERGY_SLOW_S),
+            audible: false,
+            pending_period_ms: None,
+            pending_since_ms: 0.0,
         })
     }
 
@@ -165,12 +195,36 @@ impl AubioTracker {
         let slow = self.energy_slow.update(levels.raw_energy);
         let audible = slow > 0.0 && fast / slow >= SILENCE_RATIO;
 
+        self.audible = audible;
         let instant = if audible {
             aubio_confidence.clamp(0.0, 1.0)
         } else {
             0.0
         };
         self.confidence = instant.max(self.confidence * self.confidence_decay);
+    }
+
+    /// Track an estimate the bands refused, and report when it has stood long
+    /// enough to be believed over the one being held.
+    ///
+    /// Resets whenever the estimate moves, so this measures how long *one*
+    /// answer has persisted rather than how long aubio has been disagreeing.
+    fn note_disagreement(&mut self, candidate: f32) -> Option<f32> {
+        if !self.audible {
+            self.pending_period_ms = None;
+            return None;
+        }
+        let now = self.now_ms();
+        let stable = self
+            .pending_period_ms
+            .is_some_and(|p| ((candidate - p) / p).abs() <= ESCAPE_STABILITY);
+        if !stable {
+            self.pending_period_ms = Some(candidate);
+            self.pending_since_ms = now;
+            return None;
+        }
+        let held_for = (now - self.pending_since_ms) as f32 / 1000.0;
+        (held_for >= ESCAPE_AFTER_S).then_some(candidate)
     }
 
     /// Decide whether to believe a fresh tempo estimate.
@@ -187,16 +241,23 @@ impl AubioTracker {
             // would carry a made-up grid into the set.
             None => (self.confidence >= CONF_COASTING).then_some(candidate),
             Some(_) if self.confidence >= CONF_TRACKING => Some(candidate),
-            // Degraded: follow a drifting tempo, refuse a jump. During a
-            // two-deck transition the alternative is oscillating between them.
+            // Degraded: follow a drifting tempo, refuse a jump — until the jump
+            // proves itself by not going away. During a two-deck transition the
+            // alternative to refusing is oscillating between them; the
+            // alternative to *eventually* accepting is never leaving 129.
             Some(held) if self.confidence >= CONF_COASTING => {
-                (((candidate - held) / held).abs() <= DEGRADED_TOLERANCE).then_some(candidate)
+                if ((candidate - held) / held).abs() <= DEGRADED_TOLERANCE {
+                    Some(candidate)
+                } else {
+                    self.note_disagreement(candidate)
+                }
             }
             // Coasting: frozen.
             Some(_) => None,
         };
 
         if let Some(candidate) = adopted {
+            self.pending_period_ms = None;
             // A real tempo change invalidates the history: those instants
             // belong to a grid that no longer exists, and fitting across the
             // seam produces a period matching neither.
@@ -492,6 +553,40 @@ mod tests {
             "the period should be held through silence, not forgotten"
         );
         assert!(grid.coasting, "should report coasting");
+    }
+
+    /// The degraded band must not be a latch. aubio's confidence on a real PA
+    /// sits below CONF_TRACKING for long stretches, and a set that moves further
+    /// than DEGRADED_TOLERANCE — 129 to 156, say — is then refused for the rest
+    /// of the night.
+    #[test]
+    fn a_refused_jump_is_taken_eventually() {
+        let mut tracker = AubioTracker::new(FS).unwrap();
+        let hop_ms = HOP as f64 * 1000.0 / FS as f64;
+
+        tracker.confidence = 0.8;
+        tracker.audible = true;
+        tracker.consider_period(129.0);
+        assert!(
+            (60_000.0 / tracker.period_ms.unwrap() - 129.0).abs() < 0.1,
+            "should hold 129 to begin with"
+        );
+
+        // The set moves to 156 and stays there, with confidence never leaving
+        // the degraded band.
+        tracker.confidence = 0.4;
+        let mut took = None;
+        for i in 0..(60.0 / (hop_ms / 1000.0)) as usize {
+            tracker.samples_seen += HOP as u64;
+            tracker.consider_period(156.0);
+            if (60_000.0 / tracker.period_ms.unwrap() - 156.0).abs() < 0.1 && took.is_none() {
+                took = Some(i as f64 * hop_ms / 1000.0);
+            }
+        }
+
+        let took = took.expect("never followed the set to 156 BPM");
+        println!("took a refused jump after {took:.1}s");
+        assert!(took < 12.0, "took {took:.1}s to accept a sustained new tempo");
     }
 
     /// A perfectly periodic sub-audio wobble is not a tempo. Without the energy
