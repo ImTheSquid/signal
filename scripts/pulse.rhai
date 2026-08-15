@@ -45,6 +45,7 @@ let look = 0;
 let look_until = 0;
 let hold_lamp = -1;
 let hold_until = 0;
+let mask = [true, true, true, true];
 let last_slot = -1;
 let scatter_start = 0;
 let scatter_w = 1;
@@ -55,6 +56,7 @@ let cur_y = false;
 let cur_g = false;
 let last_change = -99999;
 let nudge = false;
+let nudge_new = false;
 let nudge_s = [false, false, false];
 
 let t0 = millis();
@@ -142,7 +144,12 @@ loop {
     if rest < 1 { rest = 1; }
 
     if quarter != last_slot {
-        nudge = false;
+        // Arm the movement guarantee only here, at a slot boundary, so what it
+        // forces lands on the grid like every other change. Armed the moment the
+        // stillness threshold passes, it fires at an arbitrary offset instead —
+        // which is what a masked group full of deliberate stillness turns into.
+        nudge = now - last_change >= pd / 2;
+        nudge_new = nudge;
         if quarter % 2 == 0 {
             scatter_start = rand_int(0, 2);
             scatter_w = rand_int(1, w);
@@ -169,6 +176,16 @@ loop {
         hold_until = beat_count + GROUP;
         hold_lamp = -1;
         if rand_int(0, 2) == 0 { hold_lamp = ord[rand_int(0, 2)]; }
+
+        // Which quarters this group may change on. The first always, so the beat
+        // itself still lands; the rest by chance.
+        //
+        // This is what stops the cadence giving the look away. Changing something
+        // at every quarter of every beat is metronomic whatever the lamps do —
+        // the eye gives up predicting which and starts predicting when, and it is
+        // never wrong. Skipping slots is syncopation and space, and it costs
+        // relay operations rather than spending them.
+        mask = [true, rand_int(0, 1) == 1, rand_int(0, 1) == 1, rand_int(0, 1) == 1];
     }
 
     // The last beat of the group plays the same rhythm on different lamps, so
@@ -209,20 +226,30 @@ loop {
     // sign the daemon is gone.
     if live && now >= accent_until && hold_lamp >= 0 { s[hold_lamp] = true; }
 
+    // Hold through the quarters this group is not allowed to change on. Last,
+    // so it holds what is actually lit rather than what the look wanted.
+    if live && now >= accent_until && !mask[quarter] { s = [cur_r, cur_y, cur_g]; }
+
     // Guarantee something moves every half cycle, so a steady passage cannot
-    // leave the light frozen.
-    if !nudge && now - last_change >= pd / 2 {
-        nudge = true;
-        if cur_r || cur_y || cur_g {
-            nudge_s = [false, false, false];
-            if hold_lamp >= 0 { nudge_s[hold_lamp] = true; }
-        } else {
-            let k = w;
-            if k < 1 { k = 1; }
-            nudge_s = pickn(play,beat_count, k);
+    // leave the light frozen. Armed at the slot boundary above; this is what it
+    // does when it fires.
+    if nudge {
+        // Once per slot, not once per loop: recomputing it after the lamps have
+        // already answered gives a different answer, and firing that lands a
+        // second change at an arbitrary offset inside the slot.
+        if nudge_new {
+            nudge_new = false;
+            if cur_r || cur_y || cur_g {
+                nudge_s = [false, false, false];
+                if hold_lamp >= 0 { nudge_s[hold_lamp] = true; }
+            } else {
+                let k = w;
+                if k < 1 { k = 1; }
+                nudge_s = pickn(play,beat_count, k);
+            }
         }
+        s = nudge_s;
     }
-    if nudge { s = nudge_s; }
 
     // Gate on the dwell rather than letting set_lights block: a blocked call
     // stalls the loop, and a stalled loop misses packets.

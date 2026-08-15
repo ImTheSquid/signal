@@ -288,6 +288,52 @@ fn repeat_rate(run: &Run, period_ms: i64) -> f64 {
     same as f64 / total as f64
 }
 
+/// How often a run of `w` beats renders exactly what the previous run of `w`
+/// beats did.
+///
+/// Distinct from [`repeat_rate`], and the one that matters for whether a look is
+/// readable: beat-to-beat repetition is what makes a pattern feel deliberate, so
+/// some of it is wanted. A whole sentence repeating verbatim is what lets the eye
+/// run ahead of the light.
+fn window_repeat_rate(run: &Run, period_ms: i64, w: i64) -> f64 {
+    let first = 10_000 / period_ms;
+    let last = RUN_MS / period_ms - 1;
+    let mut same = 0;
+    let mut total = 0;
+    for beat in first + w..last {
+        let here: Vec<Vec<u8>> = (0..w).map(|k| beat_shape(run, period_ms, beat + k)).collect();
+        let prev: Vec<Vec<u8>> = (0..w)
+            .map(|k| beat_shape(run, period_ms, beat - w + k))
+            .collect();
+        if here == prev {
+            same += 1;
+        }
+        total += 1;
+    }
+    same as f64 / total as f64
+}
+
+/// Share of gaps between changes that fall in the single commonest bucket.
+///
+/// This is the cadence, and it is what gives a look away. A pattern that changes
+/// something at every quarter of every beat is metronomic whatever the lamps are
+/// doing: the eye stops predicting *which* and starts predicting *when*, and it
+/// is right every time. Spread across several gap lengths is syncopation, space,
+/// and density that moves.
+fn modal_gap_share(run: &Run) -> f64 {
+    let mut hist = std::collections::HashMap::new();
+    let mut total = 0;
+    for w in run.changes.windows(2) {
+        if w[0].0 < 10_000 {
+            continue;
+        }
+        *hist.entry((w[1].0 - w[0].0) / 20).or_insert(0) += 1;
+        total += 1;
+    }
+    let top = hist.values().copied().max().unwrap_or(0);
+    top as f64 / total.max(1) as f64
+}
+
 /// The longest any one lamp stays continuously lit, in beats.
 fn longest_hold_beats(run: &Run, period_ms: i64) -> f64 {
     let mut worst = 0;
@@ -310,17 +356,31 @@ fn longest_hold_beats(run: &Run, period_ms: i64) -> f64 {
 
 /// Measured, so "it gets bland" stops being a matter of opinion.
 ///
-/// The pattern cycle at 128 BPM is exactly one beat long, so without the
-/// four-beat group every look repeats itself once a beat: 0.337 of beats
-/// rendered the previous beat exactly, and the eye finishes a one-beat sentence
-/// after two of them. The group took that to 0.163.
+/// Beat-to-beat repetition is deliberately **not** the thing held down. Chasing
+/// it was a wrong turn: whole sentences already never repeat — 0.000 at eight
+/// beats, 0.040 at four — so verbatim repetition was never what made the look
+/// readable, and some of it is what makes a pattern feel deliberate rather than
+/// twitchy.
+///
+/// The cadence is what gives it away. Changing something at every quarter of
+/// every beat put 0.576 of the gaps between changes in one bucket: the eye stops
+/// predicting which lamp and starts predicting when, and it is never wrong.
+/// Letting each group skip slots took that to 0.488, and cost relay operations
+/// rather than spending them.
 #[test]
 fn the_pattern_breaks_itself_up() {
     let run = run_pulse(BEAT_MS);
     let repeat = repeat_rate(&run, BEAT_MS);
     let hold = longest_hold_beats(&run, BEAT_MS);
-    println!("repeat rate {repeat:.3}   longest hold {hold:.2} beats");
-    assert!(repeat < 0.25, "every {repeat:.3} of beats repeats the last one");
+    let s4 = window_repeat_rate(&run, BEAT_MS, 4);
+    let s8 = window_repeat_rate(&run, BEAT_MS, 8);
+    let cadence = modal_gap_share(&run);
+    println!(
+        "repeat {repeat:.3}  4-beat {s4:.3}  8-beat {s8:.3}  hold {hold:.2}  cadence {cadence:.3}"
+    );
+    assert!(cadence < 0.52, "{cadence:.3} of gaps are the same length");
+    // Loose, and only to catch a look that has stopped saying anything at all.
+    assert!(repeat < 0.40, "every {repeat:.3} of beats repeats the last one");
     // Uniform business is most of what reads as mechanical. Something has to sit
     // still for the rest to move against.
     assert!(hold > 2.0, "no lamp ever holds longer than {hold:.2} beats");
