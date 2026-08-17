@@ -22,15 +22,94 @@ use binrw::BinRead;
 use clap::{Parser, Subcommand};
 use rekord_ripper::db::MasterDb;
 use rekordcrate::anlz::{Content, ANLZ};
+use std::collections::HashMap;
 use std::fs;
 use std::io::Cursor;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 #[command(about = "Beat-grid ground truth from the local rekordbox library")]
 struct Args {
     #[command(subcommand)]
     cmd: Cmd,
+    /// Where to look for the audio when the path in the database points at
+    /// another machine. Repeatable. Files are matched on filename, then on
+    /// filename without the extension, so an mp3 in the database resolves to the
+    /// flac of the same name on disk.
+    #[arg(long = "audio-root", global = true)]
+    audio_root: Vec<PathBuf>,
+}
+
+/// Filename to path, for relocating audio a travelled library has lost track of.
+struct AudioIndex {
+    by_name: HashMap<String, PathBuf>,
+    by_stem: HashMap<String, PathBuf>,
+}
+
+impl AudioIndex {
+    fn build(roots: &[PathBuf]) -> Self {
+        let mut by_name = HashMap::new();
+        let mut by_stem = HashMap::new();
+        for root in roots {
+            walk(root, &mut |p: &Path| {
+                let audio = p
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| {
+                        matches!(
+                            e.to_lowercase().as_str(),
+                            "flac" | "mp3" | "wav" | "m4a" | "aiff" | "aif" | "ogg"
+                        )
+                    })
+                    .unwrap_or(false);
+                if !audio {
+                    return;
+                }
+                if let Some(n) = p.file_name().and_then(|n| n.to_str()) {
+                    by_name.entry(n.to_lowercase()).or_insert_with(|| p.to_owned());
+                }
+                if let Some(s) = p.file_stem().and_then(|s| s.to_str()) {
+                    by_stem.entry(s.to_lowercase()).or_insert_with(|| p.to_owned());
+                }
+            });
+        }
+        AudioIndex { by_name, by_stem }
+    }
+
+    fn len(&self) -> usize {
+        self.by_name.len()
+    }
+
+    /// The recorded path if it is really there, else the same filename anywhere
+    /// under the roots, else the same name with a different extension.
+    fn resolve(&self, recorded: Option<&str>) -> Option<PathBuf> {
+        let recorded = recorded?;
+        let p = Path::new(recorded);
+        if p.exists() {
+            return Some(p.to_owned());
+        }
+        // Windows paths in the database still use forward slashes, and a
+        // `soundcloud:tracks:…` reference has no filename at all.
+        let name = recorded.rsplit(['/', '\\']).next()?;
+        if let Some(hit) = self.by_name.get(&name.to_lowercase()) {
+            return Some(hit.clone());
+        }
+        let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name);
+        self.by_stem.get(&stem.to_lowercase()).cloned()
+    }
+}
+
+fn walk(dir: &Path, f: &mut impl FnMut(&Path)) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        match p.is_dir() {
+            true => walk(&p, f),
+            false => f(&p),
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -124,7 +203,12 @@ fn beat_grid(db: &MasterDb, track: &Track) -> Result<Vec<(u32, u16)>> {
     )
 }
 
-fn dump(db: &MasterDb, query: &str, out: Option<PathBuf>) -> Result<()> {
+fn dump(
+    db: &MasterDb,
+    index: &AudioIndex,
+    query: &str,
+    out: Option<PathBuf>,
+) -> Result<()> {
     let found = tracks(db, Some(query))?;
     if found.is_empty() {
         bail!("nothing matches {query:?}");
@@ -132,24 +216,26 @@ fn dump(db: &MasterDb, query: &str, out: Option<PathBuf>) -> Result<()> {
 
     // A library that has moved between machines holds a row per machine for the
     // same song — same title, different absolute path, its own analysis
-    // directory. Only one of those paths exists here, and it is the only one that
-    // can be scored, so prefer it and treat the rest as the duplicates they are.
-    let local: Vec<&Track> = found
+    // directory. Resolve each to real audio first and judge ambiguity on that:
+    // four rows that all land on one file are duplicates, not an ambiguous query.
+    let resolved: Vec<(&Track, Option<PathBuf>)> = found
         .iter()
-        .filter(|t| {
-            t.folder
-                .as_deref()
-                .is_some_and(|p| std::path::Path::new(p).exists())
-        })
+        .map(|t| (t, index.resolve(t.folder.as_deref())))
         .collect();
-    let found: Vec<&Track> = match local.is_empty() {
-        true => found.iter().collect(),
-        false => local,
+    let hits: Vec<&(&Track, Option<PathBuf>)> =
+        resolved.iter().filter(|(_, p)| p.is_some()).collect();
+
+    let candidates: Vec<&(&Track, Option<PathBuf>)> = match hits.is_empty() {
+        true => resolved.iter().collect(),
+        false => hits,
     };
 
-    let mut files: Vec<&str> = found
+    let mut files: Vec<String> = candidates
         .iter()
-        .map(|t| t.folder.as_deref().unwrap_or(""))
+        .map(|(t, p)| match p {
+            Some(p) => p.display().to_string(),
+            None => t.folder.clone().unwrap_or_default(),
+        })
         .collect();
     files.sort_unstable();
     files.dedup();
@@ -160,7 +246,7 @@ fn dump(db: &MasterDb, query: &str, out: Option<PathBuf>) -> Result<()> {
         }
         bail!("narrow the query so it matches one track");
     }
-    let track = &found[0];
+    let (track, audio) = candidates[0];
     let beats = beat_grid(db, track)?;
     if beats.is_empty() {
         bail!("the beat grid for {:?} is empty", track.title);
@@ -179,9 +265,14 @@ fn dump(db: &MasterDb, query: &str, out: Option<PathBuf>) -> Result<()> {
     s.push_str(&format!("# title\t{}\n", track.title));
     s.push_str(&format!("# bpm\t{}\n", bpm_str(track.bpm)));
     s.push_str(&format!("# beats\t{}\n", beats.len()));
+    // The resolved path, not the recorded one — the scorer has to be able to open
+    // it, and on a travelled library those are rarely the same string.
     s.push_str(&format!(
         "# file\t{}\n",
-        track.folder.as_deref().unwrap_or("-")
+        audio
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "-".into())
     ));
     s.push_str("# phrase_phase is derived: beats from the first downbeat, mod 16\n");
     s.push_str("time_ms\tbeat_in_bar\tbeat_in_track\tphrase_phase\n");
@@ -217,6 +308,10 @@ fn main() -> Result<()> {
         eprintln!("note: rekordbox is running; recent edits may not be in master.db yet");
     }
     let db = MasterDb::open()?;
+    let index = AudioIndex::build(&args.audio_root);
+    if !args.audio_root.is_empty() {
+        eprintln!("indexed {} audio files under {} roots", index.len(), args.audio_root.len());
+    }
 
     match args.cmd {
         Cmd::List { query } => {
@@ -227,10 +322,7 @@ fn main() -> Result<()> {
             // `soundcloud:tracks:…` for anything that was only ever streamed.
             let mut local = 0;
             for t in &found {
-                let here = t
-                    .folder
-                    .as_deref()
-                    .is_some_and(|p| std::path::Path::new(p).exists());
+                let here = index.resolve(t.folder.as_deref()).is_some();
                 local += u32::from(here);
                 println!(
                     "{} {:>8}  {} — {}",
@@ -245,7 +337,7 @@ fn main() -> Result<()> {
                 found.len()
             );
         }
-        Cmd::Dump { query, out } => dump(&db, &query, out)?,
+        Cmd::Dump { query, out } => dump(&db, &index, &query, out)?,
     }
     Ok(())
 }
