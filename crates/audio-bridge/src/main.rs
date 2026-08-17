@@ -13,6 +13,7 @@ mod bands;
 mod capture;
 mod downbeat;
 mod meter;
+mod score;
 mod tempo;
 mod wire;
 
@@ -68,8 +69,13 @@ struct Args {
     host_given: bool,
     wav: Option<String>,
     synth_bpm: Option<f32>,
+    /// Accented fixture rather than the bare click train, so there is a bar and a
+    /// phrase to find.
+    synth_pattern: bool,
     offset_ms: f32,
     probe: bool,
+    /// A `grid-truth` TSV to score the phrase estimate against.
+    score_grid: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -88,10 +94,20 @@ fn main() -> Result<()> {
             let (samples, rate) = analysis::read_wav_mono(path)?;
             run_offline(path, samples, rate, &args)
         }
-        (None, Some(bpm)) => {
-            let samples = analysis::synth_click_train(bpm, SYNTH_SECONDS, SYNTH_RATE);
-            run_offline(&format!("{bpm} BPM metronome"), samples, SYNTH_RATE, &args)
-        }
+        (None, Some(bpm)) => match args.synth_pattern {
+            true => run_offline(
+                &format!("{bpm} BPM pattern"),
+                analysis::synth_pattern(bpm, SYNTH_SECONDS, SYNTH_RATE),
+                SYNTH_RATE,
+                &args,
+            ),
+            false => run_offline(
+                &format!("{bpm} BPM metronome"),
+                analysis::synth_click_train(bpm, SYNTH_SECONDS, SYNTH_RATE),
+                SYNTH_RATE,
+                &args,
+            ),
+        },
         (None, None) => run_live(&args),
     }
 }
@@ -115,11 +131,16 @@ OPTIONS:\n  \
   --device NAME      exact input name; defaults to the first starting\n                     \
                      \"{}\"\n  \
   --offset MS        shift the reported beat, negative fires early (default 0)\n  \
-  --probe            per-hop TSV on stdout, for plotting and tuning\n\
+  --probe            per-hop TSV on stdout, for plotting and tuning\n  \
+  --pattern          with --synth, an accented fixture (kick every beat, clap\n                     \
+                     on 2 and 4, crash every 16) instead of a bare click train\n  \
+  --score-grid FILE  score the phrase estimate against a grid-truth TSV;\n                     \
+                     see crates/grid-truth\n\
 \n\
 --synth is the calibration signal: the grid is known-perfect, so any offset\n\
 seen on camera belongs to the rig rather than the tracker. Sweep --offset\n\
-against it to find the lamp lead.\n",
+against it to find the lamp lead. It is deliberately unaccented, so add\n\
+--pattern when the thing being tested is the phrase rather than the tempo.\n",
         capture::DEFAULT_DEVICE
     );
 }
@@ -132,8 +153,10 @@ fn parse_args(argv: &[String]) -> Result<Args> {
         device: None,
         wav: None,
         synth_bpm: None,
+        synth_pattern: false,
         offset_ms: 0.0,
         probe: false,
+        score_grid: None,
     };
     let mut i = 0;
     while i < argv.len() {
@@ -158,6 +181,8 @@ fn parse_args(argv: &[String]) -> Result<Args> {
                 args.offset_ms = take(&mut i)?.parse().context("--offset must be a number")?
             }
             "--probe" => args.probe = true,
+            "--pattern" => args.synth_pattern = true,
+            "--score-grid" => args.score_grid = Some(take(&mut i)?),
             other => bail!("unknown argument: {other}"),
         }
         i += 1;
@@ -195,14 +220,14 @@ fn probe_header() {
     // relative by construction and so can never show a bass kill, which is
     // exactly what you go looking for when tuning.
     println!(
-        "t\tlow\tmid\thigh\tenergy\traw_low\traw_mid\traw_high\tflux\tbuild\tbpm\tconf\tnext_ms\tbeat\tflags"
+        "t\tlow\tmid\thigh\tenergy\traw_low\traw_mid\traw_high\tflux\tbuild\tbpm\tconf\tnext_ms\tbeat\tflags\tphase\tsigma"
     );
 }
 
 fn probe_row(t: f64, r: &HopResult, flags: u8) {
     let bpm = r.grid.period_ms.map(|p| 60_000.0 / p).unwrap_or(0.0);
     println!(
-        "{t:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.5}\t{:.5}\t{:.5}\t{:.3}\t{:+.3}\t{bpm:.2}\t{:.3}\t{}\t{}\t{flags:#06b}",
+        "{t:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.5}\t{:.5}\t{:.5}\t{:.3}\t{:+.3}\t{bpm:.2}\t{:.3}\t{}\t{}\t{flags:#06b}\t{}\t{:.2}",
         r.levels.low,
         r.levels.mid,
         r.levels.high,
@@ -218,6 +243,8 @@ fn probe_row(t: f64, r: &HopResult, flags: u8) {
             .map(|v| format!("{v:.1}"))
             .unwrap_or_else(|| "-".into()),
         u8::from(r.beat),
+        r.phrase.phase_of(r.grid.beat_index),
+        r.phrase.excess_sigma,
     );
 }
 
@@ -237,6 +264,11 @@ fn run_offline(label: &str, samples: Vec<f32>, sample_rate: u32, args: &Args) ->
     if args.probe {
         probe_header();
     }
+
+    let mut score = match &args.score_grid {
+        Some(path) => Some(score::Score::new(score::Truth::read(path)?)),
+        None => None,
+    };
 
     // Only when paced to real time. Running a file at full speed would redraw
     // hundreds of times a second and show nothing legible.
@@ -270,6 +302,10 @@ fn run_offline(label: &str, samples: Vec<f32>, sample_rate: u32, args: &Args) ->
             probe_row(audio_time, &result, wire::encode_block(&beat)[1]);
         }
 
+        if let Some(score) = &mut score {
+            score.observe(audio_time, &result);
+        }
+
         confidence_sum += result.grid.confidence as f64;
         tracking_hops += u64::from(result.grid.tracking);
         hops += 1;
@@ -294,6 +330,9 @@ fn run_offline(label: &str, samples: Vec<f32>, sample_rate: u32, args: &Args) ->
         confidence_sum / hops as f64,
         100.0 * tracking_hops as f64 / hops as f64,
     );
+    if let Some(score) = &mut score {
+        score.report();
+    }
     Ok(())
 }
 
