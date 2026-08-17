@@ -25,9 +25,22 @@ const WINDOW: usize = 1024;
 const CONFIDENCE_TAU_S: f32 = 3.3;
 
 /// Above this, aubio's tempo estimate is adopted as-is.
-const CONF_TRACKING: f32 = 0.55;
+///
+/// Calibrated against real tracks, not against the click train. aubio returns
+/// ~1.0 on a metronome and 0.10-0.31 on music: measured over 25 tracks from the
+/// library, per-track *peak* confidence ran 0.144 to 0.307. The old pair, 0.55
+/// and 0.25, therefore sat at or above the top of the real distribution, and
+/// whether a track ever got a grid came down to where its peak happened to land
+/// — 17 of those 25 never got one.
+const CONF_TRACKING: f32 = 0.30;
 /// Below this, the grid freezes and free-runs.
-const CONF_COASTING: f32 = 0.25;
+///
+/// Lowering this is what recovers the tracks above; it does not weaken the
+/// silence protection, which is `SILENCE_RATIO` zeroing confidence outright and
+/// is a separate gate. Measured at 0.10 as well: both give 13 of 25 correct, so
+/// the threshold stops being the binding constraint here and the higher floor is
+/// kept. What remains is metrical-level error, not missing evidence.
+const CONF_COASTING: f32 = 0.15;
 /// Between the two, a new estimate is only accepted if it barely differs from
 /// the one already held — enough to follow a pitch-fader ride, not enough to
 /// jump to the other deck mid-transition.
