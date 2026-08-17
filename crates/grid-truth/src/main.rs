@@ -1,0 +1,199 @@
+//! Ground truth for the bar clock, read out of rekordbox's own analysis.
+//!
+//! rekordbox has already solved offline what the daemon is trying to solve live:
+//! its beat grid records, for every beat of every analysed track, that beat's
+//! position within the bar. That makes it a reference to score an estimator
+//! against — no hooking, nothing running, and no hand annotation.
+//!
+//! Emits a TSV so `audio-bridge`'s validation never depends on rekordbox being
+//! installed. Read-only against `master.db`.
+//!
+//! **PQTZ only.** `rekordcrate` 0.3 parses the PSSI song-structure section, and
+//! even handles its RB6+ encryption, but `SongStructure` keeps every field
+//! private with no accessor, so the phrase labels cannot be read without forking
+//! the crate. That costs less than it sounds: the beat grid numbers beats within
+//! the bar, so counting from the first downbeat gives a 16-beat grid anchored at
+//! the track's own start. For dance music that is phrase-aligned in practice —
+//! an assumption worth stating rather than a guarantee, and the reason
+//! `phrase_phase` below is derived rather than read.
+
+use anyhow::{bail, Context, Result};
+use binrw::BinRead;
+use clap::{Parser, Subcommand};
+use rekord_ripper::db::MasterDb;
+use rekordcrate::anlz::{Content, ANLZ};
+use std::fs;
+use std::io::Cursor;
+use std::path::PathBuf;
+
+#[derive(Parser)]
+#[command(about = "Beat-grid ground truth from the local rekordbox library")]
+struct Args {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// List analysed tracks, so you can find one to dump.
+    List {
+        /// Keep only titles or artists containing this, case-insensitive.
+        query: Option<String>,
+    },
+    /// Write a beat-grid TSV for one track.
+    Dump {
+        /// Title or artist substring, case-insensitive. Must match one track.
+        query: String,
+        /// Where to write. Defaults to stdout.
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+    },
+}
+
+struct Track {
+    title: String,
+    artist: String,
+    /// Hundredths of a BPM, as rekordbox stores it.
+    bpm: Option<i64>,
+    anlz: String,
+}
+
+/// Analysed tracks only — a track with no `AnalysisDataPath` has no beat grid,
+/// so it cannot be ground truth for anything.
+fn tracks(db: &MasterDb, query: Option<&str>) -> Result<Vec<Track>> {
+    let mut stmt = db.conn.prepare(
+        "SELECT c.Title, a.Name AS Artist, c.BPM, c.AnalysisDataPath
+         FROM djmdContent c
+         LEFT JOIN djmdArtist a ON a.ID = c.ArtistID
+         WHERE c.AnalysisDataPath IS NOT NULL AND c.AnalysisDataPath <> ''
+         ORDER BY a.Name, c.Title",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(Track {
+            title: r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+            artist: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            bpm: r.get(2)?,
+            anlz: r.get(3)?,
+        })
+    })?;
+
+    let needle = query.map(str::to_lowercase);
+    let mut out = Vec::new();
+    for t in rows {
+        let t = t?;
+        let keep = match &needle {
+            None => true,
+            Some(n) => {
+                t.title.to_lowercase().contains(n) || t.artist.to_lowercase().contains(n)
+            }
+        };
+        if keep {
+            out.push(t);
+        }
+    }
+    Ok(out)
+}
+
+fn bpm_str(bpm: Option<i64>) -> String {
+    bpm.map(|b| format!("{:.2}", b as f64 / 100.0))
+        .unwrap_or_else(|| "-".into())
+}
+
+/// The beats of a track, in file order. `beat_number` is 1..4, its position in
+/// the bar, which is the whole reason this tool exists.
+fn beat_grid(db: &MasterDb, track: &Track) -> Result<Vec<(u32, u16)>> {
+    let path = db.resolve_analysis_path(&track.anlz);
+    let bytes = fs::read(&path)
+        .with_context(|| format!("reading ANLZ at {}", path.display()))?;
+    let anlz = ANLZ::read(&mut Cursor::new(&bytes))
+        .map_err(|e| anyhow::anyhow!("parsing {}: {e}", path.display()))?;
+
+    for section in &anlz.sections {
+        if let Content::BeatGrid(grid) = &section.content {
+            return Ok(grid.beats.iter().map(|b| (b.time, b.beat_number)).collect());
+        }
+    }
+    bail!(
+        "no PQTZ beat grid in {} — the track is in the database but not analysed",
+        path.display()
+    )
+}
+
+fn dump(db: &MasterDb, query: &str, out: Option<PathBuf>) -> Result<()> {
+    let found = tracks(db, Some(query))?;
+    if found.is_empty() {
+        bail!("nothing matches {query:?}");
+    }
+    if found.len() > 1 {
+        eprintln!("{} tracks match {query:?}:", found.len());
+        for t in found.iter().take(12) {
+            eprintln!("  {} — {}", t.artist, t.title);
+        }
+        bail!("narrow the query so it matches one track");
+    }
+    let track = &found[0];
+    let beats = beat_grid(db, track)?;
+    if beats.is_empty() {
+        bail!("the beat grid for {:?} is empty", track.title);
+    }
+
+    // Anchor the phrase grid on the first beat the grid calls beat 1. Counting
+    // from the file's first entry instead would put the anchor wherever rekordbox
+    // happened to start, which is not a downbeat.
+    let first_downbeat = beats
+        .iter()
+        .position(|&(_, n)| n == 1)
+        .context("no beat is numbered 1, so there is no downbeat to anchor to")?;
+
+    let mut s = String::new();
+    s.push_str(&format!("# artist\t{}\n", track.artist));
+    s.push_str(&format!("# title\t{}\n", track.title));
+    s.push_str(&format!("# bpm\t{}\n", bpm_str(track.bpm)));
+    s.push_str(&format!("# beats\t{}\n", beats.len()));
+    s.push_str("# phrase_phase is derived: beats from the first downbeat, mod 16\n");
+    s.push_str("time_ms\tbeat_in_bar\tbeat_in_track\tphrase_phase\n");
+    for (i, &(time, beat_in_bar)) in beats.iter().enumerate() {
+        // Signed, so beats before the first downbeat get a negative index rather
+        // than wrapping into a wrong phase.
+        let n = i as i64 - first_downbeat as i64;
+        let phase = n.rem_euclid(16);
+        s.push_str(&format!("{time}\t{beat_in_bar}\t{n}\t{phase}\n"));
+    }
+
+    match out {
+        Some(p) => {
+            fs::write(&p, s).with_context(|| format!("writing {}", p.display()))?;
+            eprintln!(
+                "{} beats for {} — {} → {}",
+                beats.len(),
+                track.artist,
+                track.title,
+                p.display()
+            );
+        }
+        None => print!("{s}"),
+    }
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+    // Read-only, so a running rekordbox is not the hazard it is for a write.
+    // Worth saying out loud because the WAL may hold writes we cannot see.
+    if rekord_ripper::db::rekordbox_running() {
+        eprintln!("note: rekordbox is running; recent edits may not be in master.db yet");
+    }
+    let db = MasterDb::open()?;
+
+    match args.cmd {
+        Cmd::List { query } => {
+            let found = tracks(&db, query.as_deref())?;
+            println!("{} analysed tracks", found.len());
+            for t in &found {
+                println!("{:>8}  {} — {}", bpm_str(t.bpm), t.artist, t.title);
+            }
+        }
+        Cmd::Dump { query, out } => dump(&db, &query, out)?,
+    }
+    Ok(())
+}

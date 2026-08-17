@@ -6,7 +6,17 @@ members = ["crates/script-env", "crates/validator", "crates/wsframe"]
 # libclang, while the espup toolchain exports LIBCLANG_PATH pointing at the
 # xtensa one. Both settings are correct for their own crate and cannot coexist
 # in one config tree, so audio-bridge gets its own build root.
-exclude = ["firmware", "dmx-bridge", "crates/audio-bridge"]
+#
+# grid-truth is excluded on dependency grounds rather than toolchain ones: it
+# pulls SQLCipher and a vendored OpenSSL, and is macOS/Windows-only by a
+# compile_error!. It is a dev tool run by hand, so neither belongs in the tree of
+# a bare `cargo test` at the root.
+exclude = [
+    "firmware",
+    "dmx-bridge",
+    "crates/audio-bridge",
+    "crates/grid-truth",
+]
 
 [workspace.dependencies]
 # Restriction features shared by validator and firmware so both sides parse

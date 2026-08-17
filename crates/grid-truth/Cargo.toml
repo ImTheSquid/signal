@@ -1,0 +1,26 @@
+[package]
+name = "grid-truth"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Outside the workspace, and for the same kind of reason audio-bridge is: it
+# pulls SQLCipher and a vendored OpenSSL that nothing else here wants, and
+# rekord-ripper is macOS/Windows-only by a compile_error!. Neither belongs in the
+# dependency tree of a bare `cargo test` at the root.
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+
+# Carries the obfuscated SQLCipher key for rekordbox 6.x/7.x master.db, the app
+# directory lookup, and the decrypt-verify-by-forcing-a-read dance. A path dep
+# rather than the crates.io release on purpose: a stale key silently fails to
+# decrypt, so tracking the local checkout is the safer default for a tool that
+# only ever runs on a machine with rekordbox installed anyway.
+rekord-ripper = { path = "../../../rekord-ripper" }
+
+# Parses the ANLZ tags rekord-ripper copies as opaque blobs. PQTZ only — see the
+# note in main.rs about PSSI.
+rekordcrate = "0.3"
+binrw = "0.14"
