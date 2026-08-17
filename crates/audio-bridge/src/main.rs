@@ -223,14 +223,14 @@ fn probe_header() {
     // relative by construction and so can never show a bass kill, which is
     // exactly what you go looking for when tuning.
     println!(
-        "t\tlow\tmid\thigh\tenergy\traw_low\traw_mid\traw_high\tflux\tbuild\tbpm\tconf\tnext_ms\tbeat\tflags\tphase\tsigma"
+        "t\tlow\tmid\thigh\tenergy\traw_low\traw_mid\traw_high\tflux\tbuild\tbpm\tconf\tnext_ms\tbeat\tflags\tphase\tsigma\tmodel_bpm"
     );
 }
 
 fn probe_row(t: f64, r: &HopResult, flags: u8) {
     let bpm = r.grid.period_ms.map(|p| 60_000.0 / p).unwrap_or(0.0);
     println!(
-        "{t:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.5}\t{:.5}\t{:.5}\t{:.3}\t{:+.3}\t{bpm:.2}\t{:.3}\t{}\t{}\t{flags:#06b}\t{}\t{:.2}",
+        "{t:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.5}\t{:.5}\t{:.5}\t{:.3}\t{:+.3}\t{bpm:.2}\t{:.3}\t{}\t{}\t{flags:#06b}\t{}\t{:.2}\t{}",
         r.levels.low,
         r.levels.mid,
         r.levels.high,
@@ -248,6 +248,10 @@ fn probe_row(t: f64, r: &HopResult, flags: u8) {
         u8::from(r.beat),
         r.phrase.phase_of(r.grid.beat_index),
         r.phrase.excess_sigma,
+        r.grid
+            .model_bpm
+            .map(|b| format!("{b:.2}"))
+            .unwrap_or_else(|| "-".into()),
     );
 }
 

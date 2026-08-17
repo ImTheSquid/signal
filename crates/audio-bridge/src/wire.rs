@@ -282,6 +282,8 @@ mod tests {
                 coasting: false,
                 ms_since_beat: Some(40.0),
                 onset_strength: 0.5,
+                // Diagnostics only; nothing in the block encodes it.
+                model_bpm: Some(128.0),
             },
             levels: Levels {
                 low: 1.0,

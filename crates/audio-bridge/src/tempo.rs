@@ -127,6 +127,11 @@ pub struct Grid {
     pub ms_since_beat: Option<f32>,
     /// How strong the last detected beat was, 0..=1.
     pub onset_strength: f32,
+    /// What TempoCNN last said, before `consider_period` accepted or refused it.
+    /// None until the model has its first 11.89s window. Diagnostics only — it is
+    /// not encoded onto the wire, and it exists to tell "the model was wrong" apart
+    /// from "the model was overruled", which look identical from the outside.
+    pub model_bpm: Option<f32>,
 }
 
 /// The seam that keeps aubio a bet rather than a commitment. Everything
@@ -148,8 +153,15 @@ pub struct AubioTracker {
     period_ms: Option<f32>,
     /// Period fitted through recent beat instants, preferred when available.
     fitted_period_ms: Option<f32>,
-    /// Decides which metrical level aubio's periodicity actually is.
+    /// Decides which metrical level aubio's periodicity actually is. Still the
+    /// bootstrap for the model's first 11.89s.
     metrical: crate::metrical::Metrical,
+    /// TempoCNN's features and the thread that runs it.
+    mel: crate::melbands::MelBands,
+    model: crate::tempo_model::TempoWorker,
+    hops_per_submit: u32,
+    since_submit: u32,
+    model_bpm_last: Option<f32>,
     beat_times: std::collections::VecDeque<f64>,
     anchor_ms: f64,
     /// Fractional beats elapsed, integrated per hop against the current period,
@@ -185,6 +197,13 @@ impl AubioTracker {
             period_ms: None,
             fitted_period_ms: None,
             metrical: crate::metrical::Metrical::new(sample_rate),
+            mel: crate::melbands::MelBands::new(sample_rate)?,
+            model: crate::tempo_model::TempoWorker::spawn(),
+            // Roughly once a second. The model's window spans 11.89s, so consecutive
+            // runs overlap almost entirely and a faster cadence buys nothing.
+            hops_per_submit: (sample_rate as f32 / HOP as f32).round() as u32,
+            since_submit: u32::MAX,
+            model_bpm_last: None,
             beat_times: std::collections::VecDeque::with_capacity(BEAT_HISTORY),
             anchor_ms: 0.0,
             beats_elapsed: 0.0,
@@ -349,6 +368,56 @@ impl AubioTracker {
     fn effective_period(&self) -> Option<f32> {
         self.fitted_period_ms.or(self.period_ms)
     }
+
+    /// Take the model's period as the grid's, and drop a fit that disagrees with it.
+    ///
+    /// The fit is the other thing that latched: `fitted_period_ms` is preferred over
+    /// `period_ms` and is sticky, so one measured at the bootstrap's wrong level
+    /// survived every later correction. Clearing on *change* was the wrong test —
+    /// a stable wrong fit never changes. Clearing on *disagreement* is the right one.
+    ///
+    /// Once cleared it re-fits at the correct level and earns its keep: `fit_period`
+    /// rejects gaps that are not near-whole multiples of the seed, which is what a
+    /// wrong level produces, so a fit that succeeds now refines the model's 1 BPM
+    /// classes to ~0.04 BPM.
+    fn adopt(&mut self, bpm: f32) {
+        if !(MIN_BPM..=MAX_BPM).contains(&bpm) {
+            return;
+        }
+        let period = 60_000.0 / bpm;
+        if let Some(fitted) = self.fitted_period_ms {
+            if (fitted - period).abs() / period > FIT_SANITY {
+                self.fitted_period_ms = None;
+            }
+        }
+        self.period_ms = Some(period);
+        self.pending_period_ms = None;
+    }
+
+    /// Feed the model and read whatever it last concluded.
+    ///
+    /// Submission is rate-limited because inference costs ~121ms; back-to-back runs
+    /// would peg a core for an answer that only changes between tracks. Gated on
+    /// `audible` for the same reason the comb is — a comb over an inaudible passage
+    /// locks to a 1Hz pad, and there is no reason to believe a model trained on music
+    /// does anything more sensible with silence.
+    fn model_bpm(&mut self, hop: &[f32]) -> Option<f32> {
+        if self.mel.push(hop).is_err() {
+            return None;
+        }
+
+        self.since_submit = self.since_submit.saturating_add(1);
+        if self.audible && self.since_submit >= self.hops_per_submit {
+            if let Some(window) = self.mel.window() {
+                self.since_submit = 0;
+                self.model.submit(window);
+            }
+        }
+
+        let estimate = self.model.latest()?;
+        self.model_bpm_last = Some(estimate.bpm);
+        Some(estimate.bpm)
+    }
 }
 
 impl Tracker for AubioTracker {
@@ -362,18 +431,32 @@ impl Tracker for AubioTracker {
 
         self.update_confidence(self.tempo.get_confidence(), levels);
 
-        // Resolve the metrical level before anything is adopted. A level change
-        // invalidates the fit: it was measured through beat instants spaced at the
-        // old level, and it is preferred over aubio's estimate, so leaving it in
-        // place would quietly undo the correction.
+        // Keep the comb running regardless: it is the bootstrap. The model needs
+        // 11.89s of audio before it has anything to say, and going gridless for
+        // twelve seconds at the top of a set is worse than a possibly-wrong grid.
         let was = self.metrical.ratio();
-        let bpm = self
+        let combed = self
             .metrical
             .resolve(levels.flux, self.tempo.get_bpm(), self.audible);
         if self.metrical.ratio() != was {
             self.fitted_period_ms = None;
         }
-        self.consider_period(bpm);
+
+        // Prefer the model once it speaks. It is right on 90% of library tracks
+        // against the comb's 68%, and it is the only one of the two that can tell a
+        // correct 127 BPM from a 127 that should be 190.
+        //
+        // It does *not* go through `consider_period`. That machinery — the confidence
+        // floor, the degraded band, the refused-jump escape — exists to stop aubio
+        // oscillating between decks on a noisy estimate, and it treats a late-arriving
+        // better answer as exactly the kind of jump it should refuse. Measured: the
+        // comb latched 196.76 during the model's 11.89s bootstrap, and the model's
+        // correct 130.05 was then held off for the rest of the track. Three of six
+        // wrong tempi were the model being overruled rather than being wrong.
+        match self.model_bpm(hop) {
+            Some(from_model) => self.adopt(from_model),
+            None => self.consider_period(combed),
+        }
 
         if let Some(period) = self.effective_period() {
             let hop_ms = HOP as f64 * 1000.0 / self.sample_rate as f64;
@@ -414,6 +497,7 @@ impl Tracker for AubioTracker {
             coasting: coasting && period_ms.is_some(),
             ms_since_beat: self.last_beat_ms.map(|at| (now - at) as f32),
             onset_strength: self.last_beat_strength,
+            model_bpm: self.model_bpm_last,
         }
     }
 }
