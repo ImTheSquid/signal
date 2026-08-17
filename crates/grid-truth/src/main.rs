@@ -56,13 +56,17 @@ struct Track {
     /// Hundredths of a BPM, as rekordbox stores it.
     bpm: Option<i64>,
     anlz: String,
+    /// The audio itself. Recorded in the TSV so a truth file names what it is
+    /// truth *about* — the scorer needs the two together and nothing else links
+    /// them.
+    folder: Option<String>,
 }
 
 /// Analysed tracks only — a track with no `AnalysisDataPath` has no beat grid,
 /// so it cannot be ground truth for anything.
 fn tracks(db: &MasterDb, query: Option<&str>) -> Result<Vec<Track>> {
     let mut stmt = db.conn.prepare(
-        "SELECT c.Title, a.Name AS Artist, c.BPM, c.AnalysisDataPath
+        "SELECT c.Title, a.Name AS Artist, c.BPM, c.AnalysisDataPath, c.FolderPath
          FROM djmdContent c
          LEFT JOIN djmdArtist a ON a.ID = c.ArtistID
          WHERE c.AnalysisDataPath IS NOT NULL AND c.AnalysisDataPath <> ''
@@ -74,6 +78,7 @@ fn tracks(db: &MasterDb, query: Option<&str>) -> Result<Vec<Track>> {
             artist: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
             bpm: r.get(2)?,
             anlz: r.get(3)?,
+            folder: r.get(4)?,
         })
     })?;
 
@@ -124,10 +129,34 @@ fn dump(db: &MasterDb, query: &str, out: Option<PathBuf>) -> Result<()> {
     if found.is_empty() {
         bail!("nothing matches {query:?}");
     }
-    if found.len() > 1 {
-        eprintln!("{} tracks match {query:?}:", found.len());
-        for t in found.iter().take(12) {
-            eprintln!("  {} — {}", t.artist, t.title);
+
+    // A library that has moved between machines holds a row per machine for the
+    // same song — same title, different absolute path, its own analysis
+    // directory. Only one of those paths exists here, and it is the only one that
+    // can be scored, so prefer it and treat the rest as the duplicates they are.
+    let local: Vec<&Track> = found
+        .iter()
+        .filter(|t| {
+            t.folder
+                .as_deref()
+                .is_some_and(|p| std::path::Path::new(p).exists())
+        })
+        .collect();
+    let found: Vec<&Track> = match local.is_empty() {
+        true => found.iter().collect(),
+        false => local,
+    };
+
+    let mut files: Vec<&str> = found
+        .iter()
+        .map(|t| t.folder.as_deref().unwrap_or(""))
+        .collect();
+    files.sort_unstable();
+    files.dedup();
+    if files.len() > 1 {
+        eprintln!("{} distinct tracks match {query:?}:", files.len());
+        for f in files.iter().take(12) {
+            eprintln!("  {f}");
         }
         bail!("narrow the query so it matches one track");
     }
@@ -150,6 +179,10 @@ fn dump(db: &MasterDb, query: &str, out: Option<PathBuf>) -> Result<()> {
     s.push_str(&format!("# title\t{}\n", track.title));
     s.push_str(&format!("# bpm\t{}\n", bpm_str(track.bpm)));
     s.push_str(&format!("# beats\t{}\n", beats.len()));
+    s.push_str(&format!(
+        "# file\t{}\n",
+        track.folder.as_deref().unwrap_or("-")
+    ));
     s.push_str("# phrase_phase is derived: beats from the first downbeat, mod 16\n");
     s.push_str("time_ms\tbeat_in_bar\tbeat_in_track\tphrase_phase\n");
     for (i, &(time, beat_in_bar)) in beats.iter().enumerate() {
@@ -188,10 +221,29 @@ fn main() -> Result<()> {
     match args.cmd {
         Cmd::List { query } => {
             let found = tracks(&db, query.as_deref())?;
-            println!("{} analysed tracks", found.len());
+            // Whether the audio is reachable decides whether a track can be
+            // scored at all. A library that has travelled between machines is
+            // mostly grids without files: Windows paths, another Mac's paths, and
+            // `soundcloud:tracks:…` for anything that was only ever streamed.
+            let mut local = 0;
             for t in &found {
-                println!("{:>8}  {} — {}", bpm_str(t.bpm), t.artist, t.title);
+                let here = t
+                    .folder
+                    .as_deref()
+                    .is_some_and(|p| std::path::Path::new(p).exists());
+                local += u32::from(here);
+                println!(
+                    "{} {:>8}  {} — {}",
+                    if here { "audio" } else { "  -  " },
+                    bpm_str(t.bpm),
+                    t.artist,
+                    t.title
+                );
             }
+            println!(
+                "\n{} analysed tracks, {local} with audio reachable on this machine",
+                found.len()
+            );
         }
         Cmd::Dump { query, out } => dump(&db, &query, out)?,
     }
