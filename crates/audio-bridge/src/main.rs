@@ -12,6 +12,7 @@ mod analysis;
 mod bands;
 mod capture;
 mod downbeat;
+mod melbands;
 mod meter;
 mod metrical;
 mod score;

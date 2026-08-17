@@ -3,6 +3,10 @@ node_modules/
 dist/
 target/
 target-steamos/
+# Fetched and checksummed by crates/audio-bridge/build.rs, not tracked: 11.7MB is
+# six times the largest blob here and there is no git-lfs. Deliberately outside
+# target/ so `cargo clean` keeps it.
+crates/audio-bridge/models/
 .env
 .DS_Store
 .vercel

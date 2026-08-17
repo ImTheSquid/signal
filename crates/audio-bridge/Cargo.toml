@@ -6,6 +6,23 @@ edition = "2021"
 [dependencies]
 cpal = "0.15"
 anyhow = "1"
+# TempoCNN's period estimate, run as generated Rust rather than through a runtime.
+# Pre-release because burn-import 0.19 panics on the model's asymmetric padding —
+# `same` padding with an even kernel — and only the 0.22 tree represents it. Pinned
+# exactly, and `deck/build.sh` already passes `--locked`, so it cannot drift.
+burn = { version = "=0.22.0-pre.2", default-features = false, features = [
+    "ndarray",
+    "std",
+] }
+# The code burn-import generates loads its weights through this and imports it by
+# name, so it has to be a direct dependency rather than transitive.
+burn-store = "=0.22.0-pre.2"
+# 11025Hz for the model, from whatever rate the device negotiated. 48k is 147/640
+# and 44.1k is exactly 1/4, so this cannot be a fixed decimation.
+rubato = "0.16"
+# Real-input FFT for the model's spectrogram. The Butterworth bands the light uses
+# are unrelated and stay in the time domain.
+realfft = "3"
 # Lock-free SPSC ring: the audio callback must never allocate or block, and this
 # is the handoff to the analysis thread.
 rtrb = "0.3"
@@ -38,3 +55,16 @@ bliss-audio-aubio-rs = { version = "0.2.4", default-features = false, features =
 bliss-audio-aubio-rs = { version = "0.2.4", default-features = false, features = [
     "builtin",
 ] }
+
+# `onnx` only. The default features pull `safetensors`, which pulls a candle-core
+# that burn-import no longer compiles against — a non-exhaustive match on DType's
+# newer float variants. Reading an ONNX file needs none of it.
+#
+# All three are pure Rust, which is the point: the Deck's build container stays a
+# stock rust image plus the ALSA headers, with no ONNX Runtime to cross-compile.
+[build-dependencies]
+burn-import = { version = "=0.22.0-pre.1", default-features = false, features = [
+    "onnx",
+] }
+sha2 = "0.10"
+ureq = { version = "3", default-features = false, features = ["rustls"] }
