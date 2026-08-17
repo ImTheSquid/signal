@@ -13,6 +13,7 @@ mod bands;
 mod capture;
 mod downbeat;
 mod meter;
+mod metrical;
 mod score;
 mod tempo;
 mod wire;

@@ -75,8 +75,8 @@ const ENERGY_FAST_S: f32 = 2.0;
 const ENERGY_SLOW_S: f32 = 60.0;
 
 /// Tempi outside this are not dance music, and accepting them costs a grid.
-const MIN_BPM: f32 = 60.0;
-const MAX_BPM: f32 = 200.0;
+pub const MIN_BPM: f32 = 60.0;
+pub const MAX_BPM: f32 = 200.0;
 
 /// Beat instants kept for the period fit.
 ///
@@ -148,6 +148,8 @@ pub struct AubioTracker {
     period_ms: Option<f32>,
     /// Period fitted through recent beat instants, preferred when available.
     fitted_period_ms: Option<f32>,
+    /// Decides which metrical level aubio's periodicity actually is.
+    metrical: crate::metrical::Metrical,
     beat_times: std::collections::VecDeque<f64>,
     anchor_ms: f64,
     /// Fractional beats elapsed, integrated per hop against the current period,
@@ -182,6 +184,7 @@ impl AubioTracker {
             samples_seen: 0,
             period_ms: None,
             fitted_period_ms: None,
+            metrical: crate::metrical::Metrical::new(sample_rate),
             beat_times: std::collections::VecDeque::with_capacity(BEAT_HISTORY),
             anchor_ms: 0.0,
             beats_elapsed: 0.0,
@@ -358,7 +361,19 @@ impl Tracker for AubioTracker {
         self.samples_seen += hop.len() as u64;
 
         self.update_confidence(self.tempo.get_confidence(), levels);
-        self.consider_period(self.tempo.get_bpm());
+
+        // Resolve the metrical level before anything is adopted. A level change
+        // invalidates the fit: it was measured through beat instants spaced at the
+        // old level, and it is preferred over aubio's estimate, so leaving it in
+        // place would quietly undo the correction.
+        let was = self.metrical.ratio();
+        let bpm = self
+            .metrical
+            .resolve(levels.flux, self.tempo.get_bpm(), self.audible);
+        if self.metrical.ratio() != was {
+            self.fitted_period_ms = None;
+        }
+        self.consider_period(bpm);
 
         if let Some(period) = self.effective_period() {
             let hop_ms = HOP as f64 * 1000.0 / self.sample_rate as f64;
