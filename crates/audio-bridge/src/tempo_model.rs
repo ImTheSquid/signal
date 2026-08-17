@@ -42,6 +42,57 @@ const DOUBLE_MASS: f32 = 0.05;
 /// BPM either side of a target counted as that target's mass.
 const MASS_WIDTH: usize = 3;
 
+/// Inference measured at **121ms** per window in release on an M-series Mac, and a
+/// Steam Deck is slower. That is far too long to sit in the hop loop: it would stall
+/// audio processing and put that much jitter into the beat instants the light
+/// schedules against.
+///
+/// So it runs on its own thread. Submitting is non-blocking and drops the window if
+/// the worker is still busy, which is the right thing to lose — the window slides,
+/// so a newer one is along in a moment. A slower machine simply updates its tempo
+/// less often instead of falling behind the audio.
+pub struct TempoWorker {
+    tx: std::sync::mpsc::SyncSender<Window>,
+    latest: std::sync::Arc<std::sync::Mutex<Option<Estimate>>>,
+}
+
+impl TempoWorker {
+    pub fn spawn() -> Self {
+        // Capacity 1: at most one window queued, and `try_send` rather than `send`
+        // so a busy worker never backs up into the caller.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Window>(1);
+        let latest = std::sync::Arc::new(std::sync::Mutex::new(None));
+
+        let out = latest.clone();
+        std::thread::Builder::new()
+            .name("tempo-model".into())
+            .spawn(move || {
+                // Built here, so loading 11.7MB of weights never blocks the caller
+                // and the model itself never crosses a thread boundary.
+                let model = TempoModel::new();
+                while let Ok(window) = rx.recv() {
+                    let estimate = model.estimate(&window);
+                    if let Ok(mut slot) = out.lock() {
+                        *slot = Some(estimate);
+                    }
+                }
+            })
+            .expect("could not spawn the tempo model thread");
+
+        TempoWorker { tx, latest }
+    }
+
+    /// Hand over a window if the worker is idle. Never blocks.
+    pub fn submit(&self, window: Window) {
+        let _ = self.tx.try_send(window);
+    }
+
+    /// The most recent estimate, or None until the first one lands.
+    pub fn latest(&self) -> Option<Estimate> {
+        self.latest.lock().ok().and_then(|s| *s)
+    }
+}
+
 pub struct TempoModel {
     model: generated::Model,
     device: Device,
@@ -213,6 +264,60 @@ mod tests {
             "peak probability {} against ONNX Runtime's 0.395794",
             e.peak
         );
+    }
+
+    /// Why the worker thread exists: inference is far slower than a hop. Measured at
+    /// 121ms in release, against a 5.33ms hop. Informational rather than a bound,
+    /// since the whole design assumes it is slow.
+    #[test]
+    fn inference_costs_what_the_thread_is_for() {
+        let m = TempoModel::new();
+        let w = Window(vec![0.4; N_MELS * FRAMES]);
+        m.estimate(&w); // warm any lazy allocation
+
+        let runs = 4;
+        let start = std::time::Instant::now();
+        for _ in 0..runs {
+            m.estimate(&w);
+        }
+        println!(
+            "inference: {:.1}ms each ({} build)",
+            (start.elapsed() / runs).as_secs_f64() * 1000.0,
+            if cfg!(debug_assertions) { "debug" } else { "release" }
+        );
+    }
+
+    /// The property the hop loop depends on: handing over a window is free, whether
+    /// or not the worker is busy. If this ever blocks, audio processing stalls.
+    #[test]
+    fn submitting_never_blocks_the_caller() {
+        let worker = TempoWorker::spawn();
+        let start = std::time::Instant::now();
+        // Far more than the queue holds, so most of these are dropped by design.
+        for _ in 0..50 {
+            worker.submit(Window(vec![0.4; N_MELS * FRAMES]));
+        }
+        let spent = start.elapsed();
+        assert!(
+            spent < std::time::Duration::from_millis(50),
+            "50 submissions took {spent:?}, so submit is blocking on the worker"
+        );
+    }
+
+    /// And an estimate does eventually arrive.
+    #[test]
+    fn the_worker_produces_an_estimate() {
+        let worker = TempoWorker::spawn();
+        assert!(worker.latest().is_none(), "had an estimate before any window");
+        worker.submit(Window(vec![0.4; N_MELS * FRAMES]));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while worker.latest().is_none() {
+            assert!(std::time::Instant::now() < deadline, "no estimate in 30s");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let e = worker.latest().unwrap();
+        assert!(e.bpm > 0.0, "estimate has a nonsense tempo: {}", e.bpm);
     }
 
     /// The weights have to actually load. `Model::new` returns uninitialised
