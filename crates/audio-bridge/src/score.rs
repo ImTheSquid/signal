@@ -94,6 +94,15 @@ pub struct Score {
     locked: u32,
     hits_bar: u32,
     hits_phrase: u32,
+    /// How often each `(estimated - truth) mod 16` offset came up.
+    ///
+    /// The absolute hit rates above punish a constant offset as hard as random
+    /// noise, and those are different faults: the tempo grid sitting half a beat
+    /// off rekordbox's shifts every comparison the same way, which is the tracker
+    /// mis-placing beats rather than this mis-placing the phrase. A sharp peak
+    /// here means the phrase is being found and merely mis-labelled; a flat
+    /// histogram means it is not being found.
+    offset_hist: [u32; 16],
     align_err_ms: Vec<f64>,
     /// Beats of evidence the clock held at the last scored beat. Distinguishes a
     /// low score from a clock that had barely started, and drops on a reset.
@@ -110,6 +119,7 @@ impl Score {
             locked: 0,
             hits_bar: 0,
             hits_phrase: 0,
+            offset_hist: [0; 16],
             align_err_ms: Vec::new(),
             evidence: 0,
         }
@@ -139,8 +149,10 @@ impl Score {
 
         let (bt, bar, phrase) = self.truth.nearest(t_s * 1000.0);
         self.align_err_ms.push(t_s * 1000.0 - bt);
+        let est = r.phrase.phase_of(r.grid.beat_index);
         self.hits_bar += u32::from(r.phrase.bar_phase_of(r.grid.beat_index) == bar);
-        self.hits_phrase += u32::from(r.phrase.phase_of(r.grid.beat_index) == phrase);
+        self.hits_phrase += u32::from(est == phrase);
+        self.offset_hist[((est + 16 - phrase) % 16) as usize] += 1;
         self.evidence = r.phrase.beats;
     }
 
@@ -170,6 +182,22 @@ impl Score {
             "  phrase phase    {}   (vs 16 from the first downbeat — assumes the \
              track starts on a phrase)",
             pct(self.hits_phrase, self.locked)
+        );
+
+        // The one that separates "found the phrase and mislabelled it" from "did
+        // not find the phrase". 1/16 is 6% — chance.
+        let total: u32 = self.offset_hist.iter().sum();
+        let best = self
+            .offset_hist
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, &n)| n)
+            .map(|(i, &n)| (i, n))
+            .unwrap_or((0, 0));
+        eprintln!(
+            "  consistency     {}   at a constant offset of {} beats (chance 6%)",
+            pct(best.1, total),
+            best.0
         );
 
         if self.align_err_ms.is_empty() {
