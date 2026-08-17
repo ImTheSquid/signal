@@ -17,6 +17,7 @@ mod meter;
 mod metrical;
 mod score;
 mod tempo;
+mod tempo_model;
 mod wire;
 
 use std::time::{Duration, Instant};
