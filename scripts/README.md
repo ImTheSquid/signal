@@ -268,15 +268,53 @@ script keeps only the part the light owns.
 
 | | `follow.rhai` | `pulse.rhai` |
 |---|---|---|
-| on-grid @128 BPM | 0.364 | **0.871** |
+| on-grid @128 BPM | 0.364 | **0.951** |
 | on-grid @100 BPM | — | **0.980** |
-| relay ops/min R/Y/G | 216/90/240 | 223/169/272 |
+| relay ops/min R/Y/G | 216/90/240 | 168/202/165 |
 | components | `array,math` | `array` |
 
 **It is sent a prediction, not an event.** The block says "the next beat is in N ms, the period
 is P", so the script runs the grid forward itself. That is what lets it schedule around the
 100ms relay dwell instead of chasing a signal it is always a fraction of a beat behind, and it
-makes loss cheap: 75% packet loss costs 0.871 → 0.833 rather than the lock.
+makes loss cheap: 75% packet loss costs 0.951 → 0.949 rather than the lock.
+
+### What decides what is lit
+
+Not the six looks `follow.rhai` uses. Those measured **1.80x** on the one test that matches what
+an observer does — train a lookup table on half a run, predict the other half — against a floor
+of guessing the commonest state forever. Nothing repeated verbatim (0.000 at four beats and at
+eight) and it was still readable, because six deterministic programs behind a slow mode switch
+is a grammar: three or four slots identify which look is running and the look determines the
+rest. Marginal statistics could not see that. `an_observer_learns_nothing_by_watching` can, and
+the parametric generator below measures **1.01x**.
+
+Every cycle is decided at its first slot and then only read back. Drawing per slot instead
+re-rolls what the lamps have already answered.
+
+| drawn | every | what it is |
+|---|---|---|
+| `perm` | 5 cycles | which lamp leads, drawn weighted by band level rather than ranked by it |
+| `hold_lamp` | 7 cycles | one lamp rides the whole cycle, a third of the time, never twice running |
+| `onsets`, `rot` | 1–3 cycles | the rhythm: E(k,4) rotated — a Euclidean pattern and one of its rotations |
+| `ph`, `walk`, width | every cycle | where in `perm` each attack starts, and how far it steps |
+
+The periods are pairwise coprime and coprime with the four-slot grid, so the clocks never reset
+together — joint period 35 cycles rather than 2. Powers of two nested on a shared origin was the
+real fault: the *values* were random, the *change points* were not, and change points are what
+the eye locks onto.
+
+Three things are deliberate and were each arrived at by measuring the alternative:
+
+- **Weighted, not ranked.** Ranking the lamps by band level is a colour organ, and popular music's
+  spectrum is stable for bars at a time, so bass meant red for a whole section. Drawing the leader
+  with the bands as weights keeps the music visible without being a function of it. Equal bands
+  fall out as a uniform draw, so a dead-colour stretch needs no special case.
+- **The rhythm rides, the lamps do not.** Re-drawing everything every cycle took beat-to-beat
+  repetition to 0.000, which reads as flicker rather than phrasing. A random 1–3 cycle span, so
+  the boundary is not itself learnable.
+- **Width includes zero.** A non-attack slot holds what the last attack left, so drawing width
+  high pins the light near fully lit — measured at 0.77 duty and 2.34 bits/slot, brighter and
+  blander than the 0.63 and 2.71 it gets by allowing dark attacks.
 
 ### The beat block
 
@@ -325,7 +363,27 @@ bindgen needs the macOS libclang, which the firmware's espup toolchain overrides
   simply cannot be rendered, so the cycle doubles rather than asking for transitions the relays
   will refuse.
 
-Re-run `cargo test -p script-env --test pulse` after any change.
+### Cadence is now a secondary guard
+
+The modal-gap-share bar was 0.52 and is 0.55. It was a proxy for predictability adopted when
+there was no direct measure, and the two pull against each other: a sparser rhythm spreads the
+gaps *and* makes the next slot easier to guess, because holding still is predictable. Measured,
+biasing toward sparse moved cadence 0.51 → 0.49 and predictability 1.01x → 1.17x. The concern
+cadence encoded — that the eye gives up on *which* lamp and predicts *when* — is now tested
+directly by conditioning the observer on the position in the beat, which buys it nothing.
+
+### The RNG has to be real
+
+Everything here rests on `rand_int`, so where its entropy comes from is load-bearing rather than
+incidental. `Handlers::stubs()` seeds a fixed xorshift on purpose, so validation is reproducible;
+the tests override it per seed, because one draw of a stochastic script measures one draw. The
+device passes `esp_random()` — the hardware RNG, true random with RF up, which it always is by
+the time a packet has arrived. A fixed seed anywhere on that path would mean the light replays
+one identical pattern from every boot, and none of the rest of this would reach the room.
+
+Re-run `cargo test -p script-env --test pulse` after any change. `tests/entropy_probe.rs` prints
+the same measures across nine seeds and ten simulated minutes; it asserts nothing, and it is
+where a tuning decision should be checked before it becomes a bar in `pulse.rs`.
 
 ## `dmxcap.mjs` and `watch.mjs`
 
