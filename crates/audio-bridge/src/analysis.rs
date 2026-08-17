@@ -7,6 +7,7 @@
 use anyhow::{bail, Context, Result};
 
 use crate::bands::{Bands, Levels};
+use crate::downbeat::{Phrase, PhraseClock};
 use crate::tempo::{AubioTracker, Grid, Tracker, HOP};
 use crate::wire::Beat;
 
@@ -22,6 +23,7 @@ const PRESENCE_FLOOR: f32 = 1.0e-4;
 pub struct Analyzer {
     bands: Bands,
     tracker: Box<dyn Tracker>,
+    phrase: PhraseClock,
     sample_rate: u32,
     hops: u64,
 }
@@ -32,6 +34,9 @@ pub struct HopResult {
     pub grid: Grid,
     /// A beat landed in this hop.
     pub beat: bool,
+    /// Where the sixteen-beat phrase is believed to start. Deliberately not on
+    /// [`Beat`] — nothing goes to the light until this is measured.
+    pub phrase: Phrase,
 }
 
 impl Analyzer {
@@ -39,6 +44,7 @@ impl Analyzer {
         Ok(Analyzer {
             bands: Bands::new(sample_rate, HOP),
             tracker: Box::new(AubioTracker::new(sample_rate)?),
+            phrase: PhraseClock::new(),
             sample_rate,
             hops: 0,
         })
@@ -62,11 +68,14 @@ impl Analyzer {
         }
         let levels = self.bands.sample();
         let beat = self.tracker.push(hop, &levels)?;
+        let grid = self.tracker.grid();
+        let phrase = self.phrase.push(&levels, &grid);
         self.hops += 1;
         Ok(HopResult {
             levels,
-            grid: self.tracker.grid(),
+            grid,
             beat,
+            phrase,
         })
     }
 }
@@ -130,6 +139,86 @@ pub fn synth_click_train(bpm: f32, seconds: f32, sample_rate: u32) -> Vec<f32> {
             }
         }
         beat += period;
+    }
+    out
+}
+
+/// Four-on-the-floor with a bar and a phrase in it: a kick every beat, a clap on
+/// two and four, and a bright crash every sixteen.
+///
+/// `synth_click_train` is deliberately the opposite — uniform bursts, no
+/// strong/weak pattern, which is what makes it a calibration grid and also what
+/// makes it useless for a downbeat estimator. This is the fixture with an answer
+/// in it, and the answer is known by construction: beat zero is phase zero, so
+/// the truth for any beat is its index mod 16.
+///
+/// Note what is *not* distinguishable here, on purpose, because it is not
+/// distinguishable in real music either: the clap falls on phases 1 and 3, so
+/// bar phase 0 and bar phase 2 render identically. Only the crash says which of
+/// the sixteen beats is the first, which is why the estimator locks the phrase
+/// and takes the bar from it rather than the other way round.
+pub fn synth_pattern(bpm: f32, seconds: f32, sample_rate: u32) -> Vec<f32> {
+    let fs = sample_rate as f32;
+    let n = (fs * seconds) as usize;
+    let mut out = vec![0.0f32; n];
+
+    // Same generator and the same reason as the click train: a fixture must not
+    // vary between runs.
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let mut noise = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 40) as f32 / 8_388_608.0 - 1.0
+    };
+
+    let period = 60.0 / bpm;
+    let mut t = 0.0f32;
+    let mut beat = 0usize;
+    while t < seconds {
+        let start = (t * fs) as usize;
+        let phase = beat % 16;
+
+        // A decaying 55Hz sine, so the kick lands in the 30-160Hz band rather
+        // than smearing across all three the way a noise burst does.
+        for i in 0..(fs * 0.12) as usize {
+            let x = i as f32 / fs;
+            let env = (-x / 0.045).exp();
+            match out.get_mut(start + i) {
+                Some(slot) => {
+                    *slot += (std::f32::consts::TAU * 55.0 * x).sin() * env * 0.9
+                }
+                None => break,
+            }
+        }
+
+        if phase % 4 == 1 || phase % 4 == 3 {
+            for i in 0..(fs * 0.06) as usize {
+                let x = i as f32 / fs;
+                let env = (-x / 0.020).exp();
+                match out.get_mut(start + i) {
+                    Some(slot) => *slot += noise() * env * 0.35,
+                    None => break,
+                }
+            }
+        }
+
+        // Long and loud, and the only cue to the phrase. It rings into the next
+        // beat on purpose — crashes do — which is a fair test of an estimator
+        // built on a rise detector rather than on absolute level.
+        if phase == 0 {
+            for i in 0..(fs * 0.5) as usize {
+                let x = i as f32 / fs;
+                let env = (-x / 0.18).exp();
+                match out.get_mut(start + i) {
+                    Some(slot) => *slot += noise() * env * 0.55,
+                    None => break,
+                }
+            }
+        }
+
+        t += period;
+        beat += 1;
     }
     out
 }

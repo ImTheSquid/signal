@@ -11,6 +11,7 @@
 mod analysis;
 mod bands;
 mod capture;
+mod downbeat;
 mod meter;
 mod tempo;
 mod wire;
