@@ -32,15 +32,23 @@ const DOUBLE_BELOW: f32 = 115.0;
 
 /// Mass at 2x, relative to the peak, that counts as a real competing candidate.
 ///
-/// Measured over the four tracks in the danger zone across both sets: the ones that
-/// genuinely needed doubling read 0.396, 0.232, 0.081 and 0.485, and the
-/// legitimately-slow ones read 0.021 and 0.022. The rule takes tempo accuracy from
-/// 83% to 90%, and held out from 81% to 88%. The margin is real but thin, and it is
-/// evidenced by four tracks rather than forty.
+/// Tuned offline on whole-track softmaxes, where the tracks that genuinely needed
+/// doubling read 0.081 to 0.485 and the legitimately-slow ones read 0.021 and 0.022.
+///
+/// It carries over to the streaming path, which was worth checking rather than
+/// assuming: measured across 44 tracks in the daemon, on 37/44 and off 35/44. It
+/// rescues three tracks that otherwise read as exactly half — two at 172 BPM and one
+/// at 190 — and costs one genuine 90 BPM track that it doubles. Net +2, on a margin
+/// evidenced by a handful of tracks rather than a corpus.
 const DOUBLE_MASS: f32 = 0.05;
 
 /// BPM either side of a target counted as that target's mass.
 const MASS_WIDTH: usize = 3;
+
+/// Softmaxes averaged before interpreting. At one submission a second this is a few
+/// seconds of evidence — enough to steady the doubling rule, short enough to follow
+/// a track change rather than blending across it.
+const SMOOTH_WINDOWS: usize = 6;
 
 /// Inference measured at **121ms** per window in release on an M-series Mac, and a
 /// Steam Deck is slower. That is far too long to sit in the hop loop: it would stall
@@ -70,10 +78,32 @@ impl TempoWorker {
                 // Built here, so loading 11.7MB of weights never blocks the caller
                 // and the model itself never crosses a thread boundary.
                 let model = TempoModel::new();
+                // The doubling threshold was tuned against softmaxes averaged over
+                // every window of a track. Interpreting one window instead gives it
+                // noisier evidence than it was calibrated on, which showed up as a
+                // genuine 90 BPM track being doubled. Averaging a few windows first
+                // restores the evidence without waiting for a whole track.
+                let mut recent: std::collections::VecDeque<Vec<f32>> =
+                    std::collections::VecDeque::with_capacity(SMOOTH_WINDOWS);
                 while let Ok(window) = rx.recv() {
-                    let estimate = model.estimate(&window);
+                    let dist = model.distribution(&window);
+                    if recent.len() == SMOOTH_WINDOWS {
+                        recent.pop_front();
+                    }
+                    recent.push_back(dist);
+
+                    let mut mean = vec![0.0f32; CLASSES];
+                    for d in &recent {
+                        for (m, v) in mean.iter_mut().zip(d) {
+                            *m += v;
+                        }
+                    }
+                    for m in &mut mean {
+                        *m /= recent.len() as f32;
+                    }
+
                     if let Ok(mut slot) = out.lock() {
-                        *slot = Some(estimate);
+                        *slot = Some(interpret(&mean));
                     }
                 }
             })
@@ -126,12 +156,16 @@ impl TempoModel {
         }
     }
 
-    pub fn estimate(&self, window: &Window) -> Estimate {
+    /// The raw softmax over the 256 tempo classes.
+    pub fn distribution(&self, window: &Window) -> Vec<f32> {
         debug_assert_eq!(window.0.len(), N_MELS * FRAMES);
         let input = Tensor::<1>::from_data(TensorData::from(window.0.as_slice()), &self.device)
             .reshape([1, N_MELS, FRAMES, 1]);
-        let dist: Vec<f32> = self.model.forward(input).to_data().to_vec().unwrap();
-        interpret(&dist)
+        self.model.forward(input).to_data().to_vec().unwrap()
+    }
+
+    pub fn estimate(&self, window: &Window) -> Estimate {
+        interpret(&self.distribution(window))
     }
 }
 
