@@ -30,6 +30,7 @@ const HALF_LIFE_BEATS: f32 = 48.0;
 /// A period this much different is a different track, so the evidence is stale.
 const TRACK_CHANGE: f32 = 0.03;
 
+
 /// The estimate, as of a hop.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Phrase {
@@ -141,6 +142,12 @@ impl PhraseClock {
         // Rise only, never fall. An absolute difference credits a crash twice —
         // once to the beat where the highs jump up, again to the beat where they
         // fall back — which put the estimate one beat late.
+        //
+        // All three bands, kept after trying to drop the low one. The reasoning for
+        // dropping it was that the kick is on every beat and so says nothing about
+        // *which* beat, only diluting the bins that do. It measured worse: phrase
+        // consistency 53% -> 48%, bar 64% -> 60%. The kick is not uniform after all —
+        // it drops out in breakdowns and doubles on fills — and that is information.
         let change = match self.prev_bands {
             Some((l, m, h)) => {
                 (bands.0 - l).max(0.0) + (bands.1 - m).max(0.0) + (bands.2 - h).max(0.0)
@@ -170,6 +177,11 @@ impl PhraseClock {
             };
         }
 
+        // A plain argmax. Hysteresis was tried — requiring a challenger to beat the
+        // held bin by 15% before the anchor moves — on the theory that the ~53%
+        // consistency was an anchor flipping between near-equal bins. It measured
+        // *identical*, so the anchor is not flipping; it genuinely finds different
+        // phases at different times.
         let (anchor, peak) = self
             .bins
             .iter()

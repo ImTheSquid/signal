@@ -200,6 +200,20 @@ impl Score {
             best.0
         );
 
+        // The same histogram folded to four bins. A 16-beat phrase and a 4-beat bar
+        // are different problems: the bar has a quarter of the bins and four times
+        // the evidence in each, so it can be tractable where the phrase is not. If
+        // it is, the light can place its moves on downbeats and leave phrases alone.
+        let mut bars = [0u32; 4];
+        for (i, &n) in self.offset_hist.iter().enumerate() {
+            bars[i % 4] += n;
+        }
+        let best_bar = bars.iter().copied().max().unwrap_or(0);
+        eprintln!(
+            "  bar-only        {}   folded to 4 bins (chance 25%)",
+            pct(best_bar, total)
+        );
+
         if self.align_err_ms.is_empty() {
             eprintln!("  grid alignment  no locked beats to measure");
             return;
