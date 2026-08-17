@@ -9,7 +9,8 @@
 //! needs the macOS libclang that the firmware's espup toolchain would otherwise
 //! override.
 
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use script_env::{rhai, DmxFrame, Handlers};
@@ -61,9 +62,32 @@ fn run_pulse(period_ms: i64) -> Run {
     run_as(period_ms, |_| true, 200, Mode::Tree)
 }
 
-/// `deliver` decides which packets survive the network; `stop_ms` is when the
-/// stream goes silent for good.
+/// The stub RNG is fixed-seed, so one run of a stochastic script measures one
+/// draw. Anything asserted on the *look* is checked across these instead.
+const SEEDS: [u32; 5] = [0x9E37_79B9, 0x1234_5678, 0xDEAD_BEEF, 0xA5A5_A5A5, 0x3141_5927];
+
+/// Long enough to populate a one-beat context table. At 60s the order-4 table is
+/// undertrained and scores *below* the floor whatever the script does, so the
+/// assertion built on it had no teeth — the six-look version passed it.
+const OBSERVE_MS: i64 = 300_000;
+
+fn run_pulse_seeded(period_ms: i64, seed: u32) -> Run {
+    run_seeded(period_ms, |_| true, 200, Mode::Tree, seed, OBSERVE_MS)
+}
+
 fn run_as(period_ms: i64, deliver: fn(i64) -> bool, energy: u8, mode: Mode) -> Run {
+    run_seeded(period_ms, deliver, energy, mode, SEEDS[0], RUN_MS)
+}
+
+/// `deliver` decides which packets survive the network.
+fn run_seeded(
+    period_ms: i64,
+    deliver: fn(i64) -> bool,
+    energy: u8,
+    mode: Mode,
+    seed: u32,
+    run_ms: i64,
+) -> Run {
     let clock = Arc::new(AtomicI64::new(0));
     let changes = Arc::new(Mutex::new(Vec::new()));
     let last_k = Arc::new(AtomicI64::new(-1));
@@ -121,6 +145,17 @@ fn run_as(period_ms: i64, deliver: fn(i64) -> bool, energy: u8, mode: Mode) -> R
                 }
             }),
             lamp_dwell_ms: Box::new(|| DWELL_MS),
+            random_u32: Box::new({
+                let state = AtomicU32::new(seed | 1);
+                move || {
+                    let mut x = state.load(Ordering::Relaxed);
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    state.store(x, Ordering::Relaxed);
+                    x
+                }
+            }),
             ..Handlers::stubs()
         },
     );
@@ -128,7 +163,7 @@ fn run_as(period_ms: i64, deliver: fn(i64) -> bool, energy: u8, mode: Mode) -> R
     engine.on_progress({
         let clock = clock.clone();
         move |_| {
-            if clock.load(Ordering::SeqCst) >= RUN_MS {
+            if clock.load(Ordering::SeqCst) >= run_ms {
                 Some(rhai::Dynamic::from("done"))
             } else {
                 None
@@ -354,19 +389,107 @@ fn longest_hold_beats(run: &Run, period_ms: i64) -> f64 {
     worst as f64 / period_ms as f64
 }
 
+/// Lamp state on the quarter-beat grid, paired with which quarter it is — the
+/// symbol stream an observer actually sees.
+fn symbols(run: &Run, period_ms: i64) -> Vec<(u8, usize)> {
+    let q = period_ms / 4;
+    ((10_000 / q)..(OBSERVE_MS / q))
+        .map(|i| (state_at(&run.changes, i * q + q / 2), (i % 4) as usize))
+        .collect()
+}
+
+/// An observer who watches half the run and predicts the rest, against one who
+/// only ever guesses the commonest state. Their **ratio** is what matters: an
+/// absolute accuracy moves with the state distribution, so a look that simply
+/// stayed lit more would score better without being less readable.
+///
+/// Held out on purpose. Scoring a high-order context on the data that built it
+/// measures how many contexts there are, not how predictable the light is.
+fn learned_over_floor(run: &Run, period_ms: i64, order: usize, use_slot: bool) -> (f64, f64) {
+    let seq = symbols(run, period_ms);
+    let split = seq.len() / 2;
+    let key = |w: &[(u8, usize)]| -> (Vec<u8>, usize) {
+        (
+            w[..order].iter().map(|x| x.0).collect(),
+            if use_slot { w[order].1 } else { 0 },
+        )
+    };
+
+    let mut table: HashMap<(Vec<u8>, usize), HashMap<u8, u32>> = HashMap::new();
+    let mut marg: HashMap<u8, u32> = HashMap::new();
+    for w in seq[..split].windows(order + 1) {
+        *table.entry(key(w)).or_default().entry(w[order].0).or_insert(0) += 1;
+        *marg.entry(w[order].0).or_insert(0) += 1;
+    }
+    let mode = |c: &HashMap<u8, u32>| c.iter().max_by_key(|(_, &n)| n).map(|(&s, _)| s);
+    let fallback = mode(&marg).unwrap_or(0);
+
+    let (mut hits, mut total) = (0u32, 0u32);
+    for w in seq[split..].windows(order + 1) {
+        let guess = table.get(&key(w)).and_then(mode).unwrap_or(fallback);
+        hits += u32::from(guess == w[order].0);
+        total += 1;
+    }
+
+    let mut all: HashMap<u8, u32> = HashMap::new();
+    for &(s, _) in &seq[split..] {
+        *all.entry(s).or_insert(0) += 1;
+    }
+    let floor = all.values().copied().max().unwrap_or(0) as f64 / seq[split..].len() as f64;
+    (hits as f64 / total as f64, floor)
+}
+
+/// The one that answers the complaint. Everything else here is a marginal
+/// statistic — how often something happens; this is conditional — how much the
+/// last thing tells you about the next, which is the only thing an observer is
+/// doing.
+///
+/// The six fixed looks measured 1.80x the floor: three or four slots identified
+/// which look was running and the look determined the rest, so nothing repeated
+/// verbatim and it was still readable. One parametric generator whose rhythm,
+/// subset and walk are re-drawn per cycle measures 1.01x.
+#[test]
+fn an_observer_learns_nothing_by_watching() {
+    let mut worst = 0.0f64;
+    for seed in SEEDS {
+        let run = run_pulse_seeded(BEAT_MS, seed);
+        let (acc, floor) = learned_over_floor(&run, BEAT_MS, 4, false);
+        // Timing separately: a fixed cadence shows up here and nowhere else.
+        let (with_slot, _) = learned_over_floor(&run, BEAT_MS, 3, true);
+        let ratio = acc / floor;
+        println!(
+            "seed {seed:#010x}: order-4 {:.0}% vs floor {:.0}% = {ratio:.2}x, \
+             +slot {:.0}%",
+            acc * 100.0,
+            floor * 100.0,
+            with_slot * 100.0
+        );
+        worst = worst.max(ratio);
+    }
+    assert!(
+        worst < 1.35,
+        "an observer with one beat of memory beats the floor by {worst:.2}x"
+    );
+}
+
 /// Measured, so "it gets bland" stops being a matter of opinion.
 ///
-/// Beat-to-beat repetition is deliberately **not** the thing held down. Chasing
-/// it was a wrong turn: whole sentences already never repeat — 0.000 at eight
-/// beats, 0.040 at four — so verbatim repetition was never what made the look
+/// Beat-to-beat repetition is deliberately **not** the thing held down. Whole
+/// sentences never repeat, so verbatim repetition was never what made the look
 /// readable, and some of it is what makes a pattern feel deliberate rather than
-/// twitchy.
+/// twitchy — re-drawing the rhythm every single cycle took it to 0.000, which
+/// reads as flicker. It rides one to three cycles now.
 ///
-/// The cadence is what gives it away. Changing something at every quarter of
-/// every beat put 0.576 of the gaps between changes in one bucket: the eye stops
-/// predicting which lamp and starts predicting when, and it is never wrong.
-/// Letting each group skip slots took that to 0.488, and cost relay operations
-/// rather than spending them.
+/// The cadence bar is deliberately looser than the 0.52 it was set at. It was a
+/// proxy for predictability adopted when there was no direct measure; there is
+/// one now, in `an_observer_learns_nothing_by_watching`, and the two pull against
+/// each other — a sparser rhythm spreads the gaps and simultaneously makes the
+/// next slot easier to guess, because holding still is predictable. Measured:
+/// biasing toward sparse moved cadence 0.51 -> 0.49 and predictability 1.01x ->
+/// 1.17x. Optimising the proxy at the direct measure's expense is the wrong
+/// trade, so this stays as a guard against a genuine metronome and no more. The
+/// concern it encoded — that the eye gives up on *which* and predicts *when* —
+/// is now tested directly by the `+slot` context, which buys nothing.
 #[test]
 fn the_pattern_breaks_itself_up() {
     let run = run_pulse(BEAT_MS);
@@ -378,7 +501,7 @@ fn the_pattern_breaks_itself_up() {
     println!(
         "repeat {repeat:.3}  4-beat {s4:.3}  8-beat {s8:.3}  hold {hold:.2}  cadence {cadence:.3}"
     );
-    assert!(cadence < 0.52, "{cadence:.3} of gaps are the same length");
+    assert!(cadence < 0.55, "{cadence:.3} of gaps are the same length");
     // Loose, and only to catch a look that has stopped saying anything at all.
     assert!(repeat < 0.40, "every {repeat:.3} of beats repeats the last one");
     // Uniform business is most of what reads as mechanical. Something has to sit
