@@ -15,12 +15,16 @@
 // and `Tensor<D>` come from the prelude with no backend to name — the same way the
 // generated model is written.
 use burn::prelude::*;
+use burn::tensor::Bytes;
 
 use crate::melbands::{Window, FRAMES, N_MELS};
 
 mod generated {
     include!(concat!(env!("OUT_DIR"), "/model/tempocnn.rs"));
 }
+
+/// TempoCNN's parameters, baked into the binary. See `TempoModel::new`.
+static WEIGHTS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/model/tempocnn.bpk"));
 
 /// Class *i* of the softmax is `i + 30` BPM.
 const BASE_BPM: usize = 30;
@@ -147,11 +151,17 @@ impl TempoModel {
     /// Loads the weights. `Model::new` would build the same graph with
     /// *uninitialised* parameters and run perfectly happily, returning a flat
     /// 1/256 softmax — so the weights are not optional and not a detail.
+    ///
+    /// Embedded rather than read at runtime. `OUT_DIR` is an absolute path on the
+    /// machine that compiled, and the Deck compiles inside a container mounted at
+    /// `/crate` while the binary runs on the host from `~/audio-bridge` — so a
+    /// runtime load would look for `/crate/target-steamos/...` and find nothing.
+    /// Embedding costs 12MB of binary and removes the runtime dependency on the
+    /// build tree completely.
     pub fn new() -> Self {
         let device = Default::default();
-        let weights = concat!(env!("OUT_DIR"), "/model/tempocnn.bpk");
         TempoModel {
-            model: generated::Model::from_file(weights, &device),
+            model: generated::Model::from_bytes(Bytes::from_elems(WEIGHTS.to_vec()), &device),
             device,
         }
     }
