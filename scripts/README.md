@@ -278,6 +278,29 @@ is P", so the script runs the grid forward itself. That is what lets it schedule
 100ms relay dwell instead of chasing a signal it is always a fraction of a beat behind, and it
 makes loss cheap: 75% packet loss costs 0.951 → 0.949 rather than the lock.
 
+### Where the period comes from
+
+A neural one. TempoCNN classifies the tempo over 256 absolute bins from a mel spectrogram, and
+`AubioTracker` keeps supplying only the *phase* — where the beats fall. Scored against
+rekordbox's own beat grids for 44 library tracks, extracted by `crates/grid-truth`:
+
+| tempo source | correct |
+|---|---|
+| aubio as it was | 32% |
+| confidence thresholds calibrated against music rather than a click train | 52% |
+| a comb over onset novelty, resolving the metrical level | 68% |
+| **TempoCNN** | **84%** |
+
+The whole gap is metrical level, not precision. aubio reports *a* periodicity and often the
+wrong multiple of it — five of its wrong tempi were exactly 2/3 of the truth and two exactly
+half. A comb score cannot fix that in general because it has no notion of which tempi are
+plausible, so it cannot tell a correct 127 BPM from a 127 that should be 190. A classifier can,
+because 87 and 174 are separate classes competing on evidence.
+
+None of this changed the script. `pulse.rhai` reads `period_ms` and runs the grid forward, so a
+period that is right 84% of the time instead of 68% improves the look for free — a good pattern
+on a wrong tempo is only wrong faster.
+
 ### What decides what is lit
 
 Not the six looks `follow.rhai` uses. Those measured **1.80x** on the one test that matches what
@@ -347,8 +370,29 @@ physical access.
 Milliseconds rather than a phase fraction, so `millis() + ms_to_next_beat` works without knowing
 the period, and stays meaningful before one exists.
 
-**`bar_valid` is never set.** `beat_index` counts from an arbitrary origin; there is no downbeat
-estimator, so nothing may read `beat_index % 4 == 0` as a bar position until that bit appears.
+**`bar_valid` is never set**, so `beat_index` still counts from an arbitrary origin and nothing
+may read `beat_index % 4 == 0` as a bar position.
+
+Not for want of an estimator — `crates/audio-bridge/src/downbeat.rs` is one, and it finds *a*
+stable 16-beat phase far above chance. It cannot reliably find *which* phase is the downbeat: it
+locks to the largest recurring novelty, which is sometimes the beat-one crash and sometimes a
+fill on fifteen or a drop on nine. Measured on 37 tracks whose tempo is correct, phrase
+consistency is 53% and bar 64%.
+
+Five things were tried and none moved it: the much better tempo grid (50% → 53%, so it was never
+an alignment artefact), dropping the kick band on the theory that a beat-every-kick dilutes the
+bins (worse, 53% → 48% — kick patterns are not uniform, they drop out in breakdowns and double on
+fills), anchor hysteresis (identical, so the anchor is not flipping), and tempo drift as a
+confound (lowest-drift third 62%, highest 59%).
+
+Gating on confidence does not rescue it either. Swept over 44 tracks: ungated 51% of beats
+correct on 98% of beats, at 4 sigma 59% on 18%, at 8 sigma 54% on 2%, at 12 sigma 33%. Past 4
+sigma the confidence *anti*-predicts, so there is no threshold that selects the cases worth
+acting on. Four wrong beats in ten reads as a mistake rather than as looseness, which is why the
+flag stays clear and the script keeps no phrase input.
+
+The route past this is a learned downbeat tracker, where online state of the art is about 53%
+F1 — roughly where this already sits.
 
 The layout is written in `crates/audio-bridge/src/wire.rs` and read in `pulse.rhai`, with a third
 copy in the test fixture. It is duplicated because the daemon has its own build root — aubio's
