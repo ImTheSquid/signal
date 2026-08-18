@@ -94,6 +94,11 @@ pub struct Score {
     locked: u32,
     hits_bar: u32,
     hits_phrase: u32,
+    /// Every scored beat as `(sigma, estimated phase, truth phase)`, kept so the
+    /// confidence gate can be swept rather than assumed. A gate is only worth
+    /// having if a higher bar actually buys accuracy; if the curve is flat, the
+    /// number means nothing and gating on it is decoration.
+    samples: Vec<(f32, u8, u8)>,
     /// How often each `(estimated - truth) mod 16` offset came up.
     ///
     /// The absolute hit rates above punish a constant offset as hard as random
@@ -121,6 +126,7 @@ impl Score {
             hits_phrase: 0,
             offset_hist: [0; 16],
             align_err_ms: Vec::new(),
+            samples: Vec::new(),
             evidence: 0,
         }
     }
@@ -139,6 +145,15 @@ impl Score {
         }
 
         self.beats += 1;
+        // Recorded before the gate, so the gate itself can be swept.
+        let (_, truth_bar, truth_phrase) = self.truth.nearest(t_s * 1000.0);
+        self.samples.push((
+            r.phrase.excess_sigma,
+            r.phrase.phase_of(r.grid.beat_index),
+            truth_phrase,
+        ));
+        let _ = truth_bar;
+
         if r.phrase.excess_sigma < LOCK_SIGMA {
             return;
         }
@@ -213,6 +228,29 @@ impl Score {
             "  bar-only        {}   folded to 4 bins (chance 25%)",
             pct(best_bar, total)
         );
+
+        // Does a higher confidence bar actually buy a better bar phase? Swept
+        // rather than assumed, because gating the light on a number that does not
+        // predict anything would just make it fire less often and no better.
+        eprintln!("  gate sweep      sigma   admitted   bar consistency");
+        for bar in [0.0f32, 4.0, 6.0, 8.0, 10.0, 12.0] {
+            let kept: Vec<&(f32, u8, u8)> =
+                self.samples.iter().filter(|s| s.0 >= bar).collect();
+            if kept.is_empty() {
+                eprintln!("                  {bar:>5.0}          0%   -");
+                continue;
+            }
+            let mut folded = [0u32; 4];
+            for (_, est, truth) in &kept {
+                folded[((est + 16 - truth) % 16 % 4) as usize] += 1;
+            }
+            let best = folded.iter().copied().max().unwrap_or(0);
+            eprintln!(
+                "                  {bar:>5.0}   {:>8}   {}",
+                pct(kept.len() as u32, self.samples.len() as u32),
+                pct(best, kept.len() as u32)
+            );
+        }
 
         if self.align_err_ms.is_empty() {
             eprintln!("  grid alignment  no locked beats to measure");
