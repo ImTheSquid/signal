@@ -219,7 +219,12 @@ export const actions: Actions = {
 			jobId,
 			keyId: TEST_KEY_ID,
 			holder: TEST_KEY_NAME,
-			script
+			script,
+			// Nothing: `set_lights` and `sleep` are host functions, and the bool and
+			// int literals are served by arithmetic and logic, which every engine
+			// has. Undeclared would reserve the whole 96KB library for a two-line
+			// script and lose the test to a heap refusal on a busy board.
+			components: []
 		});
 		if (result.status !== 'ok') return fail(500, { error: `job submit failed: ${result.status}` });
 
