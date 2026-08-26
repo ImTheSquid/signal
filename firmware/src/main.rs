@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::peripherals::Peripherals;
+use esp_idf_svc::handle::RawHandle;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::sntp::{EspSntp, SyncStatus};
 use esp_idf_svc::wifi::{BlockingWifi, ClientConfiguration, Configuration, EspWifi};
@@ -65,6 +66,18 @@ use crate::wsproto::{DeviceMsg, JsonFramer, LightsJson, ServerMsg, ServerMsgRaw}
 const HEARTBEAT: Duration = Duration::from_secs(20);
 const WIFI_CHECK: Duration = Duration::from_secs(10);
 const IDLE_RESTART_PAUSE: Duration = Duration::from_millis(500);
+
+/// How long between rungs of [`repair_net`]. Slower than [`WIFI_CHECK`] so the
+/// ladder spans a minute rather than half of one: DHCP normally completes in
+/// under two seconds, so a netif still without a lease after a rung is broken,
+/// not slow.
+const NET_REPAIR_EVERY: Duration = Duration::from_secs(30);
+
+/// A link down this long is wedged somewhere no rung of [`repair_net`] reaches —
+/// a route or a resolver, not the radio, which by now has either recovered or
+/// rebooted the board itself. Well clear of [`LINK_GRACE`], because a reboot
+/// cannot reach a server that is simply down and should not be spent trying.
+const LINK_DEAD: Duration = Duration::from_secs(600);
 const FW_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// A run that could not start is waiting on someone else's heap, and that comes
@@ -632,13 +645,9 @@ impl App {
             } => self.set_idle(script, components, artifact, true),
             // Not stored anywhere: pub/sub is fire-and-forget, so a reboot cannot
             // be replayed at the device once it comes back up.
-            ServerMsg::Reboot => {
-                log::warn!("reboot requested");
-                // Let the log drain and the close frame go out; the server heals
-                // any running job's history row once the device stops answering.
-                std::thread::sleep(REBOOT_DELAY);
-                unsafe { esp_idf_svc::sys::esp_restart() };
-            }
+            // The server heals any running job's history row once the device
+            // stops answering.
+            ServerMsg::Reboot => reboot("requested by the server"),
         }
     }
 
@@ -747,6 +756,56 @@ fn connect_wifi(wifi: &mut BlockingWifi<EspWifi<'static>>) -> Result<()> {
                 std::thread::sleep(Duration::from_secs(5));
             }
         }
+    }
+}
+
+/// Give the log time to drain and any close frame time to go out, then restart.
+fn reboot(reason: &str) -> ! {
+    log::warn!("rebooting: {reason}");
+    std::thread::sleep(REBOOT_DELAY);
+    unsafe { esp_idf_svc::sys::esp_restart() }
+}
+
+/// Whether the station has both an association and an address.
+///
+/// `is_connected` is association alone, and that stays true through a lapsed
+/// DHCP lease — the state where the socket can never reconnect, nothing in the
+/// stack asks for a new lease, and the light blinks the link-down fault until
+/// someone pulls the power.
+fn net_healthy(wifi: &BlockingWifi<EspWifi<'static>>) -> bool {
+    wifi.is_connected().unwrap_or(false)
+        && wifi
+            .wifi()
+            .sta_netif()
+            .get_ip_info()
+            .is_ok_and(|info| !info.ip.is_unspecified())
+}
+
+/// One escalating rung of repair for an unusable netif, `strike` counting from
+/// 1. The caller re-checks health between rungs, so a netif that recovers never
+/// reaches the next one.
+///
+/// Ungated by any running job: DMX arrives over the LAN, so a station without an
+/// address is not receiving a show to interrupt.
+fn repair_net(wifi: &mut BlockingWifi<EspWifi<'static>>, strike: u32) {
+    match strike {
+        // Associated but unaddressed: ask for a lease without dropping the radio.
+        1 => {
+            log::warn!("net repair 1: renewing dhcp");
+            let netif = wifi.wifi_mut().sta_netif_mut().handle();
+            unsafe {
+                esp_idf_svc::sys::esp_netif_dhcpc_stop(netif);
+                esp_idf_svc::sys::esp_netif_dhcpc_start(netif);
+            }
+        }
+        // The lease was not the problem. Drop the association and take both
+        // again from scratch.
+        2 => {
+            log::warn!("net repair 2: reassociating");
+            let _ = wifi.wifi_mut().disconnect();
+            let _ = wifi.wifi_mut().connect();
+        }
+        _ => reboot("netif unusable after every repair"),
     }
 }
 
@@ -881,6 +940,10 @@ fn main() -> Result<()> {
 
     let mut last_heartbeat = Instant::now();
     let mut last_wifi_check = Instant::now();
+    // `None` repairs on sight: an interval only has to pass between rungs, not
+    // before the first one.
+    let mut last_net_repair: Option<Instant> = None;
+    let mut net_strikes: u32 = 0;
 
     loop {
         match rx.recv_timeout(Duration::from_millis(100)) {
@@ -901,6 +964,12 @@ fn main() -> Result<()> {
                 // the case this exists for. Its own deadline still bounds it.
                 if down.elapsed() >= LINK_GRACE && app.running_id.is_none() {
                     app.raise_fault("link down", None);
+                }
+                // The netif ladder has long since rebooted anything it could
+                // fix, so what is left is above the radio and out of reach.
+                // Gated on the same running job for the same reason.
+                if down.elapsed() >= LINK_DEAD && app.running_id.is_none() {
+                    reboot("link down past every grace");
                 }
             }
         } else if app.link_down_since.take().is_some() {
@@ -955,9 +1024,15 @@ fn main() -> Result<()> {
 
         if last_wifi_check.elapsed() >= WIFI_CHECK {
             last_wifi_check = Instant::now();
-            if !wifi.is_connected().unwrap_or(false) {
-                log::warn!("wifi down, reconnecting");
-                let _ = wifi.wifi_mut().connect();
+            if net_healthy(&wifi) {
+                // Reset on recovery, so unrelated blips minutes apart cannot
+                // accumulate into a reboot.
+                net_strikes = 0;
+                last_net_repair = None;
+            } else if last_net_repair.is_none_or(|at| at.elapsed() >= NET_REPAIR_EVERY) {
+                last_net_repair = Some(Instant::now());
+                net_strikes += 1;
+                repair_net(&mut wifi, net_strikes);
             }
         }
     }
