@@ -739,9 +739,9 @@ fn connect_wifi(wifi: &mut BlockingWifi<EspWifi<'static>>) -> Result<()> {
     }))?;
     wifi.start()?;
     // Modem power save makes the AP buffer unicast between beacon wakes, which
-    // delivers DMX in ~300ms clumps instead of a stream — measured as the
-    // dominant receive-timing distortion. The bridge disables it for the same
-    // reason, and this board is mains-powered.
+    // delivers the sender's frames in ~300ms clumps instead of a stream —
+    // measured as the dominant receive-timing distortion. This board is
+    // mains-powered, so the saving buys nothing.
     esp_idf_svc::sys::esp!(unsafe {
         esp_idf_svc::sys::esp_wifi_set_ps(esp_idf_svc::sys::wifi_ps_type_t_WIFI_PS_NONE)
     })?;
@@ -785,8 +785,8 @@ fn net_healthy(wifi: &BlockingWifi<EspWifi<'static>>) -> bool {
 /// 1. The caller re-checks health between rungs, so a netif that recovers never
 /// reaches the next one.
 ///
-/// Ungated by any running job: DMX arrives over the LAN, so a station without an
-/// address is not receiving a show to interrupt.
+/// Ungated by any running job: the beat block arrives over the LAN, so a station
+/// without an address is not receiving a show to interrupt.
 fn repair_net(wifi: &mut BlockingWifi<EspWifi<'static>>, strike: u32) {
     match strike {
         // Associated but unaddressed: ask for a lease without dropping the radio.
@@ -958,7 +958,7 @@ fn main() -> Result<()> {
         if !client.is_connected() {
             if app.ever_connected {
                 let down = *app.link_down_since.get_or_insert_with(Instant::now);
-                // Not while a job is running. DMX reaches the light over the LAN,
+                // Not while a job is running. The beat block reaches the light over the LAN,
                 // so a script can be mid-show and working perfectly with the
                 // server unreachable — killing it to announce that would break
                 // the case this exists for. Its own deadline still bounds it.

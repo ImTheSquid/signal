@@ -6,9 +6,9 @@
 # the light for a whole set means re-acquiring and resubmitting on a cycle, which
 # is what this loop does. Ctrl-C releases the lock so nobody is left blocked.
 #
-#   scripts/run-script.sh                      # runs scripts/follow.rhai
+#   scripts/run-script.sh                      # runs scripts/pulse.rhai
 #   scripts/run-script.sh scripts/other.rhai
-#   COMPONENTS=array scripts/run-script.sh scripts/pulse.rhai
+#   COMPONENTS=array,math scripts/run-script.sh scripts/other.rhai
 #
 # Token, first match wins:
 #   $TRAFFIC_LIGHT_TOKEN
@@ -38,7 +38,7 @@ while [ $# -gt 0 ]; do
 done
 
 here=$(cd "$(dirname "$0")" && pwd)
-SCRIPT="${SCRIPT:-$here/follow.rhai}"
+SCRIPT="${SCRIPT:-$here/pulse.rhai}"
 
 if [ ! -f "$SCRIPT" ]; then
   echo "no such script: $SCRIPT" >&2
@@ -78,13 +78,12 @@ AUTH="Authorization: Bearer $TOKEN"
 #
 # Sends the script as written, comments and all: POST /v1/script minifies it before
 # storing it, so the device gets the stripped form either way.
-# `components` is what the script needs from rhai's standard library. follow.rhai
-# wants arrays for the lamp ranking and math only for to_float; pulse.rhai needs
-# only arrays, because the light no longer does any of the float work. Declaring
-# it leaves the rest out on the device, which roughly doubles the script size
-# that fits — see the README. Under-declaring is not caught server-side; it
-# fails at the call, on the light.
-COMPONENTS="${COMPONENTS:-array,math}"
+# `components` is what the script needs from rhai's standard library. pulse.rhai
+# needs only arrays, because the float work happens on the host that sends the
+# beat block. Declaring it leaves the rest out on the device, which roughly
+# doubles the script size that fits — see the README. Under-declaring is not
+# caught server-side; it fails at the call, on the light.
+COMPONENTS="${COMPONENTS:-array}"
 body() {
   python3 -c "import json,sys; print(json.dumps({'script': open(sys.argv[1]).read(), 'components': sys.argv[2].split(',')}))" "$1" "$COMPONENTS"
 }

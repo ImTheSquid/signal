@@ -24,8 +24,7 @@ const AGC_HALF_LIFE_S: f32 = 15.0;
 
 /// A band's gain reference is never allowed below this fraction of the
 /// broadband reference. Without it every band normalises its own noise floor to
-/// full scale, and three lamps read hot on a bass-only drop. This is the same
-/// idea as `follow.rhai`'s `floor 20.0` on a 0-255 channel — a floor that means
+/// full scale, and three lamps read hot on a bass-only drop. The floor means
 /// "quiet relative to the mix", not "quiet relative to nothing".
 const BAND_FLOOR_RATIO: f32 = 0.05;
 
@@ -173,8 +172,8 @@ impl Envelope {
     }
 }
 
-/// Slow-decay peak reference, mirroring `follow.rhai`'s per-channel AGC: hold
-/// the peak, let it sag, normalise against it. A fixed threshold cannot work
+/// Slow-decay peak reference, one per band: hold the peak, let it sag,
+/// normalise against it. A fixed threshold cannot work
 /// when one band's natural level is a fraction of another's.
 #[derive(Clone, Copy)]
 struct Agc {

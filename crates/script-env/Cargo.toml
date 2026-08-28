@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 # Carries the bytecode VM as `rhai::grain`, so the server lowers a script to a
 # flat artifact and the device runs that instead of parsing a tree. Measured on
-# scripts/follow.rhai: 1069 allocations as an AST against 65 as an artifact,
+# scripts/pulse.rhai: 756 allocations as an AST against 54 as an artifact,
 # which is what the light could not afford — ESP-IDF charges ~8 bytes of header
 # on every one.
 rhai = { workspace = true }

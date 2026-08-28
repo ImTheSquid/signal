@@ -3,9 +3,9 @@
 //   node watch.mjs [out.jsonl] [wss://host/api/live]   (default light.jsonl)
 //
 // The device reports `lights`, `running` and per-lamp relay `ops`, so the real
-// lamp timeline is recoverable without touching the firmware. Run this next to
-// dmxcap.mjs through a set: dmxcap says what the light was told, this says what
-// it did, and the gap between them is the whole diagnosis.
+// lamp timeline is recoverable without touching the firmware. Run this through a
+// set and compare it against the simulation in `--test pulse`: one says what the
+// light did, the other what it should have done.
 //
 // `ops` counts since boot and the light is shared, so a total says nothing about
 // any one script. Everything below is therefore attributed per job: segments are
@@ -143,13 +143,13 @@ process.on("SIGINT", () => {
     console.log("watching, it was not a script driving the lamps — check `running` above.");
   } else if (dark.length > 0) {
     console.log(`VERDICT: yellow never switched under ${dark.map(([r]) => r.slice(0, 8)).join(", ")}`);
-    console.log("while red or green did. follow.rhai cannot do that — its chase walks all");
-    console.log("three positions and its dead-DMX branch lights yellow two thirds of the");
-    console.log("time. Confirm that job was running follow.rhai and not something else.");
+    console.log("while red or green did. pulse.rhai cannot do that — its permutation puts");
+    console.log("every lamp in the lead, and its no-audio branch keeps all three moving.");
+    console.log("Confirm that job was running pulse.rhai and not something else.");
   } else {
     console.log("VERDICT: every driving job moved all three lamps. The complaint is not");
     console.log("reproducible as a stuck lamp — compare the timeline against the simulation");
-    console.log("of the same frames (see dmxcap.mjs's FOLLOW_CAPTURE line).");
+    console.log("in `cargo test -p script-env --test pulse -- --nocapture`.");
   }
   process.exit(0);
 });

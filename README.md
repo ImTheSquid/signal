@@ -20,8 +20,8 @@ Everything runs on one box behind nginx — see [deploy/home-app/](deploy/home-a
 - **crates/validator** → **packages/validator-wasm** — `Engine::compile` plus [rhaiper](https://crates.io/crates/rhaiper), compiled to WASM. `POST /v1/script` rejects scripts that won't parse, with line/col errors, and minifies the rest before storing them.
 - **packages/protocol** — zod schemas + constants for the wire protocol and Redis keys.
 - **firmware** — Rust (esp-idf) for an ESP32-WROOM-32E: wifi → SNTP → websocket, Rhai engine in a dedicated thread, three relay GPIOs (32/33/25 = R/Y/G).
-- **dmx-bridge** — Rust (esp-idf) for an ESP32-S3 that presents FTDI descriptors over USB so **rekordbox lighting** drives the signal. It reassembles the DMX512 stream rekordbox writes and forwards raw channel values over LAN UDP to `dmx_recv()`. See `dmx-bridge/README.md`.
-- **scripts** — `follow.rhai` (the DMX-following job worth running) and `logcat.mjs` (collector for the bridge's UDP logs).
+- **crates/audio-bridge** — Rust daemon on a host machine that captures the master output, estimates tempo with TempoCNN and sends the light a beat *prediction* over LAN UDP to `dmx_recv()`. Runs on macOS via a BlackHole clone, or on a Steam Deck off a Focusrite Scarlett — see `crates/audio-bridge/deck/`.
+- **scripts** — `pulse.rhai` (the job worth running), `run-script.sh` (holds the lock and resubmits for a whole set) and `watch.mjs` (records what the lamps actually did).
 
 Locking: one lock at a time, `SET NX PX` + owner-checked Lua. Lock expiry is enforced *on the device* via relative TTLs, so the light returns to its idle script even if wifi dies mid-script. When nobody holds the lock the device runs an admin-editable idle script (falling back to a built-in green/yellow/red cycle).
 
@@ -64,7 +64,7 @@ curl $BASE/v1/status
 
 Comment and indent freely. `POST /v1/script` minifies with
 [rhaiper](https://crates.io/crates/rhaiper) before storing, so the size limit measures the
-stripped text and the device never receives a comment — `scripts/follow.rhai` goes 8251 → 5054
+stripped text and the device never receives a comment — `scripts/pulse.rhai` goes 11182 → 3633
 bytes on whitespace alone. The source map stays server-side, so runtime errors in the dashboard
 still cite the line you wrote rather than a position in text nobody has seen.
 
@@ -83,7 +83,7 @@ no `as float` cast. These functions are available:
 | `rand_float()` | `[0.0, 1.0)` |
 | `rand_int(lo, hi)` | integer in `lo..=hi` |
 | `rand_chance(p)` | true with probability `p` |
-| `dmx_recv(timeout_ms)` | `#{ ok, base, seq, ch }` — newest DMX frame from the bridge, or `ok: false` on timeout |
+| `dmx_recv(timeout_ms)` | `#{ ok, base, seq, ch }` — newest frame from the audio bridge, or `ok: false` on timeout |
 
 **There is no operation cap.** A run is bounded by your lock's TTL and by the kill switch,
 nothing else, so a long analysis loop is fine. A busy loop with no `sleep` will still hold
@@ -93,7 +93,7 @@ the light for the whole lock, so include one.
 
 Your script is **compiled to bytecode on the server**. The parser, the optimiser and the syntax
 tree all stay here; the light receives a flat artifact, verifies it and runs it. That is the
-difference between roughly 1,069 heap allocations and 65 for `scripts/follow.rhai` — and the
+difference between roughly 756 heap allocations and 54 for `scripts/pulse.rhai` — and the
 ESP32's allocator charges about 8 bytes of header on every one.
 
 `POST /v1/script` reports `artifact_bytes` alongside `bytes`, and that is the number the device's
@@ -122,7 +122,7 @@ instead:
 | you declare | interpreter costs | your script may be |
 |---|---|---|
 | nothing (the default: everything) | ~69KB | **~5KB** |
-| `["array", "math"]` — what `follow.rhai` needs | ~27KB | **~10.5KB** |
+| `["array"]` — what `pulse.rhai` needs | ~21KB | **~11KB** |
 | `[]` — arithmetic and comparison only | ~6KB | **~13KB** |
 
 Arithmetic, comparison and the traffic-light functions in the table above are always present.
@@ -143,8 +143,8 @@ This table is generated from probes, not from reading rhai's package list — se
 not where they look like they should be. `crates/script-env` pins every row, so if a component
 stops providing what is claimed here, its tests fail.
 
-`scripts/follow.rhai` declares `["array", "math"]`: arrays for its lamp ranking, and `math`
-purely for `to_float`.
+`scripts/pulse.rhai` declares `["array"]` and nothing else: the float work happens on the host
+that sends the beat block, so the light needs arrays and integer arithmetic only.
 
 #### The part that will bite you
 
@@ -184,27 +184,26 @@ Asking for changes faster than that does not drop them: the call blocks until th
 move, so a strobe script runs at the cap rather than doing something you didn't write.
 Blocked calls still honor your lock expiry, and apply their state on the way out.
 
-If your script also reads DMX, gate the writes on `lamp_dwell_ms()` yourself rather than
-letting `set_lights` block — a blocked call stalls your loop, and a stalled loop misses
-frames. Above roughly 10Hz a relay can't mechanically follow anyway (operate
+If your script also reads the beat block, gate the writes on `lamp_dwell_ms()` yourself
+rather than letting `set_lights` block — a blocked call stalls your loop, and a stalled
+loop misses frames. Above roughly 10Hz a relay can't mechanically follow anyway (operate
 plus release is around 15ms), and its timing variance is the floor on how tight any
 animation can be.
 
-`dmx_recv` receives DMX channel values forwarded by the **dmx-bridge** (see `dmx-bridge/`),
-which presents itself to rekordbox as an Enttec DMX interface. It binds a UDP socket
-(`dmx_port`, default 49500) on first call and drops it when your script ends, so the port
-is only open while a script is asking for it. Each call drains everything queued and
-returns only the newest frame — bursts are coalesced, never replayed. It blocks like
-`sleep`, so lock expiry and the kill switch still land within 10ms.
+`dmx_recv` receives frames sent by the **audio-bridge** (see `crates/audio-bridge/`). It
+binds a UDP socket (`dmx_port`, default 49500) on first call and drops it when your script
+ends, so the port is only open while a script is asking for it. Each call drains everything
+queued and returns only the newest frame — bursts are coalesced, never replayed. It blocks
+like `sleep`, so lock expiry and the kill switch still land within 10ms.
 
-The values are **raw**, deliberately: thresholding and the channel-to-lamp mapping are
-yours to decide, so they can change without reflashing anything.
+The bytes are **raw**, deliberately: how they map to lamps is yours to decide, so it can
+change without reflashing anything.
 
 | field | meaning |
 |---|---|
 | `ok` | a frame arrived within the timeout |
-| `ch` | array of raw 0-255 channel values; `ch[0]` is channel `base` |
-| `base` | DMX channel number `ch[0]` holds, so you can locate a fixture without knowing how the bridge is configured |
+| `ch` | array of raw 0-255 bytes; the audio bridge packs its beat block here |
+| `base` | which sender this is; the audio bridge uses `0xFFFE`, so a script can tell senders apart |
 | `seq` | sender's frame counter; gaps mean dropped datagrams |
 
 On timeout `ok` is false and `ch` is **empty**, so a script that ignores `ok` gets an index
@@ -212,19 +211,11 @@ error rather than quietly acting on an all-zero frame. If the socket cannot bind
 call raises a script error instead of timing out forever, since a silent no-op looks
 identical to an idle sender.
 
-Patched as a 3-channel RGB fixture, channel 1 is red, 2 green, 3 blue — so blue drives the
-yellow lamp:
-
-```rhai
-loop {
-    let p = dmx_recv(50);
-    if p.ok { set_lights(p.ch[0] >= 128, p.ch[2] >= 128, p.ch[1] >= 128); }
-}
-```
-
-That literal version reads as "off most of the time" in practice — rekordbox drives the fixture
-only ~28% of a set, and a fixed 128 cut discards nearly half of that. `scripts/follow.rhai` is
-the version worth actually running; see `scripts/README.md` for the measurements behind it.
+The block carries a *prediction* — "the next beat is in N ms, the period is P" — so a script
+runs the grid forward itself rather than chasing an event it is always a fraction of a beat
+behind. That is what makes loss cheap: at 75% packet loss the on-grid figure moves 0.951 →
+0.949. `scripts/pulse.rhai` is the version worth actually running; see `scripts/README.md`
+for the block layout and the measurements behind it.
 
 The script is killed when your lock expires (blocking calls wake every 10ms to check) and its last `set_lights` is applied on the way out. Runtime errors (wrong arity, unknown function) surface in the dashboard history *and* on the light itself as the fault signal below; only parse errors are caught at `POST /v1/script`.
 
@@ -244,7 +235,7 @@ if h.result == "error" {
 
 ### The fault signal
 
-All three lamps together at 1Hz — a combination a real signal never shows. Raised when a script errors (for 10s, then normal idle resumes) or when the link to the server has been down for over a minute, and driven by the firmware rather than a script so it still appears when the script thread is dead or could not be spawned. It is *not* raised while a job is running: DMX arrives over the LAN, so a script can be mid-show with the server unreachable.
+All three lamps together at 1Hz — a combination a real signal never shows. Raised when a script errors (for 10s, then normal idle resumes) or when the link to the server has been down for over a minute, and driven by the firmware rather than a script so it still appears when the script thread is dead or could not be spawned. It is *not* raised while a job is running: the beat block arrives over the LAN, so a script can be mid-show with the server unreachable.
 
 With `min_lamp_dwell_ms = 0` (solid-state relays) it pulses at 1Hz indefinitely. With mechanical relays it eases to a short blink after 30s, because 1Hz is 7,200 transitions/lamp/hour and that would spend a real fraction of the contacts' rated life announcing a fault.
 
@@ -302,16 +293,16 @@ against your own copy of the datasheet, but the figures that matter are:
 | max switching rate | 300 operations/min mechanical, **30/min electrical** |
 | operate / release | ≤10ms / ≤5ms |
 
-`scripts/follow.rhai` measures at **216 / 90 / 240 operations per minute** for red / yellow /
-green (`cargo test -p script-env --test follow -- --nocapture relay`). Against those figures:
+`scripts/pulse.rhai` measures at **168 / 202 / 165 operations per minute** for red / yellow /
+green (`cargo test -p script-env --test pulse -- --nocapture relay`). Against the busiest lamp:
 
-- **~700 hours** of running against mechanical endurance.
-- **~7 hours** against electrical endurance *at rated load* — but the lamps draw a small
+- **~825 hours** of running against mechanical endurance.
+- **~8 hours** against electrical endurance *at rated load* — but the lamps draw a small
   fraction of 10A, so the true figure is far higher. How much higher depends on inrush, not
   on steady current: these are AC LED modules with capacitive-input drivers, and the contacts
   close at a random point in the AC cycle because there is no zero-cross switching. Inrush at
   the wrong phase angle is what erodes contacts.
-- **8× over the 30/min electrical switching guidance**, which is the figure a denser pattern
+- **~7× over the 30/min electrical switching guidance**, which is the figure a denser pattern
   makes worse.
 
 `min_lamp_dwell_ms` is the single knob: it caps transitions at `1000 / dwell` per second per

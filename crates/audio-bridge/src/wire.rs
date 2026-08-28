@@ -1,8 +1,7 @@
 //! The UDP datagram the traffic light listens for.
 //!
-//! Same magic, version and header as `dmx-bridge/src/wire.rs`, because it is
-//! the same socket on the light and the same parser in `firmware/src/dmx.rs`.
-//! What differs is the payload and one header field.
+//! It rides the light's existing UDP path — the same socket and the same parser
+//! in `firmware/src/dmx.rs` — which is why adding it needed no reflash.
 //!
 //! The beat block rides in the **channel bytes**, not in an extended header.
 //! The header is extensible — `firmware/src/dmx.rs` skips whatever it does not
@@ -12,9 +11,9 @@
 //! access. In the channel bytes they arrive as `p.ch[0..16]` with no firmware
 //! change at all.
 //!
-//! `base` is the discriminator. DMX channels are 1..512, so 0xFFFE cannot be a
-//! real base, and `follow.rhai` never reads `base` — the two senders can be
-//! told apart by any script without either being modified.
+//! `base` is the discriminator: the parser's channel bases are 1..512, so
+//! 0xFFFE cannot collide with one and a script can tell senders apart without
+//! being modified.
 
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, Instant};
@@ -245,8 +244,6 @@ pub struct Parsed {
 /// Mirrors `parse` in `firmware/src/dmx.rs`, so the tests check what the light
 /// will actually see rather than what we meant to send.
 ///
-/// Test-only: sniffing a live stream is already covered by `scripts/dmxcap.mjs`,
-/// which needs no changes because the port and magic are unchanged.
 #[cfg(test)]
 pub fn parse(buf: &[u8]) -> Option<Parsed> {
     if buf.len() < HEADER_LEN || buf[0..2] != MAGIC || buf[2] != VERSION {

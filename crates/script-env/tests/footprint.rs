@@ -1,9 +1,8 @@
 //! What the interpreter costs, and how big a script the device can actually run.
 //!
-//! The light has ~140KB free at idle and OOM-aborts partway into
-//! `scripts/follow.rhai`, so the question is how the budget divides between the
-//! engine (paid once per run, whatever the script) and the AST (paid per source
-//! byte).
+//! The light has ~140KB free at idle and a script has to fit in what the engine
+//! leaves, so the question is how the budget divides between the engine (paid
+//! once per run, whatever the script) and the AST (paid per source byte).
 //!
 //! **The engine's cost is only discretionary if the submitter says so.** Every
 //! key holder submits arbitrary Rhai and the admin idle script runs on the same
@@ -96,7 +95,7 @@ fn cost_counted<T>(f: impl FnOnce() -> T) -> (isize, isize) {
     out
 }
 
-const SCRIPT: &str = include_str!("../../../scripts/follow.rhai");
+const SCRIPT: &str = include_str!("../../../scripts/pulse.rhai");
 
 /// Free heap the device reports while idle on the built-in cycle, and the
 /// script thread's stack — both from the running light, not from theory.
@@ -139,7 +138,7 @@ fn allocation_overhead_is_worth_measuring() {
         ..Default::default()
     };
     let minified = rhaiper::minify_with_engine(&engine, SCRIPT, &opts)
-        .expect("follow.rhai must minify")
+        .expect("pulse.rhai must minify")
         .text;
 
     let before = [
@@ -166,7 +165,7 @@ fn allocation_overhead_is_worth_measuring() {
     println!(
         "\n  allocations held, for {} minified source bytes\
          \n    engine (full library)  {engine_allocs:>7} allocs   {engine_bytes:>8} bytes\
-         \n    follow.rhai AST        {ast_allocs:>7} allocs   {ast_bytes:>8} bytes\
+         \n    pulse.rhai AST         {ast_allocs:>7} allocs   {ast_bytes:>8} bytes\
          \n    together               {total_allocs:>7} allocs\
          \n\
          \n  AST allocations by size (what a per-allocation header punishes)",
@@ -245,12 +244,11 @@ fn allocation_overhead_is_worth_measuring() {
 /// What the device would hold if it loaded a compiled artifact instead of
 /// parsing a tree.
 ///
-/// The AST is the reason the light can only run ~3.5KB of script: 1879
-/// allocations for follow.rhai, each charged an 8-byte header by ESP-IDF, on a
-/// heap where wifi and TLS have already taken 168KB of 323KB. An artifact is a
-/// flat buffer, so the question is what it costs and whether anything in
-/// follow.rhai fails to lower — a residual stays an AST fragment and keeps its
-/// AST cost.
+/// The AST is the reason the light can only run ~3.5KB of script: an allocation
+/// per node, each charged an 8-byte header by ESP-IDF, on a heap where wifi and
+/// TLS have already taken 168KB of 323KB. An artifact is a flat buffer, so the
+/// question is what it costs and whether anything in the script fails to lower —
+/// a residual stays an AST fragment and keeps its AST cost.
 fn artifact_is_cheaper_than_the_tree() {
     let engine = script_env::new_engine(script_env::Components::all());
     let opts = rhaiper::Options {
@@ -258,7 +256,7 @@ fn artifact_is_cheaper_than_the_tree() {
         ..Default::default()
     };
     let minified = rhaiper::minify_with_engine(&engine, SCRIPT, &opts)
-        .expect("follow.rhai must minify")
+        .expect("pulse.rhai must minify")
         .text;
     let ast = engine.compile(&minified).expect("minified must compile");
 
@@ -269,7 +267,7 @@ fn artifact_is_cheaper_than_the_tree() {
     let residual_nodes = program.residual_nodes();
     let unsupported = program.first_unsupported();
 
-    let wire = program.write().expect("follow.rhai must serialise");
+    let wire = program.write().expect("pulse.rhai must serialise");
     // Borrowed against the wire buffer, which is what the device should do: it
     // has to keep the bytes anyway, and `into_owned` copies every pool out of
     // them. Measured both ways because the difference decides which one the
@@ -283,7 +281,7 @@ fn artifact_is_cheaper_than_the_tree() {
     });
 
     println!(
-        "\n  follow.rhai, {} minified bytes\
+        "\n  pulse.rhai, {} minified bytes\
          \n    as a tree          {tree_bytes:>8} bytes  {tree_allocs:>6} allocs\
          \n    artifact, borrowed {loaded_bytes:>8} bytes  {loaded_allocs:>6} allocs\
          \n    artifact, owned    {owned_bytes:>8} bytes  {owned_allocs:>6} allocs\
@@ -299,10 +297,10 @@ fn artifact_is_cheaper_than_the_tree() {
 
     // A residual is an AST fragment handed back to the walker, which keeps the
     // per-node allocation cost this whole change exists to remove. Nothing in
-    // follow.rhai should need one.
+    // pulse.rhai should need one.
     assert_eq!(
         residual, 0,
-        "follow.rhai does not lower whole; {residual_nodes} nodes stay a tree"
+        "pulse.rhai does not lower whole; {residual_nodes} nodes stay a tree"
     );
     assert!(
         loaded_allocs < tree_allocs / 10,
@@ -328,7 +326,7 @@ fn interpreter_footprint() {
     let validation = cost(script_env::validation_engine);
 
     let engine = script_env::rhai::Engine::new();
-    let ast = cost(|| engine.compile(SCRIPT).expect("follow.rhai must compile"));
+    let ast = cost(|| engine.compile(SCRIPT).expect("pulse.rhai must compile"));
 
     // The device is sent the minified form, so that is what the per-byte cost
     // has to be measured against.
@@ -339,7 +337,7 @@ fn interpreter_footprint() {
         ..Default::default()
     };
     let minified = rhaiper::minify_with_engine(&engine, SCRIPT, &opts)
-        .expect("follow.rhai must minify")
+        .expect("pulse.rhai must minify")
         .text;
     let ast_min = cost(|| engine.compile(&minified).expect("minified must compile"));
 
@@ -357,12 +355,12 @@ fn interpreter_footprint() {
             ..Default::default()
         },
     )
-    .expect("follow.rhai must minify with renaming")
+    .expect("pulse.rhai must minify with renaming")
     .text;
     let ast_renamed = cost(|| engine.compile(&renamed).expect("renamed must compile"));
     drop(engine);
 
-    // How much of follow.rhai is names the device has to allocate for.
+    // How much of the script is names the device has to allocate for.
     let mut long: Vec<&str> = Vec::new();
     for tok in SCRIPT.split(|c: char| !c.is_alphanumeric() && c != '_') {
         if tok.len() > 11 && !tok.chars().next().is_some_and(|c| c.is_numeric()) {
@@ -396,7 +394,7 @@ fn interpreter_footprint() {
          \n    Engine::new()        {full:>8}\
          \n    Engine::new_raw()    {raw:>8}   (floor only — see the module docs)\
          \n    validation_engine()  {validation:>8}\
-         \n    follow.rhai AST      {ast:>8}   from {} source bytes\
+         \n    pulse.rhai AST       {ast:>8}   from {} source bytes\
          \n    minified AST         {ast_min:>8}   from {} minified bytes\
          \n    AST per source byte  {per_byte:>8.1}\
          \n\
@@ -407,7 +405,7 @@ fn interpreter_footprint() {
          \n    engine               {engine_dev:>8}\
          \n    script stack         {SCRIPT_STACK:>8}\
          \n    leaves for the AST   {headroom:>8}\
-         \n    = about {serviceable} source bytes; follow.rhai is {}; the API \
+         \n    = about {serviceable} source bytes; pulse.rhai is {}; the API \
              advertises {}\n",
         SCRIPT.len(),
         minified.len(),
@@ -428,12 +426,10 @@ fn interpreter_footprint() {
             script_env::rhai::packages::ArithmeticPackage::new().register_into_engine(e);
             script_env::rhai::packages::LogicPackage::new().register_into_engine(e);
         }),
-        ("array + math (follow)", |e| {
+        ("+ array (pulse)", |e| {
             script_env::rhai::packages::ArithmeticPackage::new().register_into_engine(e);
             script_env::rhai::packages::LogicPackage::new().register_into_engine(e);
             script_env::rhai::packages::BasicArrayPackage::new().register_into_engine(e);
-            // follow.rhai calls to_float, which lives in math.
-            script_env::rhai::packages::BasicMathPackage::new().register_into_engine(e);
         }),
         ("everything (today)", |e| {
             script_env::rhai::packages::StandardPackage::new().register_into_engine(e);
@@ -458,7 +454,7 @@ fn interpreter_footprint() {
             (room as f64 / bytes_per) as isize
         );
     }
-    println!("\n  follow.rhai needs {} bytes\n", minified.len());
+    println!("\n  pulse.rhai needs {} bytes\n", minified.len());
 
     // The device loads artifacts, so the limit that has to be honourable is the
     // artifact one. Against the narrowest engine, which is the best case; a

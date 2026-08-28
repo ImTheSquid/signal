@@ -4,7 +4,7 @@
 
 use serde_json::Value;
 
-const FOLLOW: &str = include_str!("../../../scripts/follow.rhai");
+const PULSE: &str = include_str!("../../../scripts/pulse.rhai");
 
 fn prepared(script: &str) -> Value {
     serde_json::from_str(&validator::prepare(script)).expect("prepare returned invalid JSON")
@@ -30,7 +30,7 @@ const SCRIPTS: &[&str] = &[
     "let a = 5;\nlet b = a - -1;\nsleep(b);\n",
     "for i in 0..3 {\n    sleep(i);\n}\n",
     "try {\n    sleep(1);\n} catch (e) {\n    sleep(2);\n}\n",
-    FOLLOW,
+    PULSE,
 ];
 
 #[test]
@@ -55,8 +55,8 @@ fn output_never_grows_and_is_a_fixed_point() {
 
 #[test]
 fn reported_bytes_match_the_text() {
-    let v = ok(FOLLOW);
-    assert_eq!(v["rawBytes"].as_u64().unwrap() as usize, FOLLOW.len());
+    let v = ok(PULSE);
+    assert_eq!(v["rawBytes"].as_u64().unwrap() as usize, PULSE.len());
     assert_eq!(v["bytes"].as_u64().unwrap() as usize, text(&v).len());
     assert_eq!(v["minified"], Value::Bool(true));
 }
@@ -64,12 +64,12 @@ fn reported_bytes_match_the_text() {
 /// The number that justifies the whole pipeline. Printed rather than pinned to an
 /// exact value, which would break on any rhaiper or script change.
 #[test]
-fn follow_rhai_shrinks_by_at_least_a_quarter() {
-    let v = ok(FOLLOW);
-    let (raw, min) = (FOLLOW.len(), text(&v).len());
+fn pulse_rhai_shrinks_by_at_least_a_quarter() {
+    let v = ok(PULSE);
+    let (raw, min) = (PULSE.len(), text(&v).len());
     let saved = 100.0 * (raw - min) as f64 / raw as f64;
     println!(
-        "follow.rhai  {raw} -> {min} bytes ({} saved, {saved:.1}%), map {} bytes",
+        "pulse.rhai  {raw} -> {min} bytes ({} saved, {saved:.1}%), map {} bytes",
         raw - min,
         v["map"].as_str().unwrap().len()
     );

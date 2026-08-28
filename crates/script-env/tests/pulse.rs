@@ -233,8 +233,6 @@ fn respects_the_relay_dwell() {
 /// The point of the whole exercise. Transitions must cluster on the grid of the
 /// tempo actually playing, and not on another one — a free-running pattern would
 /// score alike against both.
-///
-/// For reference, `follow.rhai` on rekordbox DMX measures 0.364 here.
 #[test]
 fn lands_on_the_beat() {
     for (playing, other) in [(BEAT_MS, BEAT_MS_SLOW), (BEAT_MS_SLOW, BEAT_MS)] {
@@ -549,8 +547,9 @@ fn relay_operations_per_lamp() {
         y as f64 / minutes,
         g as f64 / minutes
     );
-    // follow.rhai measures 216/90/240. Staying near that keeps the wear budget
-    // where it already was rather than quietly spending more of it.
+    // The cap is the dwell gate, not a target: 300/min is what the relay's
+    // mechanical rating allows, and the printed per-lamp figures are what the
+    // wear budget in the README is priced from.
     let worst = r.max(y).max(g) as f64 / minutes;
     assert!(worst < 300.0, "{worst:.0} operations/minute per lamp");
 }

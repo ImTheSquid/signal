@@ -28,12 +28,12 @@ use cpal::traits::DeviceTrait;
 use crate::analysis::{to_beat, Analyzer, HopResult};
 use crate::tempo::HOP;
 
-/// Where the light listens. Matches `dmx-bridge`'s destination, and the two are
-/// never run together — the light keeps one sequence number per socket, not per
-/// sender, so whichever is numerically ahead starves the other.
+/// Where the light listens. Only one sender may run at a time — the light keeps
+/// one sequence number per socket, not per sender, so whichever is numerically
+/// ahead starves the other.
 const DEFAULT_PORT: u16 = 49500;
 
-/// Same default as `dmx-bridge/cfg.toml`. The light binds `0.0.0.0:49500` and
+/// The light binds `0.0.0.0:49500` and
 /// accepts whatever arrives, so nothing needs to know its address — which is
 /// the point, since it takes a DHCP lease and has no fixed one.
 ///

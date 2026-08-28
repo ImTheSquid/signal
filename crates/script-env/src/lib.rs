@@ -30,8 +30,8 @@ pub const MAX_SCRIPT_BYTES: usize = 16 * 1024;
 /// Maximum size of the compiled artifact the device loads.
 ///
 /// The real ceiling, and much further out than the source one it replaces:
-/// `scripts/follow.rhai` is 5054 minified bytes and 8719 of artifact, so about
-/// 1.7 bytes of artifact per source byte, loading to roughly 5x that in heap.
+/// `scripts/pulse.rhai` is 3633 minified bytes and 6476 of artifact, so about
+/// 1.8 bytes of artifact per source byte, loading to roughly 5x that in heap.
 /// Against ~155KB free, less a 32KB stack and a declared engine, that leaves
 /// room for something like 17KB of artifact — so this is a bound rather than a
 /// squeeze, and the device refuses anything it cannot actually fit.
@@ -51,7 +51,7 @@ pub struct Handlers {
     pub sleep: Box<dyn Fn(i64) + Send + Sync>,
     /// millis() — monotonic milliseconds since boot/script start
     pub millis: Box<dyn Fn() -> i64 + Send + Sync>,
-    /// dmx_recv(timeout_ms) — the newest DMX frame received within the timeout.
+    /// dmx_recv(timeout_ms) — the newest frame received within the timeout.
     /// `Ok(None)` means nothing arrived; `Err` means the receiver itself is
     /// broken (a port that will not bind), which must surface as a script error
     /// rather than an endless silent timeout.
@@ -76,11 +76,11 @@ pub struct Handlers {
     pub lamp_dwell_ms: Box<dyn Fn() -> i64 + Send + Sync>,
 }
 
-/// A DMX frame as handed to a script.
+/// A frame from the UDP sender, as handed to a script.
 pub struct DmxFrame {
     pub seq: i64,
-    /// DMX channel number that `channels[0]` holds, so a script can locate a
-    /// fixture without knowing how the sender was configured.
+    /// Identifies the sender, so a script can tell one apart from another
+    /// without being modified. The audio bridge uses `0xFFFE`.
     pub base: i64,
     pub channels: Vec<u8>,
 }
@@ -117,8 +117,8 @@ impl Handlers {
 /// Apply the sandbox limits. Parse-time limits (expression depth) also make
 /// `Engine::compile` reject pathological inputs during validation.
 pub fn apply_limits(engine: &mut Engine) {
-    // No operation cap. A script doing real signal analysis on a 40Hz DMX stream
-    // burns 5M operations in about ten minutes, so the cap ended shows rather
+    // No operation cap. A script running a beat grid forward burns 5M operations
+    // in about ten minutes, so the cap ended shows rather
     // than protecting anything. What actually bounds a run is the job TTL (which
     // the lock's remaining time sets) and the abort flag; the progress callback
     // still yields for the watchdog on every engine, so an unbounded count
@@ -210,8 +210,8 @@ pub fn register_api(engine: &mut Engine, handlers: Handlers) {
             (random_u32() >> 8) as rhai::FLOAT / 16_777_216.0 < p
         }
     });
-    // Returns #{ ok, base, seq, ch }. `ch` holds raw 0-255 values, `base` is the
-    // DMX channel ch[0] corresponds to. On timeout `ok` is false and `ch` is
+    // Returns #{ ok, base, seq, ch }. `ch` holds raw 0-255 bytes and `base`
+    // identifies the sender. On timeout `ok` is false and `ch` is
     // empty, so a script that ignores `ok` gets an index error rather than
     // silently acting on a stale or all-zero frame.
     engine.register_fn(
@@ -274,7 +274,8 @@ pub fn register_idle_api(
 /// `Engine::run` takes `&self`, so an engine cannot gain a package once a run
 /// has started; the set is fixed before evaluation. That matters because
 /// registering all of them costs ~69KB of the device's ~140KB free heap, which
-/// leaves room for about 5KB of script — less than `scripts/follow.rhai` needs.
+/// leaves room for about 5KB of script, which `scripts/pulse.rhai` fits inside
+/// only because it declares what it needs and gets the rest of the heap back.
 /// Registering only what a script uses costs ~21KB for that script and roughly
 /// doubles the ceiling. `crates/script-env/tests/footprint.rs` prices it.
 ///
@@ -447,7 +448,7 @@ pub fn new_engine(components: Components) -> Engine {
     // `Engine::new` turns this on and `new_raw` does not, so building up from
     // raw silently loses it. Without the interner every identifier and string
     // literal in a script allocates separately instead of being shared: measured
-    // on scripts/follow.rhai, the AST goes 91648 -> 110368 bytes and 1303 -> 1879
+    // on a real job script, the AST goes 91648 -> 110368 bytes and 1303 -> 1879
     // allocations, and on the device each of those allocations also costs an
     // 8-byte heap header. Not optional on a board this tight.
     engine.set_max_strings_interned(1024);
@@ -513,7 +514,7 @@ pub struct Artifact {
 ///
 /// The parser, the optimiser and the tree all stay here. What reaches the light
 /// is a flat buffer it verifies and executes, which is the difference between
-/// ~1069 allocations and ~65 for `scripts/follow.rhai`.
+/// ~756 allocations and ~54 for `scripts/pulse.rhai`.
 pub fn lower(ast: &rhai::AST) -> Result<Artifact, String> {
     let mut program = rhai::grain::Compiler::new().compile(ast);
     let residual = program.residual_count();
@@ -1023,8 +1024,8 @@ mod component_tests {
         assert!(runs(Components::none(), "let m = #{a: 1}; m.a == 1"));
     }
 
-    /// `to_float` reads like a conversion but lives in `math`, which is why
-    /// scripts/follow.rhai needs that component despite doing no trigonometry.
+    /// `to_float` reads like a conversion but lives in `math`, which is why a
+    /// script doing no trigonometry can still need that component.
     #[test]
     fn to_float_needs_math() {
         assert!(!runs(Components::none(), "(1).to_float() > 0.0"));

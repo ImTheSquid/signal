@@ -99,8 +99,8 @@ export const JobSchema = z.object({
    *  AST gets instead — the full set costs roughly half the free heap. */
   components: z.array(z.string()).optional(),
   /** The script lowered to bytecode, base64. What the device actually runs: it
-   *  loads a flat buffer instead of parsing a tree, which on follow.rhai is ~65
-   *  allocations rather than ~1069 — and the light's heap charges a header on
+   *  loads a flat buffer instead of parsing a tree, which on pulse.rhai is ~54
+   *  allocations rather than ~756 — and the light's heap charges a header on
    *  every one. Absent falls back to running `script`. */
   artifact: z.string().optional(),
   /** Maps an artifact program counter back to a position in the submitted

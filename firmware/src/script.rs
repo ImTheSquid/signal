@@ -38,7 +38,7 @@ pub type SharedLastHolder = Arc<Mutex<Option<LastHolderInfo>>>;
 ///
 /// **Do not size this from the idle script.** 16KB looked safe on the evidence
 /// of the built-in idle run, which touches 7488 bytes and leaves the high-water
-/// log reporting most of the stack unused — and then `scripts/follow.rhai`
+/// log reporting most of the stack unused — and then a real job script
 /// overflowed it immediately, because its nested calls go far deeper than
 /// anything idle does. The mark this logs is only ever a statement about the
 /// script that just ran.
@@ -94,12 +94,12 @@ const AST_BYTES_PER_SOURCE_BYTE: usize = 24;
 
 /// Heap per byte of artifact, the same measurement taken the other way.
 ///
-/// follow.rhai's 8719 wire bytes load to ~30KB on the host, so about 3.5x, and
+/// pulse.rhai's 6476 wire bytes load to ~23KB on the host, so about 3.6x, and
 /// the device's share is no worse — the pools are the same shape and its
 /// pointers are half the width. Rounded to 5: being wrong here costs a reboot,
 /// while being pessimistic costs a refusal that says what it wanted.
 const ARTIFACT_BYTES_PER_WIRE_BYTE: usize = 5;
-/// Room for the run itself — scope, values, and the DMX frames a script pulls in
+/// Room for the run itself — scope, values, and the frames a script pulls in
 /// while it works. Without it a script fits at startup and dies once busy.
 const RUN_MARGIN_BYTES: usize = 8 * 1024;
 
@@ -142,8 +142,8 @@ fn heap_check(
     let engine = engine_heap_bytes(components);
     // An artifact is loaded roughly as it lies, plus its pools; a source has to
     // be parsed into a tree that costs many times its own length. Measured on
-    // follow.rhai: 8719 artifact bytes become ~30KB loaded, where 5054 source
-    // bytes become ~78KB of tree with 1069 allocations under it.
+    // pulse.rhai: 6476 artifact bytes become ~23KB loaded, where 3633 source
+    // bytes become ~57KB of tree with 756 allocations under it.
     let body = if is_artifact {
         weight * ARTIFACT_BYTES_PER_WIRE_BYTE
     } else {
@@ -181,8 +181,8 @@ fn heap_check(
 /// check the flag.
 ///
 /// Also the poll granularity for `dmx_recv`, which is why it is 10ms and not
-/// more: DMX arrives at ~41Hz (24ms/frame), so a 50ms wake could only ever see
-/// every other frame — enough for a threshold, not enough for onset detection.
+/// more: a coarser wake quantises every arrival it reports, and a script
+/// scheduling against a beat grid pays that as jitter on every lamp change.
 pub(crate) const SLEEP_CHUNK: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -480,7 +480,7 @@ fn run_script(
 
     // An artifact is loaded, not parsed: the server did the parsing and the
     // optimising, and what arrives is a flat buffer this verifies and executes.
-    // Measured on scripts/follow.rhai, that is ~65 allocations against ~1069 for
+    // Measured on scripts/pulse.rhai, that is ~54 allocations against ~756 for
     // the tree, and ESP-IDF charges a header on every one.
     //
     // The source path stays until the artifact path has run on the hardware.
