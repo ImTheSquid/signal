@@ -73,11 +73,6 @@ const IDLE_RESTART_PAUSE: Duration = Duration::from_millis(500);
 /// not slow.
 const NET_REPAIR_EVERY: Duration = Duration::from_secs(30);
 
-/// A link down this long is wedged somewhere no rung of [`repair_net`] reaches —
-/// a route or a resolver, not the radio, which by now has either recovered or
-/// rebooted the board itself. Well clear of [`LINK_GRACE`], because a reboot
-/// cannot reach a server that is simply down and should not be spent trying.
-const LINK_DEAD: Duration = Duration::from_secs(600);
 const FW_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// A run that could not start is waiting on someone else's heap, and that comes
@@ -182,9 +177,18 @@ struct Fault {
 const FAULT_LOUD: Duration = Duration::from_secs(30);
 /// Transient faults (a failed script) show briefly, then hand back to idle.
 const FAULT_BLIP: Duration = Duration::from_secs(10);
-/// How long the link may be down before it counts as a fault. Reconnects through
-/// a proxy with 30s heartbeats are routine.
-const LINK_GRACE: Duration = Duration::from_secs(60);
+/// How long the link may be down before the light goes dark and the websocket
+/// client is rebuilt. Short, because a rebuild is cheap and reversible — it is
+/// not a reboot, so overreacting to a routine reconnect costs a socket rather
+/// than the session, the running job and the idle script.
+const LINK_GRACE: Duration = Duration::from_secs(10);
+
+/// Backoff between rebuild attempts. The first is immediate: a wedged client is
+/// the common case and costs nothing to replace. The ladder is for the other
+/// case — a server that is genuinely down, where repeating a TLS handshake every
+/// few seconds is the waste to avoid.
+const WS_REBUILD_RETRY: Duration = Duration::from_secs(5);
+const WS_REBUILD_RETRY_MAX: Duration = Duration::from_secs(60);
 
 /// Lamp state for the fault signal.
 ///
@@ -256,6 +260,8 @@ struct App {
     /// When the link went down, and whether it has ever been up.
     link_down_since: Option<Instant>,
     ever_connected: bool,
+    /// All lamps off, outranking the fault and the cycle, while the link is down.
+    dark: bool,
     runner: Runner,
     lights: Arc<Lights>,
     last_holder: SharedLastHolder,
@@ -725,6 +731,75 @@ fn send(client: &mut EspWebSocketClient<'_>, msg: &DeviceMsg<'_>) -> bool {
     }
 }
 
+/// Build a websocket client.
+///
+/// Called again whenever the link has to be remade. The ESP client retries on
+/// its own, but that retry can wedge with the radio associated and addressed —
+/// the state where `net_healthy` is true, so no rung of [`repair_net`] fires and
+/// nothing else in the process would ever replace it.
+///
+/// Each call is a fresh framer as well as a fresh socket, so no fragment of the
+/// dead session can be parsed as the first message of the new one.
+fn connect_ws(tx: &Sender<AppEvent>) -> Result<EspWebSocketClient<'static>> {
+    let headers = format!("Authorization: Bearer {}\r\n", CONFIG.device_token);
+    let ws_config = EspWebSocketClientConfig {
+        headers: Some(&headers),
+        crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
+        // TLS handshakes run on the client's own task; the default stack is tight.
+        task_stack: 10 * 1024,
+        ..Default::default()
+    };
+    let client = EspWebSocketClient::new(CONFIG.ws_url, &ws_config, Duration::from_secs(10), {
+        let tx = tx.clone();
+        // Messages arrive in receive-buffer-sized chunks with no length info, so
+        // they have to be reframed before parsing. Mutex because the callback is
+        // Fn, not FnMut.
+        let framer: std::sync::Mutex<JsonFramer<ServerMsgRaw>> =
+            std::sync::Mutex::new(JsonFramer::new());
+        move |event: &Result<WebSocketEvent<'_>, esp_idf_svc::io::EspIOError>| {
+            if let Ok(event) = event {
+                match &event.event_type {
+                    WebSocketEventType::Connected => {
+                        // A fragment left over from the previous session would
+                        // corrupt the first message of this one.
+                        if let Ok(mut framer) = framer.lock() {
+                            framer.reset();
+                        }
+                        let _ = tx.send(AppEvent::WsConnected);
+                    }
+                    // Drop a partial as soon as the link goes, not just on the
+                    // next connect. A message cut in half by a network drop would
+                    // otherwise be held for the whole dead-connection window, and
+                    // a half-received 16KB job script is heap this device cannot
+                    // spare — free heap is ~33KB while any script is running.
+                    WebSocketEventType::Disconnected
+                    | WebSocketEventType::Close(_)
+                    | WebSocketEventType::Closed => {
+                        if let Ok(mut framer) = framer.lock() {
+                            if framer.is_partial() {
+                                log::warn!("link closed mid-message; discarding partial");
+                            }
+                            framer.reset();
+                        }
+                    }
+                    // Binary is the normal path: bytes arrive unvalidated, so a
+                    // multi-byte character split across chunks survives. Text is
+                    // still accepted so the server and firmware can be deployed
+                    // in either order.
+                    WebSocketEventType::Binary(bytes) => {
+                        deliver(&framer, &tx, bytes);
+                    }
+                    WebSocketEventType::Text(text) => {
+                        deliver(&framer, &tx, text.as_bytes());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    })?;
+    Ok(client)
+}
+
 fn connect_wifi(wifi: &mut BlockingWifi<EspWifi<'static>>) -> Result<()> {
     wifi.set_configuration(&Configuration::Client(ClientConfiguration {
         ssid: CONFIG
@@ -866,6 +941,7 @@ fn main() -> Result<()> {
         fault: None,
         link_down_since: None,
         ever_connected: false,
+        dark: false,
         runner: Runner::new(),
         lights: lights.clone(),
         last_holder: SharedLastHolder::default(),
@@ -881,62 +957,7 @@ fn main() -> Result<()> {
     connect_wifi(&mut wifi)?;
     wait_for_sntp();
 
-    let headers = format!("Authorization: Bearer {}\r\n", CONFIG.device_token);
-    let ws_config = EspWebSocketClientConfig {
-        headers: Some(&headers),
-        crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
-        // TLS handshakes run on the client's own task; the default stack is tight.
-        task_stack: 10 * 1024,
-        ..Default::default()
-    };
-    let mut client = EspWebSocketClient::new(CONFIG.ws_url, &ws_config, Duration::from_secs(10), {
-        let tx = tx.clone();
-        // Messages arrive in receive-buffer-sized chunks with no length info, so
-        // they have to be reframed before parsing. Mutex because the callback is
-        // Fn, not FnMut.
-        let framer: std::sync::Mutex<JsonFramer<ServerMsgRaw>> =
-            std::sync::Mutex::new(JsonFramer::new());
-        move |event: &Result<WebSocketEvent<'_>, esp_idf_svc::io::EspIOError>| {
-            if let Ok(event) = event {
-                match &event.event_type {
-                    WebSocketEventType::Connected => {
-                        // A fragment left over from the previous session would
-                        // corrupt the first message of this one.
-                        if let Ok(mut framer) = framer.lock() {
-                            framer.reset();
-                        }
-                        let _ = tx.send(AppEvent::WsConnected);
-                    }
-                    // Drop a partial as soon as the link goes, not just on the
-                    // next connect. A message cut in half by a network drop would
-                    // otherwise be held for the whole dead-connection window, and
-                    // a half-received 16KB job script is heap this device cannot
-                    // spare — free heap is ~33KB while any script is running.
-                    WebSocketEventType::Disconnected
-                    | WebSocketEventType::Close(_)
-                    | WebSocketEventType::Closed => {
-                        if let Ok(mut framer) = framer.lock() {
-                            if framer.is_partial() {
-                                log::warn!("link closed mid-message; discarding partial");
-                            }
-                            framer.reset();
-                        }
-                    }
-                    // Binary is the normal path: bytes arrive unvalidated, so a
-                    // multi-byte character split across chunks survives. Text is
-                    // still accepted so the server and firmware can be deployed
-                    // in either order.
-                    WebSocketEventType::Binary(bytes) => {
-                        deliver(&framer, &tx, bytes);
-                    }
-                    WebSocketEventType::Text(text) => {
-                        deliver(&framer, &tx, text.as_bytes());
-                    }
-                    _ => {}
-                }
-            }
-        }
-    })?;
+    let mut client = connect_ws(&tx)?;
 
     let mut last_heartbeat = Instant::now();
     let mut last_wifi_check = Instant::now();
@@ -944,6 +965,10 @@ fn main() -> Result<()> {
     // before the first one.
     let mut last_net_repair: Option<Instant> = None;
     let mut net_strikes: u32 = 0;
+    // Same shape for the websocket: `None` rebuilds on sight, once the link has
+    // been down for [`LINK_GRACE`].
+    let mut last_ws_rebuild: Option<Instant> = None;
+    let mut ws_strikes: u32 = 0;
 
     loop {
         match rx.recv_timeout(Duration::from_millis(100)) {
@@ -952,9 +977,13 @@ fn main() -> Result<()> {
             Err(mpsc::RecvTimeoutError::Disconnected) => unreachable!("app holds a sender"),
         }
 
-        // A link that stays down is a fault worth showing: the light looks
-        // perfectly healthy while unreachable otherwise. Only after it has been
-        // up once, so a boot before the AP is ready doesn't flash.
+        // A down link is not shown on the lamps: it says nothing the person
+        // looking at it can act on, and the light is unreachable anyway. It goes
+        // dark and the client is rebuilt underneath it.
+        //
+        // Only after the link has been up once, so a boot before the AP is ready
+        // neither darkens the light nor replaces a client still making its first
+        // connection.
         if !client.is_connected() {
             if app.ever_connected {
                 let down = *app.link_down_since.get_or_insert_with(Instant::now);
@@ -963,41 +992,55 @@ fn main() -> Result<()> {
                 // server unreachable — killing it to announce that would break
                 // the case this exists for. Its own deadline still bounds it.
                 if down.elapsed() >= LINK_GRACE && app.running_id.is_none() {
-                    app.raise_fault("link down", None);
-                }
-                // The netif ladder has long since rebooted anything it could
-                // fix, so what is left is above the radio and out of reach.
-                // Gated on the same running job for the same reason.
-                if down.elapsed() >= LINK_DEAD && app.running_id.is_none() {
-                    reboot("link down past every grace");
+                    app.dark = true;
+                    let wait = idle_backoff(WS_REBUILD_RETRY, WS_REBUILD_RETRY_MAX, ws_strikes);
+                    if last_ws_rebuild.is_none_or(|at| at.elapsed() >= wait) {
+                        last_ws_rebuild = Some(Instant::now());
+                        ws_strikes += 1;
+                        log::warn!("link down {:?}; rebuilding websocket ({ws_strikes})", down.elapsed());
+                        // The old client is dropped by the assignment, which
+                        // closes and destroys its handle and joins its task.
+                        match connect_ws(&tx) {
+                            Ok(fresh) => client = fresh,
+                            Err(e) => log::warn!("websocket rebuild failed: {e}"),
+                        }
+                    }
                 }
             }
         } else if app.link_down_since.take().is_some() {
-            if app.fault.as_ref().is_some_and(|f| f.reason == "link down") {
-                app.clear_fault();
-            }
+            app.dark = false;
+            ws_strikes = 0;
+            last_ws_rebuild = None;
         }
 
-        // The fault signal owns the lamps while it is up, and is driven from
-        // here rather than from a script — so it still shows when the script
-        // thread is dead, or could not be spawned at all.
-        match &app.fault {
-            Some(fault) => {
-                let want = fault_lamps(fault.since.elapsed(), dwell);
-                if lights.get() != want {
-                    lights.set(want.0, want.1, want.2);
-                }
-                if fault.linger.is_some_and(|d| fault.since.elapsed() >= d) {
-                    app.clear_fault();
-                }
+        // A dark light outranks both: it means the link is down, and whatever
+        // the fault or the cycle would say cannot reach anyone anyway.
+        if app.dark {
+            if lights.get() != (false, false, false) {
+                lights.set(false, false, false);
             }
-            // Drive the built-in cycle. Cheap: it only writes when the state
-            // changes, and it changes at most every 1.5s.
-            None => {
-                if let Idle::Builtin { since } = app.idle {
-                    let want = builtin_idle_lamps(since.elapsed());
+        } else {
+            // The fault signal owns the lamps while it is up, and is driven from
+            // here rather than from a script — so it still shows when the script
+            // thread is dead, or could not be spawned at all.
+            match &app.fault {
+                Some(fault) => {
+                    let want = fault_lamps(fault.since.elapsed(), dwell);
                     if lights.get() != want {
                         lights.set(want.0, want.1, want.2);
+                    }
+                    if fault.linger.is_some_and(|d| fault.since.elapsed() >= d) {
+                        app.clear_fault();
+                    }
+                }
+                // Drive the built-in cycle. Cheap: it only writes when the state
+                // changes, and it changes at most every 1.5s.
+                None => {
+                    if let Idle::Builtin { since } = app.idle {
+                        let want = builtin_idle_lamps(since.elapsed());
+                        if lights.get() != want {
+                            lights.set(want.0, want.1, want.2);
+                        }
                     }
                 }
             }
