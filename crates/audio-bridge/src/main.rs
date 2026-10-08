@@ -7,11 +7,15 @@
 //! "the next beat is in N ms, the period is P" — rather than beat events.
 //! Predictions are what let the light schedule around its 100ms relay dwell
 //! instead of chasing a signal it is always a fraction of a beat behind.
+//!
+//! When a CDJ is playing on a Pro DJ Link network, its own grid replaces the
+//! tracker's; see `link`.
 
 mod analysis;
 mod bands;
 mod capture;
 mod downbeat;
+mod link;
 mod melbands;
 mod meter;
 mod metrical;
@@ -26,7 +30,7 @@ use anyhow::{bail, Context, Result};
 use cpal::traits::DeviceTrait;
 
 use crate::analysis::{to_beat, Analyzer, HopResult};
-use crate::tempo::HOP;
+use crate::tempo::{Grid, HOP};
 
 /// Where the light listens. Only one sender may run at a time — the light keeps
 /// one sequence number per socket, not per sender, so whichever is numerically
@@ -63,6 +67,9 @@ const IDLE_SEND: Duration = Duration::from_millis(100);
 const SYNTH_RATE: u32 = 48_000;
 const SYNTH_SECONDS: f32 = 600.0;
 
+/// beat-link's first choice, for the same reason: clear of players 1-6.
+const DEFAULT_LINK_DEVICE: u8 = 7;
+
 struct Args {
     host: String,
     port: u16,
@@ -79,6 +86,10 @@ struct Args {
     probe: bool,
     /// A `grid-truth` TSV to score the phrase estimate against.
     score_grid: Option<String>,
+    link: link::Mode,
+    /// None takes `offset_ms`: the audio path's capture latency makes that the
+    /// earlier of the two, and early is the safe side.
+    link_offset_ms: Option<f32>,
 }
 
 fn main() -> Result<()> {
@@ -138,7 +149,12 @@ OPTIONS:\n  \
   --pattern          with --synth, an accented fixture (kick every beat, clap\n                     \
                      on 2 and 4, crash every 16) instead of a bare click train\n  \
   --score-grid FILE  score the phrase estimate against a grid-truth TSV;\n                     \
-                     see crates/grid-truth\n\
+                     see crates/grid-truth\n  \
+  --link MODE        Pro DJ Link: passive (default) follows a CDJ playing on\n                     \
+                     air whenever there is one; announce also joins the network\n                     \
+                     as a virtual CDJ to learn the tempo master; off ignores it\n  \
+  --link-device N    device number to announce as, 7-15 (default {DEFAULT_LINK_DEVICE})\n  \
+  --link-offset MS   --offset for the CDJ's grid (default: same as --offset)\n\
 \n\
 --synth is the calibration signal: the grid is known-perfect, so any offset\n\
 seen on camera belongs to the rig rather than the tracker. Sweep --offset\n\
@@ -160,7 +176,10 @@ fn parse_args(argv: &[String]) -> Result<Args> {
         offset_ms: 0.0,
         probe: false,
         score_grid: None,
+        link: link::Mode::Passive,
+        link_offset_ms: None,
     };
+    let mut link_device = DEFAULT_LINK_DEVICE;
     let mut i = 0;
     while i < argv.len() {
         let take = |i: &mut usize| -> Result<String> {
@@ -186,9 +205,31 @@ fn parse_args(argv: &[String]) -> Result<Args> {
             "--probe" => args.probe = true,
             "--pattern" => args.synth_pattern = true,
             "--score-grid" => args.score_grid = Some(take(&mut i)?),
+            "--link" => {
+                args.link = match take(&mut i)?.as_str() {
+                    "off" => link::Mode::Off,
+                    "passive" => link::Mode::Passive,
+                    "announce" => link::Mode::Announce(0),
+                    other => bail!("--link must be off, passive or announce, not {other}"),
+                }
+            }
+            "--link-device" => {
+                link_device = take(&mut i)?
+                    .parse()
+                    .ok()
+                    .filter(|n| (7..=15).contains(n))
+                    .context("--link-device must be 7-15; 1-6 belong to players")?
+            }
+            "--link-offset" => {
+                args.link_offset_ms =
+                    Some(take(&mut i)?.parse().context("--link-offset must be a number")?)
+            }
             other => bail!("unknown argument: {other}"),
         }
         i += 1;
+    }
+    if let link::Mode::Announce(_) = args.link {
+        args.link = link::Mode::Announce(link_device);
     }
     Ok(args)
 }
@@ -352,6 +393,33 @@ fn run_live(args: &Args) -> Result<()> {
     outcome
 }
 
+/// What the light is told about a hop: a followed CDJ's grid in place of the
+/// tracker's, with its own latency knob. The levels stay the audio's — the CDJ
+/// knows where the beats are, not how loud they are.
+fn shown(
+    result: &HopResult,
+    link: Option<&link::Link>,
+    link_beat: bool,
+    args: &Args,
+) -> (HopResult, f32) {
+    let Some(link) = link else {
+        return (*result, args.offset_ms);
+    };
+    let grid = Grid {
+        onset_strength: result.grid.onset_strength,
+        model_bpm: result.grid.model_bpm,
+        ..link.grid
+    };
+    (
+        HopResult {
+            grid,
+            beat: link_beat,
+            ..*result
+        },
+        args.link_offset_ms.unwrap_or(args.offset_ms),
+    )
+}
+
 fn capture_loop(args: &Args, meter: &mut meter::Meter) -> Result<()> {
     let mut sender = wire::Sender::new(&args.host, args.port)?;
     eprintln!("sending to {}", sender.dest());
@@ -371,23 +439,60 @@ fn capture_loop(args: &Args, meter: &mut meter::Meter) -> Result<()> {
         probe_header();
     }
 
+    let mut follower = link::Follower::start(args.link)?;
+    if follower.is_some() {
+        eprintln!("watching for Pro DJ Link ({:?})", args.link);
+    }
+    let mut following: Option<u8> = None;
+    // A CDJ beat the meter has not flashed yet.
+    let mut unshown_beat = false;
+
     let mut hop = vec![0.0f32; HOP];
     let mut last_result: Option<HopResult> = None;
     let mut last_activity = Instant::now();
 
     loop {
+        let linked = match &mut follower {
+            Some(f) => {
+                for msg in f.notes() {
+                    meter.note(&msg);
+                }
+                f.poll(Instant::now())
+            }
+            None => None,
+        };
+        let player = linked.map(|l| l.player);
+        if player != following {
+            meter.note(&match player {
+                Some(p) => format!("following CDJ {p} over Pro DJ Link"),
+                None => "no CDJ playing on air; following the audio".into(),
+            });
+            following = player;
+        }
+        unshown_beat = linked.is_some_and(|l| unshown_beat || l.beat);
+
+        // A CDJ beat goes out the moment it lands rather than at the next hop.
+        if let (Some(l), Some(result)) = (&linked, &last_result) {
+            if l.beat {
+                let (shown, offset) = shown(result, Some(l), true, args);
+                sender.maybe_send(&to_beat(&shown, &[], offset), true, Instant::now())?;
+            }
+        }
+
         // Drain whatever has arrived, in whole hops.
         while cap.samples.slots() >= HOP {
             for slot in hop.iter_mut() {
                 *slot = cap.samples.pop().unwrap_or(0.0);
             }
             let result = analyzer.push_hop(&hop)?;
-            let beat = to_beat(&result, &hop, args.offset_ms);
-            sender.maybe_send(&beat, result.beat, Instant::now())?;
+            let (shown, offset) =
+                shown(&result, linked.as_ref(), std::mem::take(&mut unshown_beat), args);
+            let beat = to_beat(&shown, &hop, offset);
+            sender.maybe_send(&beat, shown.beat, Instant::now())?;
             if args.probe {
-                probe_row(analyzer.elapsed_s(), &result, wire::encode_block(&beat)[1]);
+                probe_row(analyzer.elapsed_s(), &shown, wire::encode_block(&beat)[1]);
             }
-            meter.update(&result.levels, &result.grid, result.beat, beat.audio_present);
+            meter.update(&shown.levels, &shown.grid, shown.beat, beat.audio_present);
             last_result = Some(result);
             last_activity = Instant::now();
         }
@@ -397,7 +502,8 @@ fn capture_loop(args: &Args, meter: &mut meter::Meter) -> Result<()> {
         // reported rather than merely producing nothing.
         if last_activity.elapsed() >= IDLE_SEND {
             if let Some(result) = &last_result {
-                let mut beat = to_beat(result, &[], args.offset_ms);
+                let (shown, offset) = shown(result, linked.as_ref(), false, args);
+                let mut beat = to_beat(&shown, &[], offset);
                 beat.audio_present = false;
                 sender.maybe_send(&beat, false, Instant::now())?;
             }

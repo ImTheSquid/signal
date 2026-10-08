@@ -29,6 +29,7 @@ pub struct Analyzer {
 }
 
 /// What one hop produced.
+#[derive(Clone, Copy)]
 pub struct HopResult {
     pub levels: Levels,
     pub grid: Grid,

@@ -41,11 +41,9 @@ pub mod flags {
     pub const TRACKING: u8 = 1 << 1;
     pub const COASTING: u8 = 1 << 2;
     pub const BASS_MUTED: u8 = 1 << 3;
-    /// Reserved: set only once a real downbeat estimator exists. Until then
-    /// nothing may read `beat_index % 4 == 0` as a downbeat. Declared rather
-    /// than left as a bare bit so the reservation is visible to whoever adds
-    /// the estimator, and so a test can hold it down.
-    #[allow(dead_code)]
+    /// `beat_index % 4 == 0` is the downbeat. Set only while following a CDJ,
+    /// whose rekordbox grid knows the bar; the audio tracker's count starts
+    /// wherever the daemon did.
     pub const BAR_VALID: u8 = 1 << 4;
     pub const CLIPPING: u8 = 1 << 5;
 }
@@ -98,6 +96,9 @@ pub fn encode_block(beat: &Beat) -> [u8; BLOCK_LEN] {
     }
     if beat.clipping {
         f |= flags::CLIPPING;
+    }
+    if beat.grid.bar_valid {
+        f |= flags::BAR_VALID;
     }
     b[1] = f;
 
@@ -274,6 +275,7 @@ mod tests {
                 period_ms: Some(468.75),
                 ms_to_next_beat: Some(123.0),
                 beat_index: 21,
+                bar_valid: false,
                 confidence: 0.75,
                 tracking: true,
                 coasting: false,
@@ -317,13 +319,18 @@ mod tests {
     }
 
     #[test]
-    fn bar_valid_is_never_claimed() {
-        let b = encode_block(&sample_beat());
+    fn bar_valid_follows_the_grid() {
+        let mut beat = sample_beat();
+        let b = encode_block(&beat);
         assert_eq!(
             b[1] & flags::BAR_VALID,
             0,
-            "there is no downbeat estimator, so this bit must stay clear"
+            "the audio tracker has no downbeat estimator, so this bit must stay clear"
         );
+
+        beat.grid.bar_valid = true;
+        let b = encode_block(&beat);
+        assert_eq!(b[1] & flags::BAR_VALID, flags::BAR_VALID);
     }
 
     #[test]

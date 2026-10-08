@@ -154,8 +154,9 @@ physical access.
 Milliseconds rather than a phase fraction, so `millis() + ms_to_next_beat` works without knowing
 the period, and stays meaningful before one exists.
 
-**`bar_valid` is never set**, so `beat_index` still counts from an arbitrary origin and nothing
-may read `beat_index % 4 == 0` as a bar position.
+**`bar_valid` is set only while the bridge follows a CDJ over Pro DJ Link**, whose rekordbox grid
+knows the bar; then `beat_index % 4 == 0` is the downbeat. From the audio alone it is never set,
+`beat_index` counts from an arbitrary origin, and nothing may read `% 4` as a bar position.
 
 Not for want of an estimator — `crates/audio-bridge/src/downbeat.rs` is one, and it finds *a*
 stable 16-beat phase far above chance. It cannot reliably find *which* phase is the downbeat: it

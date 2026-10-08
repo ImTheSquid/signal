@@ -50,6 +50,41 @@ which routes by its own `capture_node` key. That is worth knowing because when t
 not resolve, nothing fails: the plugin quietly falls back to the default source. Hence the PCM,
 and hence `run.sh` printing the links it actually got.
 
+## Following the CDJs over Pro DJ Link
+
+With the Deck's ethernet on the booth switch, the bridge takes the beat grid from the CDJs
+whenever one is playing on air. That is rekordbox's grid, so tempo, phase and the downbeat are
+exact, and `bar_valid` goes out set. Levels still come from the Scarlett. When no deck is playing
+on air, or the cable comes out, the audio tracker takes over within about a beat. It runs the
+whole time, so there is nothing to restart in either direction.
+
+**The ethernet needs a link-local address, once.** The booth switch has no DHCP server, so the
+CDJs sit on 169.254/16. Without an address in that subnet the kernel drops their broadcasts
+before any socket sees them. NetworkManager left alone waits forever in `activating`. This needs
+the Deck's own Konsole; polkit refuses it over ssh:
+
+```sh
+nmcli con mod "Wired connection 1" ipv4.method link-local ipv4.never-default yes
+nmcli con up "Wired connection 1"
+```
+
+`never-default` is the part that matters for the light. It is reached by broadcast over wifi,
+and an ethernet default route would take that broadcast off to the booth instead.
+
+**Which deck.** It follows a deck whose beat packets are arriving and whose channel the DJM
+reports on air, and stays on that deck until it stops or leaves the air. The light does not jump
+mid-blend. With no DJM on the network, every playing deck counts as on air.
+
+`--link announce` also joins the network as virtual CDJ 7 (`--link-device` to change it). Players
+send status only to devices that announce, and status is what carries the tempo-master flag, so
+the light follows whichever deck the DJ has made master. It is a device on the DJs' network, so
+it is opt-in. If another device already holds the number, the bridge yields and only listens.
+
+- `--link off` ignores the network entirely.
+- `--link-offset` is `--offset` for the CDJ path. It defaults to `--offset`, which carries the
+  audio path's capture latency and so fires slightly early here. Calibrate it on camera against a
+  CDJ, the way `--offset` was against `--synth`.
+
 ## What will stop it
 
 **Sleep.** An idle Deck suspends — measured at 8 minutes, `PM: suspend entry (deep)` — and a

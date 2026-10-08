@@ -115,9 +115,12 @@ pub struct Grid {
     /// than with detections — aubio reports roughly one beat in five, so a
     /// detection counter would advance at a fifth of the tempo.
     ///
-    /// Phase-locked to the beat but **not** to the bar: there is no downbeat
-    /// estimator, so nothing may read `beat_index % 4 == 0` as a downbeat.
+    /// Phase-locked to the beat but **not** to the bar unless `bar_valid` says
+    /// so: nothing may read `beat_index % 4 == 0` as a downbeat otherwise.
     pub beat_index: u8,
+    /// `beat_index % 4 == 0` is the downbeat. Only a CDJ's grid can claim this —
+    /// rekordbox analysed the bar; the audio tracker has no downbeat estimator.
+    pub bar_valid: bool,
     pub confidence: f32,
     /// Live evidence is driving the grid.
     pub tracking: bool,
@@ -492,6 +495,7 @@ impl Tracker for AubioTracker {
             period_ms,
             ms_to_next_beat,
             beat_index: (self.beats_elapsed.rem_euclid(16.0)) as u8,
+            bar_valid: false,
             confidence: self.confidence,
             tracking: self.confidence >= CONF_TRACKING && period_ms.is_some(),
             coasting: coasting && period_ms.is_some(),

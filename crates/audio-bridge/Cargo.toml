@@ -33,6 +33,13 @@ hound = "3.5"
 # then the in-place redraw clears one physical row of several and the rest
 # scrolls away forever.
 libc = "0.2"
+# Pro DJ Link's ports are fixed, so they have to be shared with anything else on
+# the machine listening to the CDJs — SO_REUSEPORT, which std cannot set before
+# binding. `all` is what exposes it.
+socket2 = { version = "0.6", features = ["all"] }
+# Announcing as a virtual CDJ means broadcasting from the interface on the DJ Link
+# subnet, which is not the one the default route picks when wifi carries the light.
+if-addrs = "0.15"
 
 # Fork of aubio-rs maintained by the bliss-rs project; the upstream crate is
 # frozen at 2021. `builtin` compiles aubio from vendored sources, so neither
