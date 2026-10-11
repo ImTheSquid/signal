@@ -40,6 +40,9 @@ socket2 = { version = "0.6", features = ["all"] }
 # Announcing as a virtual CDJ means broadcasting from the interface on the DJ Link
 # subnet, which is not the one the default route picks when wifi carries the light.
 if-addrs = "0.15"
+# Posting plays to greenlight-stream. Blocking suits the sender's own thread, and
+# the build script already pulls it in.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 
 # Fork of aubio-rs maintained by the bliss-rs project; the upstream crate is
 # frozen at 2021. `builtin` compiles aubio from vendored sources, so neither

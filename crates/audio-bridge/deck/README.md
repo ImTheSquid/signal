@@ -85,6 +85,26 @@ it is opt-in. If another device already holds the number, the bridge yields and 
   audio path's capture latency and so fires slightly early here. Calibrate it on camera against a
   CDJ, the way `--offset` was against `--synth`.
 
+## Tracklist
+
+With `--link announce`, the bridge can report tracks played on air to greenlight-stream. A
+track counts once it has been playing on air for 30 seconds (`--min-play`). Its title comes from
+the dbserver of the player holding the USB.
+
+```
+mkdir -p ~/.config/audio-bridge
+read -rs t && printf %s "$t" | install -m 600 /dev/stdin ~/.config/audio-bridge/greenlight-token
+deck/run.sh --link announce --tracklist https://stream.greenlight.church/api/tracks
+```
+
+Start a session from greenlight's control page. Plays outside a session are dropped there. Every
+play is also logged as a `tracklist:` line: `journalctl --user -u audio-bridge | grep tracklist`.
+
+To check titles before a set, stop the service and run
+`target-steamos/release/audio-bridge --tracks`. CDJ-3000s are asked as themselves. Nexus
+players only answer a player 1–4 that has not loaded a track from them, so `--ask-as N` tries
+another.
+
 ## What will stop it
 
 **Sleep.** An idle Deck suspends — measured at 8 minutes, `PM: suspend entry (deep)` — and a

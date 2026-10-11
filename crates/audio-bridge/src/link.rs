@@ -326,6 +326,20 @@ impl Follower {
         })
     }
 
+    pub fn watch(&self) -> Watch {
+        Watch {
+            shared: self.shared.clone(),
+        }
+    }
+}
+
+/// Read access to what the listener has heard, for other threads.
+#[derive(Clone)]
+pub struct Watch {
+    shared: Arc<Mutex<Shared>>,
+}
+
+impl Watch {
     /// Devices heard recently, in number order. Empty unless announcing.
     pub fn players(&self, now: Instant) -> Vec<Player> {
         let shared = lock(&self.shared);
@@ -340,6 +354,18 @@ impl Follower {
                 status: player_slot(number).and_then(|i| shared.decks[i].status(now)),
             })
             .collect()
+    }
+
+    /// The mixer's metronome is arriving, so its on-air flags reach the players.
+    pub fn mixer(&self, now: Instant) -> bool {
+        lock(&self.shared)
+            .mixer_at
+            .is_some_and(|at| now.saturating_duration_since(at) <= MIXER_FRESH)
+    }
+
+    /// Said where the listener's own notes are.
+    pub fn note(&self, msg: String) {
+        note(&self.shared, msg);
     }
 }
 

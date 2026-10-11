@@ -57,6 +57,14 @@ fi
 # anything else audio-shaped is plugged in. By name rather than id, so it still
 # resolves if the stream is rebuilt after a replug.
 #
+# greenlight-stream's device token, for --tracklist. A file rather than the unit's
+# environment, so it never appears in systemctl's view of the unit.
+token=${XDG_CONFIG_HOME:-$HOME/.config}/audio-bridge/greenlight-token
+if [[ -r $token ]]; then
+    GREENLIGHT_DEVICE_TOKEN=$(<"$token")
+    export GREENLIGHT_DEVICE_TOKEN
+fi
+
 # --device first so a caller can still override it.
 #
 # systemd-inhibit because an idle Deck suspends, and a suspended Deck is a light

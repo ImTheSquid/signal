@@ -20,9 +20,11 @@ mod link;
 mod melbands;
 mod meter;
 mod metrical;
+mod played;
 mod score;
 mod tempo;
 mod tempo_model;
+mod tracklist;
 mod wire;
 
 use std::time::{Duration, Instant};
@@ -75,6 +77,13 @@ const DEFAULT_LINK_DEVICE: u8 = 7;
 /// players start sending status once they have heard one.
 const TRACKS_LISTEN: Duration = Duration::from_secs(6);
 
+/// Playing on air for this long is a play rather than a cue or a preview.
+const DEFAULT_MIN_PLAY: Duration = Duration::from_secs(30);
+
+/// greenlight-stream's device token. From the environment, never an argument,
+/// so it stays out of `ps`.
+const TOKEN_VAR: &str = "GREENLIGHT_DEVICE_TOKEN";
+
 struct Args {
     host: String,
     port: u16,
@@ -99,6 +108,9 @@ struct Args {
     tracks: bool,
     /// Player number to query dbservers as, overriding the usual choice.
     ask_as: Option<u8>,
+    /// greenlight-stream's `/api/tracks`, to report plays to.
+    tracklist: Option<String>,
+    min_play: Duration,
 }
 
 fn main() -> Result<()> {
@@ -170,13 +182,18 @@ OPTIONS:\n  \
   --tracks           announce, list each player's loaded track with its title\n                     \
                      from the dbserver, and exit. Stop the service first, or\n                     \
                      give a free --link-device\n  \
-  --ask-as N         with --tracks, query dbservers as player N\n\
+  --ask-as N         with --tracks, query dbservers as player N\n  \
+  --tracklist URL    report tracks played on air to greenlight-stream's\n                     \
+                     /api/tracks, with ${TOKEN_VAR} from the environment.\n                     \
+                     Needs --link announce\n  \
+  --min-play S       seconds on air before a track counts (default {})\n\
 \n\
 --synth is the calibration signal: the grid is known-perfect, so any offset\n\
 seen on camera belongs to the rig rather than the tracker. Sweep --offset\n\
 against it to find the lamp lead. It is deliberately unaccented, so add\n\
 --pattern when the thing being tested is the phrase rather than the tempo.\n",
-        capture::DEFAULT_DEVICE
+        capture::DEFAULT_DEVICE,
+        DEFAULT_MIN_PLAY.as_secs()
     );
 }
 
@@ -196,6 +213,8 @@ fn parse_args(argv: &[String]) -> Result<Args> {
         link_offset_ms: None,
         tracks: false,
         ask_as: None,
+        tracklist: None,
+        min_play: DEFAULT_MIN_PLAY,
     };
     let mut link_device = DEFAULT_LINK_DEVICE;
     let mut i = 0;
@@ -252,9 +271,19 @@ fn parse_args(argv: &[String]) -> Result<Args> {
                         .context("--ask-as must be 1-15")?,
                 )
             }
+            "--tracklist" => args.tracklist = Some(take(&mut i)?),
+            "--min-play" => {
+                args.min_play = Duration::from_secs(
+                    take(&mut i)?.parse().context("--min-play must be whole seconds")?,
+                )
+            }
             other => bail!("unknown argument: {other}"),
         }
         i += 1;
+    }
+    // Plays are read from status, which only an announced device receives.
+    if args.tracklist.is_some() && !matches!(args.link, link::Mode::Announce(_)) {
+        bail!("--tracklist needs --link announce");
     }
     // Status, and so the loaded track, only comes to an announced device.
     if args.tracks && args.link == link::Mode::Passive {
@@ -278,7 +307,7 @@ fn show_tracks(args: &Args) -> Result<()> {
         }
     }
 
-    let players = follower.players(Instant::now());
+    let players = follower.watch().players(Instant::now());
     if players.is_empty() {
         bail!("heard no keep-alives; is the booth interface link-local, and are we announcing?");
     }
@@ -532,6 +561,19 @@ fn capture_loop(args: &Args, meter: &mut meter::Meter) -> Result<()> {
     let mut follower = link::Follower::start(args.link)?;
     if follower.is_some() {
         eprintln!("watching for Pro DJ Link ({:?})", args.link);
+    }
+    if let (Some(url), Some(f)) = (&args.tracklist, &follower) {
+        let token = std::env::var(TOKEN_VAR)
+            .ok()
+            .filter(|t| !t.is_empty())
+            .with_context(|| format!("--tracklist needs {TOKEN_VAR} set"))?;
+        let config = tracklist::Config {
+            url: url.clone(),
+            token,
+            min_play: args.min_play,
+        };
+        tracklist::start(config, f.watch())?;
+        eprintln!("reporting plays to {url}");
     }
     let mut following: Option<u8> = None;
     // A CDJ beat the meter has not flashed yet.
