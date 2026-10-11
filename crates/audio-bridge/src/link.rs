@@ -38,7 +38,9 @@ const TYPE_BEAT: u8 = 0x28;
 const BEAT_LEN: usize = 0x60;
 const KEEP_ALIVE_LEN: usize = 0x36;
 const STATUS_FLAGS: usize = 0x89;
+const STATUS_PLAYING: u8 = 0x40;
 const STATUS_MASTER: u8 = 0x20;
+const STATUS_ON_AIR: u8 = 0x08;
 
 /// Pitch is a fraction of this; 0x100000 is the track at its own tempo.
 const NOMINAL_PITCH: f64 = 1_048_576.0;
@@ -90,6 +92,38 @@ pub struct Link {
     pub beat: bool,
 }
 
+/// A loaded track, as named to the dbserver of the player it came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Track {
+    /// Player whose media holds it: the deck itself, or another over Link.
+    pub source: u8,
+    pub slot: u8,
+    /// 1 rekordbox-analysed, 2 unanalysed, 5 audio CD.
+    pub kind: u8,
+    pub id: u32,
+}
+
+/// A player's own account of itself. Only arrives when announcing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Status {
+    pub device: u8,
+    pub track: Option<Track>,
+    pub playing: bool,
+    /// The player's belief, from the mixer, that it can be heard.
+    pub on_air: bool,
+    pub master: bool,
+}
+
+/// A device on the network, as of its last keep-alive.
+#[derive(Clone, Debug)]
+pub struct Player {
+    pub number: u8,
+    pub name: String,
+    pub ip: Ipv4Addr,
+    /// None unless fresh.
+    pub status: Option<Status>,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct Deck {
     /// Arrival of the latest beat packet. A player sends it on the beat, so this
@@ -102,8 +136,7 @@ struct Deck {
     /// When the current run of beats began. Two decks playing at once go to the
     /// one that was there first.
     playing_since: Option<Instant>,
-    /// Last status that called this deck master. Only arrives when announcing.
-    master_at: Option<Instant>,
+    status: Option<(Instant, Status)>,
 }
 
 impl Deck {
@@ -113,9 +146,14 @@ impl Deck {
         })
     }
 
+    fn status(&self, now: Instant) -> Option<Status> {
+        self.status
+            .filter(|(at, _)| now.saturating_duration_since(*at) <= STATUS_FRESH)
+            .map(|(_, s)| s)
+    }
+
     fn master(&self, now: Instant) -> bool {
-        self.master_at
-            .is_some_and(|at| now.saturating_duration_since(at) <= STATUS_FRESH)
+        self.status(now).is_some_and(|s| s.master)
     }
 
     fn beat(&mut self, period_ms: f64, beat_in_bar: u8, now: Instant) {
@@ -170,7 +208,15 @@ struct Shared {
     mixer_at: Option<Instant>,
     /// Any player's address, which names the subnet to announce on.
     player_ip: Option<Ipv4Addr>,
+    /// Everyone's latest keep-alive. Only heard when announcing.
+    devices: BTreeMap<u8, Heard>,
     notes: Vec<String>,
+}
+
+struct Heard {
+    name: String,
+    ip: Ipv4Addr,
+    at: Instant,
 }
 
 impl Shared {
@@ -278,6 +324,22 @@ impl Follower {
             grid: deck.grid(now),
             beat,
         })
+    }
+
+    /// Devices heard recently, in number order. Empty unless announcing.
+    pub fn players(&self, now: Instant) -> Vec<Player> {
+        let shared = lock(&self.shared);
+        shared
+            .devices
+            .iter()
+            .filter(|(_, h)| now.saturating_duration_since(h.at) <= PEER_FRESH)
+            .map(|(&number, h)| Player {
+                number,
+                name: h.name.clone(),
+                ip: h.ip,
+                status: player_slot(number).and_then(|i| shared.decks[i].status(now)),
+            })
+            .collect()
     }
 }
 
@@ -440,8 +502,17 @@ impl Announcer {
                 );
             }
             self.peers.insert(k.device, now);
+            let mut shared = lock(shared);
             if player_slot(k.device).is_some() {
-                lock(shared).player_ip = Some(ip);
+                shared.player_ip = Some(ip);
+            }
+            if Some(ip) != self.own_ip {
+                let heard = Heard {
+                    name: k.name,
+                    ip,
+                    at: now,
+                };
+                shared.devices.insert(k.device, heard);
             }
         }
         loop {
@@ -452,7 +523,7 @@ impl Announcer {
             };
             if let Some(s) = parse_status(&buf[..n]) {
                 if let Some(i) = player_slot(s.device) {
-                    lock(shared).decks[i].master_at = s.master.then_some(now);
+                    lock(shared).decks[i].status = Some((now, s));
                 }
             }
         }
@@ -592,18 +663,26 @@ fn parse_keep_alive(p: &[u8]) -> Option<KeepAlive> {
     })
 }
 
-struct Status {
-    device: u8,
-    master: bool,
-}
-
+/// Every field read sits in the prefix the 0xd4-byte nexus layout shares with
+/// the CDJ-3000's longer one.
 fn parse_status(p: &[u8]) -> Option<Status> {
     if !framed(p, TYPE_STATUS, STATUS_FLAGS + 1) {
         return None;
     }
+    let flags = p[STATUS_FLAGS];
+    // A zero source player means nothing is loaded.
+    let track = (p[0x28] != 0).then(|| Track {
+        source: p[0x28],
+        slot: p[0x29],
+        kind: p[0x2a],
+        id: u32::from_be_bytes([p[0x2c], p[0x2d], p[0x2e], p[0x2f]]),
+    });
     Some(Status {
         device: p[0x21],
-        master: p[STATUS_FLAGS] & STATUS_MASTER != 0,
+        track,
+        playing: flags & STATUS_PLAYING != 0,
+        on_air: flags & STATUS_ON_AIR != 0,
+        master: flags & STATUS_MASTER != 0,
     })
 }
 
@@ -824,8 +903,45 @@ mod tests {
         let at = t + Duration::from_millis(3600);
         assert_eq!(f.poll(at).unwrap().player, 1);
 
-        lock(&f.shared).decks[1].master_at = Some(at);
+        let master = parse_status(&status_packet(2, 0xd4, None, STATUS_PLAYING | STATUS_MASTER));
+        lock(&f.shared).decks[1].status = Some((at, master.unwrap()));
         assert_eq!(f.poll(at).unwrap().player, 2);
+    }
+
+    fn status_packet(device: u8, len: usize, track: Option<Track>, flags: u8) -> Vec<u8> {
+        let mut p = vec![0u8; len];
+        p[..10].copy_from_slice(&MAGIC);
+        p[0x0a] = TYPE_STATUS;
+        p[0x21] = device;
+        if let Some(t) = track {
+            p[0x28] = t.source;
+            p[0x29] = t.slot;
+            p[0x2a] = t.kind;
+            p[0x2c..0x30].copy_from_slice(&t.id.to_be_bytes());
+        }
+        p[STATUS_FLAGS] = flags;
+        p
+    }
+
+    #[test]
+    fn a_status_packet_names_its_track_on_both_generations() {
+        // Player 3 playing on air, from player 1's USB over Link.
+        let track = Track {
+            source: 1,
+            slot: 3,
+            kind: 1,
+            id: 0x0001_2345,
+        };
+        for len in [0xd4, 0x200] {
+            let s = parse_status(&status_packet(3, len, Some(track), 0x40 | 0x08)).unwrap();
+            assert_eq!(s.device, 3);
+            assert_eq!(s.track, Some(track));
+            assert!(s.playing && s.on_air && !s.master);
+        }
+        let empty = parse_status(&status_packet(2, 0xd4, None, 0)).unwrap();
+        assert_eq!(empty.track, None);
+        assert!(!empty.playing && !empty.on_air);
+        assert!(parse_status(&status_packet(2, 0xd4, None, 0)[..0x80]).is_none(), "short");
     }
 
     #[test]

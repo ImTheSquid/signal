@@ -14,6 +14,7 @@
 mod analysis;
 mod bands;
 mod capture;
+mod dbserver;
 mod downbeat;
 mod link;
 mod melbands;
@@ -70,6 +71,10 @@ const SYNTH_SECONDS: f32 = 600.0;
 /// beat-link's first choice, for the same reason: clear of players 1-6.
 const DEFAULT_LINK_DEVICE: u8 = 7;
 
+/// How long `--tracks` listens before asking. Keep-alives go out every 1.5s, and
+/// players start sending status once they have heard one.
+const TRACKS_LISTEN: Duration = Duration::from_secs(6);
+
 struct Args {
     host: String,
     port: u16,
@@ -90,6 +95,10 @@ struct Args {
     /// None takes `offset_ms`: the audio path's capture latency makes that the
     /// earlier of the two, and early is the safe side.
     link_offset_ms: Option<f32>,
+    /// List the players' loaded tracks and exit.
+    tracks: bool,
+    /// Player number to query dbservers as, overriding the usual choice.
+    ask_as: Option<u8>,
 }
 
 fn main() -> Result<()> {
@@ -103,6 +112,9 @@ fn main() -> Result<()> {
     }
 
     let args = parse_args(&argv)?;
+    if args.tracks {
+        return show_tracks(&args);
+    }
     match (&args.wav, args.synth_bpm) {
         (Some(path), _) => {
             let (samples, rate) = analysis::read_wav_mono(path)?;
@@ -154,7 +166,11 @@ OPTIONS:\n  \
                      air whenever there is one; announce also joins the network\n                     \
                      as a virtual CDJ to learn the tempo master; off ignores it\n  \
   --link-device N    device number to announce as, 7-15 (default {DEFAULT_LINK_DEVICE})\n  \
-  --link-offset MS   --offset for the CDJ's grid (default: same as --offset)\n\
+  --link-offset MS   --offset for the CDJ's grid (default: same as --offset)\n  \
+  --tracks           announce, list each player's loaded track with its title\n                     \
+                     from the dbserver, and exit. Stop the service first, or\n                     \
+                     give a free --link-device\n  \
+  --ask-as N         with --tracks, query dbservers as player N\n\
 \n\
 --synth is the calibration signal: the grid is known-perfect, so any offset\n\
 seen on camera belongs to the rig rather than the tracker. Sweep --offset\n\
@@ -178,6 +194,8 @@ fn parse_args(argv: &[String]) -> Result<Args> {
         score_grid: None,
         link: link::Mode::Passive,
         link_offset_ms: None,
+        tracks: false,
+        ask_as: None,
     };
     let mut link_device = DEFAULT_LINK_DEVICE;
     let mut i = 0;
@@ -224,14 +242,86 @@ fn parse_args(argv: &[String]) -> Result<Args> {
                 args.link_offset_ms =
                     Some(take(&mut i)?.parse().context("--link-offset must be a number")?)
             }
+            "--tracks" => args.tracks = true,
+            "--ask-as" => {
+                args.ask_as = Some(
+                    take(&mut i)?
+                        .parse()
+                        .ok()
+                        .filter(|n| (1..=15).contains(n))
+                        .context("--ask-as must be 1-15")?,
+                )
+            }
             other => bail!("unknown argument: {other}"),
         }
         i += 1;
+    }
+    // Status, and so the loaded track, only comes to an announced device.
+    if args.tracks && args.link == link::Mode::Passive {
+        args.link = link::Mode::Announce(0);
     }
     if let link::Mode::Announce(_) = args.link {
         args.link = link::Mode::Announce(link_device);
     }
     Ok(args)
+}
+
+/// Each player's loaded track, titled by the dbserver of the player it came from.
+fn show_tracks(args: &Args) -> Result<()> {
+    let follower = link::Follower::start(args.link)?.context("--tracks needs the link on")?;
+    eprintln!("listening for {}s", TRACKS_LISTEN.as_secs());
+    let until = Instant::now() + TRACKS_LISTEN;
+    while Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(250));
+        for msg in follower.notes() {
+            eprintln!("{msg}");
+        }
+    }
+
+    let players = follower.players(Instant::now());
+    if players.is_empty() {
+        bail!("heard no keep-alives; is the booth interface link-local, and are we announcing?");
+    }
+    for p in &players {
+        let status = match p.status {
+            None => "no status".to_string(),
+            Some(s) => format!(
+                "{}{}{} {}",
+                if s.playing { "playing" } else { "stopped" },
+                if s.on_air { " on-air" } else { "" },
+                if s.master { " master" } else { "" },
+                match s.track {
+                    None => "empty".to_string(),
+                    Some(t) => format!(
+                        "track {} from player {} slot {} type {}",
+                        t.id, t.source, t.slot, t.kind
+                    ),
+                },
+            ),
+        };
+        println!("{:>2}  {:<14} {:<15} {status}", p.number, p.name, p.ip);
+    }
+
+    for p in &players {
+        let Some(track) = p.status.and_then(|s| s.track) else {
+            continue;
+        };
+        let Some(source) = players.iter().find(|s| s.number == track.source) else {
+            println!("player {}: source player {} not heard", p.number, track.source);
+            continue;
+        };
+        let Some(asking) = args.ask_as.or_else(|| dbserver::asking_number(source, &players)) else {
+            println!("player {}: no player number may ask player {}", p.number, source.number);
+            continue;
+        };
+        let asked = format!("asked player {} as {asking}", source.number);
+        match dbserver::lookup(source.ip, track, asking) {
+            Ok(Some(m)) => println!("player {}: {} — {} ({asked})", p.number, m.artist, m.title),
+            Ok(None) => println!("player {}: no metadata ({asked})", p.number),
+            Err(e) => println!("player {}: {e:#} ({asked})", p.number),
+        }
+    }
+    Ok(())
 }
 
 fn list_devices() -> Result<()> {
