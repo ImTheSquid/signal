@@ -8,38 +8,18 @@ pub use rhai;
 
 use rhai::Engine;
 
-/// Maximum size in bytes of the script that reaches the device, measured after
-/// minification. Enforced at the API and bounded again by the websocket framer.
+/// Maximum size of the compiled artifact the device loads, enforced at the API
+/// and bounded again by the websocket framer.
 ///
-/// This is the *best case*: what fits when a script declares the narrowest set
-/// of [`Components`] it can. A script that declares nothing carries rhai's whole
-/// standard library and fits about 5KB, so this limit passing does not mean the
-/// device will take it — `heap_check` in the firmware gives the real answer, in
-/// a message that says how much was needed and how much was free.
-///
-/// This bounds the wire and the work one request can ask of the validator. It
-/// is **not** the device's constraint any more: the light loads an artifact
-/// rather than parsing this, so [`MAX_ARTIFACT_BYTES`] is what its memory is
-/// about, and `heap_check` in the firmware makes the real decision against the
-/// heap it actually has and says what it wanted.
-///
-/// It was briefly 4KB, sized from what a *tree* cost — 24 device bytes per
-/// source byte, which is what made a 5KB script impossible.
-pub const MAX_SCRIPT_BYTES: usize = 16 * 1024;
-
-/// Maximum size of the compiled artifact the device loads.
-///
-/// The real ceiling, and much further out than the source one it replaces:
-/// `scripts/pulse.rhai` is 3633 minified bytes and 6476 of artifact, so about
-/// 1.8 bytes of artifact per source byte, loading to roughly 5x that in heap.
-/// Against ~155KB free, less a 32KB stack and a declared engine, that leaves
-/// room for something like 17KB of artifact — so this is a bound rather than a
-/// squeeze, and the device refuses anything it cannot actually fit.
+/// The real ceiling: `scripts/pulse.rhai` is 11182 source bytes and 4807 of
+/// artifact, loading to roughly 5x that in heap. Against ~155KB free, less a
+/// 32KB stack and the lazy engine, that leaves room for something like 20KB of
+/// artifact — so this is a bound rather than a squeeze, and the device refuses
+/// anything it cannot actually fit, with `heap_check` saying what it wanted.
 pub const MAX_ARTIFACT_BYTES: usize = 16 * 1024;
 
-/// Maximum size in bytes of a script as submitted, before minification. Comments
-/// and indentation are stripped before `MAX_SCRIPT_BYTES` applies, so this is what
-/// bounds the work the validator will do on one request.
+/// Maximum size in bytes of a script as submitted. Bounds the work the
+/// validator will do on one request.
 pub const MAX_RAW_SCRIPT_BYTES: usize = 256 * 1024;
 
 /// Callbacks that back the script API. The validator passes no-op stubs;
@@ -269,179 +249,19 @@ pub fn register_idle_api(
     });
 }
 
-/// Which of rhai's optional standard packages an engine carries.
-///
-/// `Engine::run` takes `&self`, so an engine cannot gain a package once a run
-/// has started; the set is fixed before evaluation. That matters because
-/// registering all of them costs ~69KB of the device's ~140KB free heap, which
-/// leaves room for about 5KB of script, which `scripts/pulse.rhai` fits inside
-/// only because it declares what it needs and gets the rest of the heap back.
-/// Registering only what a script uses costs ~21KB for that script and roughly
-/// doubles the ceiling. `crates/script-env/tests/footprint.rs` prices it.
-///
-/// Arithmetic and logic are not represented here because they are not optional:
-/// every script counts and compares, and together they are a small part of the
-/// cost.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Components {
-    pub core: bool,
-    pub array: bool,
-    pub map: bool,
-    pub string: bool,
-    pub math: bool,
-    pub iterator: bool,
-    pub blob: bool,
-    pub bit_field: bool,
-    pub functions: bool,
-}
-
-impl Components {
-    /// Everything the documented surface promises. What validation must accept,
-    /// and the safe answer whenever the needed set is unknown.
-    pub const fn all() -> Self {
-        Components {
-            core: true,
-            array: true,
-            map: true,
-            string: true,
-            math: true,
-            iterator: true,
-            blob: true,
-            bit_field: true,
-            functions: true,
-        }
-    }
-
-    /// Everything except what a script must opt out of explicitly.
-    ///
-    /// There is deliberately no `detect(script)`. Rhai resolves calls at run
-    /// time, so which packages a script needs is not decidable from its text:
-    /// the only sound answers are to run every path (impossible) or to be told.
-    /// Inferring it from substrings would trade a reboot for a script that dies
-    /// the first time an untested branch is taken, which is worse — the failure
-    /// moves from startup to the middle of a set.
-    /// Every component name, in the order they are documented.
-    pub const NAMES: [&'static str; 9] = [
-        "core",
-        "array",
-        "map",
-        "string",
-        "math",
-        "iterator",
-        "blob",
-        "bitfield",
-        "functions",
-    ];
-
-    /// Parse a declaration, as submitted with a script.
-    ///
-    /// Unknown names are rejected rather than ignored: a typo that silently
-    /// dropped a component would surface much later, as the script dying at the
-    /// first call it could not resolve.
-    pub fn from_names<S: AsRef<str>>(names: impl IntoIterator<Item = S>) -> Result<Self, String> {
-        let mut c = Components::none();
-        for name in names {
-            let name = name.as_ref();
-            match name {
-                "core" => c.core = true,
-                "array" => c.array = true,
-                "map" => c.map = true,
-                "string" => c.string = true,
-                "math" => c.math = true,
-                "iterator" => c.iterator = true,
-                "blob" => c.blob = true,
-                "bitfield" => c.bit_field = true,
-                "functions" => c.functions = true,
-                other => {
-                    return Err(format!(
-                        "unknown component {other:?}; valid components are {}",
-                        Self::NAMES.join(", ")
-                    ))
-                }
-            }
-        }
-        Ok(c)
-    }
-
-    /// The declared names, for echoing back and for storing with a job.
-    pub fn names(&self) -> Vec<&'static str> {
-        let on = [
-            self.core,
-            self.array,
-            self.map,
-            self.string,
-            self.math,
-            self.iterator,
-            self.blob,
-            self.bit_field,
-            self.functions,
-        ];
-        Self::NAMES
-            .iter()
-            .zip(on)
-            .filter(|(_, on)| *on)
-            .map(|(n, _)| *n)
-            .collect()
-    }
-
-    pub const fn none() -> Self {
-        Components {
-            core: false,
-            array: false,
-            map: false,
-            string: false,
-            math: false,
-            iterator: false,
-            blob: false,
-            bit_field: false,
-            functions: false,
-        }
-    }
-}
-
-/// An engine carrying `components`, with the sandbox limits applied.
+/// An engine carrying the whole standard library, with the sandbox limits applied.
 ///
 /// The single construction site for the language surface: the validator and the
 /// firmware both come through here, so what validates and what runs cannot
 /// drift apart.
-pub fn new_engine(components: Components) -> Engine {
-    use rhai::packages::Package;
-
-    // Arithmetic and logic are built once and shared by pointer thereafter:
-    // `register_global_module` stores the handle rather than copying functions
-    // in, so every run after the first pays a refcount instead of rebuilding
-    // them. That is churn the board feels — it idles with 140KB free but a
-    // largest block of 108KB.
-    //
-    // Only these two, deliberately. A cached module is never freed, so caching
-    // the optional ones would pin whatever any script ever declared: one idle
-    // script wanting the full surface would hold ~63KB for the life of the
-    // board and cost every later job more than declaring ever saved it
-    // (measured: a 5.9KB ceiling against the 12.3KB this arrangement gives).
-    // These two are in every engine regardless, so they can never be wasted.
-    macro_rules! shared {
-        ($pkg:ty) => {{
-            static CELL: std::sync::OnceLock<std::sync::Arc<rhai::Module>> =
-                std::sync::OnceLock::new();
-            CELL.get_or_init(|| <$pkg>::new().as_shared_module()).clone()
-        }};
-    }
-    // `init_engine` is how a package registers custom operators or syntax. Every
-    // package used here leaves it empty, but calling it keeps this exactly
-    // equivalent to `register_into_engine` if that ever stops being true.
-    macro_rules! add_shared {
-        ($engine:expr, $pkg:ty) => {{
-            <$pkg as Package>::init_engine(&mut $engine);
-            $engine.register_global_module(shared!($pkg));
-        }};
-    }
-    // Built per run and freed with the engine, so an unused component costs
-    // nothing beyond the run that asked for it.
-    macro_rules! add {
-        ($engine:expr, $pkg:ty) => {{
-            <$pkg>::new().register_into_engine(&mut $engine);
-        }};
-    }
+///
+/// The library is lazy: its functions stay in static manifests and are looked up
+/// only when a script calls them, so carrying all of it costs a small module
+/// rather than the ~96KB an eager `StandardPackage` takes on the device. That
+/// module is built once and shared by pointer, so every run after the first pays
+/// a refcount.
+pub fn new_engine() -> Engine {
+    use rhai::packages::{Package, StandardPackage};
 
     let mut engine = Engine::new_raw();
 
@@ -453,40 +273,16 @@ pub fn new_engine(components: Components) -> Engine {
     // 8-byte heap header. Not optional on a board this tight.
     engine.set_max_strings_interned(1024);
 
-    // Not optional — see `Components`.
-    add_shared!(engine, rhai::packages::ArithmeticPackage);
-    add_shared!(engine, rhai::packages::LogicPackage);
-
-    if components.core {
-        add!(engine, rhai::packages::LanguageCorePackage);
-    }
-    if components.array {
-        add!(engine, rhai::packages::BasicArrayPackage);
-    }
-    if components.map {
-        add!(engine, rhai::packages::BasicMapPackage);
-    }
-    if components.string {
-        add!(engine, rhai::packages::BasicStringPackage);
-        // Both, or `all()` would be narrower than the `Engine::new()` it stands
-        // in for: StandardPackage carries MoreStringPackage too.
-        add!(engine, rhai::packages::MoreStringPackage);
-    }
-    if components.math {
-        add!(engine, rhai::packages::BasicMathPackage);
-    }
-    if components.iterator {
-        add!(engine, rhai::packages::BasicIteratorPackage);
-    }
-    if components.blob {
-        add!(engine, rhai::packages::BasicBlobPackage);
-    }
-    if components.bit_field {
-        add!(engine, rhai::packages::BitFieldPackage);
-    }
-    if components.functions {
-        add!(engine, rhai::packages::BasicFnPackage);
-    }
+    // `init_engine` is how a package registers custom operators or syntax;
+    // calling it keeps this equivalent to `register_into_engine`.
+    static STANDARD: std::sync::OnceLock<std::sync::Arc<rhai::Module>> =
+        std::sync::OnceLock::new();
+    <StandardPackage as Package>::init_engine(&mut engine);
+    engine.register_global_module(
+        STANDARD
+            .get_or_init(|| StandardPackage::new_lazy().as_shared_module())
+            .clone(),
+    );
 
     apply_limits(&mut engine);
     engine
@@ -503,7 +299,7 @@ pub struct Artifact {
     pub program: Vec<u8>,
     /// Maps a program counter back to a position in the submitted source. Keep
     /// it beside the job; the device never sees it.
-    pub positions: Vec<u8>,
+    pub sidecar: rhai::grain::Sidecar,
     /// Nodes the compiler could not lower, which stay AST fragments and run on
     /// rhai's walker. Zero for everything in this repo; a script that reports
     /// more is paying the tree's per-node allocation cost for that part.
@@ -516,15 +312,14 @@ pub struct Artifact {
 /// is a flat buffer it verifies and executes, which is the difference between
 /// ~756 allocations and ~54 for `scripts/pulse.rhai`.
 pub fn lower(ast: &rhai::AST) -> Result<Artifact, String> {
-    let mut program = rhai::grain::Compiler::new().compile(ast);
+    let program = rhai::grain::Compiler::new().compile(ast);
     let residual = program.residual_count();
-    let positions = program.strip_positions();
-    let program = program
-        .write()
+    let stripped = program
+        .write_stripped()
         .map_err(|e| format!("cannot serialise the artifact: {e}"))?;
     Ok(Artifact {
-        program,
-        positions,
+        program: stripped.artifact,
+        sidecar: stripped.sidecar,
         residual,
     })
 }
@@ -553,10 +348,9 @@ pub fn run_artifact(engine: &Engine, bytes: &[u8]) -> Result<(), Box<rhai::EvalA
 
 /// A fully configured engine with stub handlers, for validation.
 ///
-/// Always the full surface: validation must accept anything the docs promise,
-/// whatever narrower set the device will actually run it on.
+/// The same engine the device runs, so what validates is what executes.
 pub fn validation_engine() -> Engine {
-    let mut engine = new_engine(Components::all());
+    let mut engine = new_engine();
     register_api(&mut engine, Handlers::stubs());
     engine
 }
@@ -922,12 +716,12 @@ mod tests {
 }
 
 #[cfg(test)]
-mod component_tests {
+mod surface_tests {
     use super::*;
 
     /// Exercises one feature from every package `Engine::new()` carries, so a
-    /// gap between `Components::all()` and the surface it replaces shows up
-    /// here rather than in somebody's script at 2am. Rhai resolves calls at run
+    /// gap between the lazy library and the surface it replaces shows up here
+    /// rather than in somebody's script at 2am. Rhai resolves calls at run
     /// time, so these must be *run*, not just compiled.
     const SURFACE: &str = r#"
         let n = 7 + 3 * 2;              // arithmetic
@@ -946,174 +740,62 @@ mod component_tests {
     "#;
 
     #[test]
-    fn all_components_cover_the_standard_surface() {
-        let mut engine = new_engine(Components::all());
-        register_api(&mut engine, Handlers::stubs());
+    fn the_lazy_library_covers_the_standard_surface() {
+        let engine = validation_engine();
         let got: bool = engine
             .eval(SURFACE)
-            .expect("Components::all() must run everything Engine::new() would");
+            .expect("the lazy library must run everything Engine::new() would");
         assert!(got);
     }
 
-    /// The saving is real only if dropping components actually drops functions.
+    /// The same surface, lowered to an artifact and run the way the device runs
+    /// it, so the lazy lookup is exercised through the VM and not only the walker.
     #[test]
-    fn dropping_components_drops_the_surface() {
-        let mut engine = new_engine(Components::none());
-        register_api(&mut engine, Handlers::stubs());
-        assert!(
-            engine.eval::<bool>(SURFACE).is_err(),
-            "a bare engine still ran the full surface; the components do nothing"
-        );
+    fn the_surface_runs_as_an_artifact() {
+        let engine = validation_engine();
+        let artifact = lower(&engine.compile(SURFACE).unwrap()).unwrap();
+        assert_eq!(artifact.residual, 0, "would fall back to the tree walker");
+        run_artifact(&engine, &artifact.program).expect("artifact must run the full surface");
     }
 
-    /// Arithmetic and logic are always on, so the cheapest engine is still able
-    /// to count and compare — which is what makes them non-optional.
-    /// What each component actually contains, established by probing rather
-    /// than by reading rhai's package list — several entries are not where they
-    /// look like they should be. Pinned so the README's table cannot rot.
-    ///
-    /// `core` and `functions` are absent deliberately: nothing reachable from
-    /// this language surface could be shown to depend on them, so the docs do
-    /// not claim they provide anything specific.
-    const PER_COMPONENT: [(&str, &str); 7] = [
-        ("array", "let a = [1, 2]; a.len() == 2"),
-        ("map", "let m = #{a: 1}; m.len() == 1"),
-        ("string", r#""abc".sub_string(1, 1) == "b""#),
-        ("math", "(4.0).sqrt() > 1.0"),
-        ("iterator", "let t = 0; for i in 0..3 { t += i } t == 3"),
-        ("blob", "let b = blob(2); b.len() == 2"),
-        ("bitfield", "let x = 6; x.get_bit(1)"),
-    ];
-
-    fn runs(c: Components, src: &str) -> bool {
-        let mut engine = new_engine(c);
-        register_api(&mut engine, Handlers::stubs());
-        matches!(engine.eval::<bool>(src), Ok(true))
+    /// Every script gets the whole library without declaring anything: the
+    /// functions that used to need a component resolve on first call.
+    #[test]
+    fn lazy_functions_resolve_on_call() {
+        let engine = validation_engine();
+        assert!(engine.eval::<bool>("(1).to_float() > 0.0").unwrap());
+        assert!(engine.eval::<bool>("let b = blob(2); b.len() == 2").unwrap());
+        assert!(engine.eval::<bool>("let x = 6; x.get_bit(1)").unwrap());
+        engine.eval::<()>("print(1)").unwrap();
     }
 
-    /// Each component provides its own entry, and *only* its own — so the docs
-    /// can tell someone which one name to add when a call fails.
+    /// The light's default idle script, run the way the device runs it.
     #[test]
-    fn components_provide_exactly_what_the_docs_say() {
-        for (name, src) in PER_COMPONENT {
-            let only = Components::from_names([name]).unwrap();
-            assert!(runs(only, src), "{name}: {src:?} did not run with only {name}");
-            assert!(
-                !runs(Components::none(), src),
-                "{name}: {src:?} runs with no components, so the docs must not \
-                 attribute it to {name}"
-            );
-            for other in Components::NAMES {
-                if other == name || other == "core" || other == "functions" {
-                    continue;
-                }
-                let only_other = Components::from_names([other]).unwrap();
-                assert!(
-                    !runs(only_other, src),
-                    "{name}: {src:?} also runs under {other}, so the docs are wrong"
-                );
-            }
-        }
-    }
-
-    /// Field access on a map is core language, not the `map` component — worth
-    /// pinning because `dmx_recv` hands scripts a map and reading it must not
-    /// require a declaration.
-    #[test]
-    fn reading_a_map_field_needs_nothing() {
-        assert!(runs(Components::none(), "let m = #{a: 1}; m.a == 1"));
-    }
-
-    /// `to_float` reads like a conversion but lives in `math`, which is why a
-    /// script doing no trigonometry can still need that component.
-    #[test]
-    fn to_float_needs_math() {
-        assert!(!runs(Components::none(), "(1).to_float() > 0.0"));
-        assert!(runs(Components::from_names(["math"]).unwrap(), "(1).to_float() > 0.0"));
-    }
-
-    /// print and debug format their argument, so they need `string` — not the
-    /// `core` name a reader would reach for first.
-    #[test]
-    fn print_needs_string() {
-        assert!(!runs(Components::none(), "print(1); true"));
-        assert!(runs(Components::from_names(["string"]).unwrap(), "print(1); true"));
-    }
-
-    #[test]
-    fn names_round_trip() {
-        let all = Components::all();
-        assert_eq!(all.names().len(), Components::NAMES.len());
-        assert_eq!(Components::from_names(all.names()).unwrap(), all);
-        assert_eq!(Components::from_names(Vec::<&str>::new()).unwrap(), Components::none());
-    }
-
-    /// A typo must not quietly drop a component: the script would run until it
-    /// reached the first call it could not resolve, which could be hours in.
-    #[test]
-    fn unknown_names_are_rejected_and_say_what_is_valid() {
-        let e = Components::from_names(["array", "maths"]).unwrap_err();
-        assert!(e.contains("maths"), "{e}");
-        assert!(e.contains("math"), "{e}");
-    }
-
-    #[test]
-    fn the_cheapest_engine_still_counts_and_compares() {
-        let mut engine = new_engine(Components::none());
-        register_api(&mut engine, Handlers::stubs());
-        assert!(engine.eval::<bool>("let n = 7 + 3 * 2; n > 5 && n != 0").unwrap());
-    }
-
-    /// The light's default idle script, run the way the device runs it: lowered
-    /// to an artifact, on an engine that declares nothing.
-    ///
-    /// This is the premise the idle heap budget rests on. Undeclared, the device
-    /// reserves ~96KB for the standard library and can refuse to start a script
-    /// that calls one function — so what matters is not just that this script
-    /// works, but that it works with nothing declared.
-    #[test]
-    fn the_idle_script_needs_no_components() {
+    fn the_idle_script_runs_as_an_artifact() {
         let src = "set_lights(false, false, false);";
         let artifact = lower(&validation_engine().compile(src).unwrap()).unwrap();
         assert_eq!(artifact.residual, 0, "idle would fall back to the tree walker");
 
-        let mut engine = new_engine(Components::none());
-        register_api(&mut engine, Handlers::stubs());
+        let engine = validation_engine();
         assert!(run_artifact(&engine, &artifact.program).is_ok());
         assert!(engine.eval::<()>(src).is_ok(), "source path must agree");
     }
 
-    /// `get_last_holder` returns a map and idle scripts are its only callers, so
-    /// what it takes to *use* one is what an idle declaration has to cover.
-    ///
-    /// Reading its fields, comparing them and joining them needs nothing —
-    /// map-field access and `+` on two strings are both core. An idle script that
-    /// greets the last holder can therefore declare nothing at all, which is the
-    /// case the heap budget cares about.
     #[test]
-    fn using_the_last_holder_needs_no_components() {
-        fn idle_runs(c: Components, src: &str) -> bool {
-            let mut engine = new_engine(c);
-            register_api(&mut engine, Handlers::stubs());
-            register_idle_api(
-                &mut engine,
-                Box::new(|| {
-                    Some(LastHolder {
-                        name: "amy".into(),
-                        result: "ok".into(),
-                        ended_ms_ago: 1234,
-                    })
-                }),
-            );
-            matches!(engine.eval::<bool>(src), Ok(true))
-        }
-
-        let none = Components::none();
-        assert!(idle_runs(none, r#"get_last_holder().name == "amy""#));
-        assert!(idle_runs(none, r#"get_last_holder().ended_ms_ago > 1000"#));
-        assert!(idle_runs(
-            none,
-            r#"get_last_holder().name + ":" + get_last_holder().result == "amy:ok""#
-        ));
+    fn using_the_last_holder_works() {
+        let mut engine = validation_engine();
+        register_idle_api(
+            &mut engine,
+            Box::new(|| {
+                Some(LastHolder {
+                    name: "amy".into(),
+                    result: "ok".into(),
+                    ended_ms_ago: 1234,
+                })
+            }),
+        );
+        assert!(engine
+            .eval::<bool>(r#"get_last_holder().name + ":" + get_last_holder().result == "amy:ok""#)
+            .unwrap());
     }
 }

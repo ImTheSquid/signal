@@ -41,10 +41,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
+name = "castaway"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dec551ab6e7578819132c713a93c022a05d60159dc86e7a7050223577484c55a"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
+
+[[package]]
+name = "compact_str"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "79fcda08c33bb58b97008b2cdada6622500e949e060f5913361763121abd2416"
+dependencies = [
+ "castaway",
+ "cfg-if",
+ "itoa",
+ "serde",
+ "static_assertions",
+ "zmij",
+]
 
 [[package]]
 name = "const-random"
@@ -214,15 +237,17 @@ checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
 
 [[package]]
 name = "rhai"
-version = "1.25.1"
-source = "git+https://github.com/rhaiscript/rhai?rev=72ad275f0db410120945d31fa686647135f1f99f#72ad275f0db410120945d31fa686647135f1f99f"
+version = "1.27.0"
+source = "git+https://github.com/rhaiscript/rhai?rev=7ab3f68ab4c50bf06f23ff6ed3c253d490237ba8#7ab3f68ab4c50bf06f23ff6ed3c253d490237ba8"
 dependencies = [
  "ahash",
  "bitflags",
+ "compact_str",
  "no-std-compat",
  "num-traits",
  "once_cell",
  "rhai_codegen",
+ "serde",
  "smallvec",
  "smartstring",
  "thin-vec",
@@ -231,30 +256,13 @@ dependencies = [
 
 [[package]]
 name = "rhai_codegen"
-version = "3.2.0"
-source = "git+https://github.com/rhaiscript/rhai?rev=72ad275f0db410120945d31fa686647135f1f99f#72ad275f0db410120945d31fa686647135f1f99f"
+version = "3.3.0"
+source = "git+https://github.com/rhaiscript/rhai?rev=7ab3f68ab4c50bf06f23ff6ed3c253d490237ba8#7ab3f68ab4c50bf06f23ff6ed3c253d490237ba8"
 dependencies = [
  "proc-macro2",
  "quote",
  "syn",
 ]
-
-[[package]]
-name = "rhaiper"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb51fd006f96e54b4ada41deda3785792b516709cd9a4cbaa73af905b96d5446"
-dependencies = [
- "rhai",
- "rhaiper-map",
- "serde_json",
-]
-
-[[package]]
-name = "rhaiper-map"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9da8239cec117d318a76610c9a67be767bb26d0786b72f9a522072ad5e97f37"
 
 [[package]]
 name = "rustversion"
@@ -267,7 +275,6 @@ name = "script-env"
 version = "0.1.0"
 dependencies = [
  "rhai",
- "rhaiper",
 ]
 
 [[package]]
@@ -324,6 +331,9 @@ name = "smallvec"
 version = "1.15.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "smartstring"
@@ -386,7 +396,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "getrandom 0.3.4",
- "rhaiper",
+ "rhai",
  "script-env",
  "serde_json",
  "wasm-bindgen",

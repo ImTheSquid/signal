@@ -20,10 +20,11 @@ describe('prepareScript', () => {
 		expect(out.residual).toBe(0);
 	});
 
-	it('minifies without growing the script', () => {
-		const out = prepared('// a comment\nset_lights(false, false, false);\n');
-		expect(out.minified).toBe(true);
-		expect(out.bytes).toBeLessThanOrEqual(out.rawBytes);
+	it('returns the script as submitted', () => {
+		const src = '// a comment\nset_lights(false, false, false);\n';
+		const out = prepared(src);
+		expect(out.script).toBe(src);
+		expect(out.bytes).toBe(src.length);
 	});
 
 	it('reports a parse error against the submitted text', () => {

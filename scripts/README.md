@@ -11,12 +11,7 @@ Runs a script on the light for as long as you leave it running. Use this rather 
 scripts/run-script.sh                      # runs pulse.rhai until Ctrl-C
 scripts/run-script.sh scripts/other.rhai
 LOCK_S=120 scripts/run-script.sh           # shorter cycle
-COMPONENTS=array,math scripts/run-script.sh scripts/other.rhai
 ```
-
-`COMPONENTS` is the rhai standard-library surface the script is given, default `array,math`.
-Declaring less leaves more heap for the script itself; under-declaring is not caught
-server-side and fails at the call, on the light.
 
 **Why a loop is necessary.** A job's TTL is fixed when it is submitted, from the lock's
 *remaining* time — re-acquiring the lock does **not** extend a script already running
@@ -53,7 +48,6 @@ script keeps only the part the light owns.
 | on-grid @128 BPM | **0.951** |
 | on-grid @100 BPM | **0.980** |
 | relay ops/min R/Y/G | 168/202/165 |
-| components | `array` |
 
 **It is sent a prediction, not an event.** The block says "the next beat is in N ms, the period
 is P", so the script runs the grid forward itself. That is what lets it schedule around the

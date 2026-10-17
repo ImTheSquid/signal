@@ -1,40 +1,9 @@
 import { z } from "zod";
 
-/** Rhai standard-library components a script may declare it needs, mirrored from
- *  `Components::NAMES` in crates/script-env.
- *
- *  Declaring is how a script buys heap: the device leaves out what was not
- *  declared, and what it leaves out is room the script's own AST gets instead.
- *  The full set costs roughly half the free heap.
- *
- *  Nothing here can be verified server-side. Rhai resolves calls at run time, so
- *  compiling a script against a narrower engine still succeeds — see the
- *  `unknown_function_compiles` test. An under-declared script fails on the
- *  device, at the first call it cannot resolve. */
-export const COMPONENTS = [
-  "core",
-  "array",
-  "map",
-  "string",
-  "math",
-  "iterator",
-  "blob",
-  "bitfield",
-  "functions",
-] as const;
-export const ComponentsSchema = z.array(z.enum(COMPONENTS));
-export type Component = (typeof COMPONENTS)[number];
-
 // ---- Shared limits (mirrored in crates/script-env) ----
 
-/** Size of the script that reaches the device, measured after minification.
- *  The best case — what fits when a script declares the narrowest `components`
- *  it can. Declaring nothing fits less, and the device reports the real limit
- *  with its own numbers when it declines. Sized from what the hardware managed,
- *  which is about 24 bytes of heap per source byte. */
-export const MAX_SCRIPT_BYTES = 4 * 1024;
-/** Size of a script as submitted. Comments and indentation are stripped before
- *  MAX_SCRIPT_BYTES applies, so this bounds the work one request can ask for. */
+/** Size of a script as submitted. Bounds the work one request can ask of the
+ *  validator; the device's own limit is on the compiled artifact. */
 export const MAX_RAW_SCRIPT_BYTES = 256 * 1024;
 export const WS_MAX_PAYLOAD = 32 * 1024;
 /** Device sends a state message at least this often as a WS keepalive. */
@@ -54,10 +23,6 @@ export const REDIS = {
   key: (id: string) => `key:${id}`,
   keys: "keys",
   idle: "idle",
-  /** Source map for the idle script. A separate key rather than a field on
-   *  `idle`, whose schema is spread straight into the `hello` frame — a map
-   *  added there would ride to the device and undo the minification. */
-  idleMap: "idle:map",
   device: "device",
   history: "history",
   settings: "settings",
@@ -84,28 +49,16 @@ export const JobSchema = z.object({
   keyId: z.string(),
   /** Key holder's display name — the device exposes it to idle scripts. */
   holder: z.string().default(""),
-  /** Minified. What the device runs, and what `map` resolves positions against. */
+  /** As submitted, so positions in errors refer to what the author wrote. */
   script: z.string(),
-  /** Source Map v3 for `script`. Absent when the script was not minified, or was
-   *  generated rather than submitted. Server-side only: the `job` frame is built
-   *  field by field, so this never reaches the device. Lives here rather than
-   *  under its own key so that it expires with the job. */
-  map: z.string().optional(),
-  /** Submitted size, for reporting what minification saved. */
-  rawBytes: z.number().optional(),
-  /** Rhai standard-library components the submitter declared this script needs.
-   *  Absent means all of them, which is what the device built before scripts
-   *  could declare. Each one the device can leave out is heap the script's own
-   *  AST gets instead — the full set costs roughly half the free heap. */
-  components: z.array(z.string()).optional(),
   /** The script lowered to bytecode, base64. What the device actually runs: it
    *  loads a flat buffer instead of parsing a tree, which on pulse.rhai is ~54
    *  allocations rather than ~756 — and the light's heap charges a header on
    *  every one. Absent falls back to running `script`. */
   artifact: z.string().optional(),
   /** Maps an artifact program counter back to a position in the submitted
-   *  source. Server-side only, like `map` and for the same reason: the device
-   *  has no use for it, and the `job` frame is built field by field. */
+   *  source. Server-side only: the device has no use for it, and the `job`
+   *  frame is built field by field. */
   positions: z.string().optional(),
   expiresAt: z.number(),
 });
@@ -114,11 +67,6 @@ export type Job = z.infer<typeof JobSchema>;
 export const IdleSchema = z.object({
   script: z.string(),
   rev: z.number(),
-  /** See `JobSchema.components`. Absent means all of them, which is what a
-   *  record written before idle could declare still says — and what the device
-   *  reserves for it. Declaring what the script actually uses is the difference
-   *  between an engine the light can afford and one it can refuse to start. */
-  components: z.array(z.string()).optional(),
   /** See `JobSchema.artifact`. Absent falls back to parsing `script`. */
   artifact: z.string().optional(),
 });
@@ -162,10 +110,7 @@ export const HistoryEntrySchema = z.object({
   start: z.number(),
   end: z.number().nullable(),
   result: z.enum(["ok", "error", "aborted", "deadline", "preempted", "running", "lost"]),
-  /** Positions rewritten to the script as submitted, where a map allowed it. */
   error: z.string().optional(),
-  /** What the device reported, kept only when remapping changed it. */
-  deviceError: z.string().optional(),
   /** Collapsed consecutive runs by the same key (absent = 1). */
   runs: z.number().optional(),
 });
@@ -236,9 +181,6 @@ export const JobMsgSchema = z.object({
    *  thing it has — on bytes it will discard. A frame with neither is refused. */
   script: z.string().optional(),
   ttl_ms: z.number(),
-  /** See `JobSchema.components`. Omitted means all of them, so a device on
-   *  older firmware and a server that never sends this agree. */
-  components: z.array(z.string()).optional(),
   /** See `JobSchema.artifact`. Omitted means the device parses `script`, which
    *  is what firmware without a VM does with it anyway. */
   artifact: z.string().optional(),
@@ -246,8 +188,7 @@ export const JobMsgSchema = z.object({
 
 /** The idle push. Derived from `IdleSchema` rather than respelled, because the
  *  stored record and the pushed frame are deliberately the same shape — which is
- *  exactly why nothing server-side may live on `IdleSchema` (see `REDIS.idleMap`).
- *  Spelling them out separately let the two drift silently. */
+ *  exactly why nothing server-side may live on `IdleSchema`. Spelling them out separately let the two drift silently. */
 export const IdleMsgSchema = IdleSchema.extend({
   t: z.literal("idle"),
   /** See `JobMsgSchema.script`: omitted when `artifact` is present. Required in

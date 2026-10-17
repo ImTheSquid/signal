@@ -28,9 +28,6 @@ import {
 // Relative, not `$lib`: that alias only resolves inside SvelteKit, and this runs
 // as a plain Node server. tsx loads the TypeScript source directly.
 import { buildHelloFrame, buildIdleFrame, buildJobFrame } from '../src/lib/server/frames.js';
-// Imported straight from the wasm package rather than through `$lib`, which only
-// resolves inside SvelteKit. The nodejs-target build is CJS, so plain Node loads it.
-import { remap as remapError } from '@traffic-light/validator-wasm';
 
 const redisUrl = process.env.REDIS_URL ?? 'redis://localhost:6379';
 // maxRetriesPerRequest: null so commands queue rather than fail across a
@@ -107,11 +104,9 @@ async function recordJobDone(msg: {
 	result: 'ok' | 'error' | 'aborted' | 'deadline';
 	error?: string;
 }): Promise<void> {
-	// Read before the delete below: the device reports positions against the
-	// minified script, and the map that translates them expires with the job.
 	const raw = await redis.get(REDIS.jobCurrent);
 	const stored = raw ? (JSON.parse(raw) as Job) : null;
-	// Only the job this message is about can explain its positions.
+	// Only clear the job this message is about.
 	const job = stored?.jobId === msg.id ? stored : null;
 
 	const entries = await redis.lrange(REDIS.history, 0, HISTORY_LENGTH - 1);
@@ -120,13 +115,7 @@ async function recordJobDone(msg: {
 		if (entry.jobId === msg.id) {
 			entry.end = Date.now();
 			entry.result = msg.result;
-			if (msg.error) {
-				const mapped = job?.map ? remapError(job.map, job.script, msg.error) : msg.error;
-				entry.error = mapped;
-				// Keep what the device actually said when it differs, so a wrong map
-				// cannot destroy the only copy of the error.
-				if (mapped !== msg.error) entry.deviceError = msg.error;
-			}
+			if (msg.error) entry.error = msg.error;
 			await redis.lset(REDIS.history, i, JSON.stringify(entry));
 			// Now terminal — merge into a same-key streak if adjacent.
 			await redis.eval(COLLAPSE_HISTORY_LUA, 1, REDIS.history);

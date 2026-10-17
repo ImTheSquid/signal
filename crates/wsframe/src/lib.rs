@@ -9,7 +9,7 @@ use std::marker::PhantomData;
 use serde::de::DeserializeOwned;
 
 /// Must fit the largest message the server can send, which is `hello`: it
-/// carries a job script AND an idle script, each up to `MAX_SCRIPT_BYTES`
+/// carries a job artifact AND an idle artifact, each up to `MAX_ARTIFACT_BYTES`
 /// (16KB), plus envelope and JSON escaping. Measured at 32866 bytes for a
 /// two-script hello, so a 16KB-based limit silently discarded the whole message —
 /// taking the idle script with it.

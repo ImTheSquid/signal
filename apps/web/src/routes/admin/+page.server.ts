@@ -1,12 +1,5 @@
 import { fail } from '@sveltejs/kit';
-import {
-	COMPONENTS,
-	ComponentsSchema,
-	REDIS,
-	type DeviceState,
-	type Idle,
-	type Lock
-} from '@traffic-light/protocol';
+import { REDIS, type DeviceState, type Idle, type Lock } from '@traffic-light/protocol';
 import {
 	SESSION_COOKIE,
 	createSessionToken,
@@ -44,7 +37,6 @@ export const load: PageServerLoad = async ({ cookies }) => {
 			authed: false as const,
 			keys: [],
 			idle: null,
-			idleComponents: null,
 			lock: null,
 			history: [],
 			historyPublic: true,
@@ -76,9 +68,6 @@ export const load: PageServerLoad = async ({ cookies }) => {
 		authed: true as const,
 		keys,
 		idle: idle?.script ?? '',
-		// `null` means the record predates declarations, which the device reads as
-		// the full standard library — distinct from an explicit empty declaration.
-		idleComponents: idle?.components ?? null,
 		lock,
 		history,
 		historyPublic,
@@ -138,20 +127,6 @@ export const actions: Actions = {
 		const form = await request.formData();
 		const script = String(form.get('script') ?? '');
 
-		// The marker distinguishes "ticked nothing" from "the fieldset never came" —
-		// a stale form posting without it would otherwise narrow the engine to
-		// nothing for a script no one re-read. Same validation as /v1/script: a
-		// declaration cannot be checked by compiling, but a typo can be caught here
-		// instead of dropping a component and killing the script mid-run.
-		let components: string[] | undefined;
-		if (form.get('declared') === '1') {
-			const parsed = ComponentsSchema.safeParse(form.getAll('components').map(String));
-			if (!parsed.success) {
-				return fail(400, { error: `components must be any of: ${COMPONENTS.join(', ')}` });
-			}
-			components = parsed.data;
-		}
-
 		const prepared = prepareScript(script);
 		if (isValidationError(prepared)) {
 			const where = prepared.line === null ? '' : `line ${prepared.line}: `;
@@ -162,17 +137,11 @@ export const actions: Actions = {
 		const idle: Idle = {
 			script: prepared.script,
 			rev: (prev?.rev ?? 0) + 1,
-			components,
 			artifact: prepared.artifact
 		};
 		await r.set(REDIS.idle, JSON.stringify(idle));
-		// Separate key: the idle schema is spread straight into the `hello` frame, so
-		// a map stored on it would ride to the device.
-		await r.set(REDIS.idleMap, prepared.map);
 		await r.publish(REDIS.eventsChannel, JSON.stringify({ type: 'idle' }));
-		// Set only when minification was declined, which is also when there is no
-		// artifact — worth saying rather than leaving invisible.
-		return { ok: true, warning: prepared.warning };
+		return { ok: true };
 	},
 
 	kill: async ({ cookies }) => {
@@ -219,12 +188,7 @@ export const actions: Actions = {
 			jobId,
 			keyId: TEST_KEY_ID,
 			holder: TEST_KEY_NAME,
-			script,
-			// Nothing: `set_lights` and `sleep` are host functions, and the bool and
-			// int literals are served by arithmetic and logic, which every engine
-			// has. Undeclared would reserve the whole 96KB library for a two-line
-			// script and lose the test to a heap refusal on a busy board.
-			components: []
+			script
 		});
 		if (result.status !== 'ok') return fail(500, { error: `job submit failed: ${result.status}` });
 

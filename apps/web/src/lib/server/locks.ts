@@ -36,11 +36,9 @@ return {'released', cur}
 
 // The job payload is stamped with expiresAt by appending, never by decoding it.
 // Lua's cjson has one representation for an empty table, so a round-trip turns
-// `"components":[]` — "this script needs nothing", the declaration that buys back
-// 96KB — into `"components":{}`, which the device cannot deserialize. It rejects
-// the whole frame, so the job silently never arrives. The payload also carries
-// user script text and base64, none of which is worth re-encoding to insert one
-// number. ARGV[2] is a JSON object, so it ends in '}' and is never empty.
+// any empty array into `{}`, which the device cannot deserialize — it rejects the
+// whole frame, so the job silently never arrives. The payload also carries user
+// script text and base64, none of which is worth re-encoding to insert one number. ARGV[2] is a JSON object, so it ends in '}' and is never empty.
 const SUBMIT_JOB = `
 local cur = redis.call('GET', KEYS[1])
 if not cur then return {'nolock', '0'} end

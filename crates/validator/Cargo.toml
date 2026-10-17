@@ -10,10 +10,9 @@ crate-type = ["cdylib", "rlib"]
 script-env = { path = "../script-env" }
 wasm-bindgen = "0.2"
 serde_json = "1"
-# `default-features = false` drops the `cli` feature's clap; only the library is
-# wanted here. rhaiper compiles against the workspace's restricted rhai, so its
-# own compile checks reject anything the firmware's engine would reject too.
-rhaiper = { version = "0.2", default-features = false }
+# Serialises the position sidecar the server keeps beside a job. Only the
+# validator asks for it, so the firmware's rhai does not carry serde support.
+rhai = { workspace = true, features = ["serde"] }
 # The artifact is bytes and the frame carrying it is JSON.
 base64 = "0.22"
 

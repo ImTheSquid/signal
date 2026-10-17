@@ -8,7 +8,6 @@
 #
 #   scripts/run-script.sh                      # runs scripts/pulse.rhai
 #   scripts/run-script.sh scripts/other.rhai
-#   COMPONENTS=array,math scripts/run-script.sh scripts/other.rhai
 #
 # Token, first match wins:
 #   $TRAFFIC_LIGHT_TOKEN
@@ -76,16 +75,10 @@ AUTH="Authorization: Bearer $TOKEN"
 # JSON-encode the script body. Doing this in python avoids hand-rolled quoting,
 # which breaks on the backslashes and quotes real scripts contain.
 #
-# Sends the script as written, comments and all: POST /v1/script minifies it before
-# storing it, so the device gets the stripped form either way.
-# `components` is what the script needs from rhai's standard library. pulse.rhai
-# needs only arrays, because the float work happens on the host that sends the
-# beat block. Declaring it leaves the rest out on the device, which roughly
-# doubles the script size that fits — see the README. Under-declaring is not
-# caught server-side; it fails at the call, on the light.
-COMPONENTS="${COMPONENTS:-array}"
+# Sends the script as written, comments and all: POST /v1/script lowers it to the
+# artifact the device runs, so the device never sees the text.
 body() {
-  python3 -c "import json,sys; print(json.dumps({'script': open(sys.argv[1]).read(), 'components': sys.argv[2].split(',')}))" "$1" "$COMPONENTS"
+  python3 -c "import json,sys; print(json.dumps({'script': open(sys.argv[1]).read()}))" "$1"
 }
 
 release() {

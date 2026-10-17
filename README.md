@@ -7,7 +7,7 @@ A real three-lamp traffic signal on the internet. Friends, apps, and trinkets ge
 ```
 friend ──HTTP──▶ SvelteKit /v1/* ──────────▶ Redis ◀────── pub/sub ────── api/device.ts
                     │                          ▲                             ▲ websocket
-                    └─ validates + minifies    │ pub/sub                     └── ESP32 (runs Rhai on-device)
+                    └─ validates + lowers      │ pub/sub                     └── ESP32 (runs Rhai on-device)
                        via Rhai→WASM       api/live.ts
                                                ▲ websocket
                                             dashboard (live updates)
@@ -17,7 +17,7 @@ Everything runs on one box behind nginx — see [deploy/home-app/](deploy/home-a
 
 - **apps/web** — SvelteKit app: public dashboard (live over websocket, 10s polling as fallback), admin panel (keys, idle script editor, lamp test, history controls, kill switch), the `/v1` JSON API, and two standalone websocket servers: `api/device.ts` (the ESP32) and `api/live.ts` (browsers). SvelteKit routes can't upgrade websockets, so those run as their own processes — which is also why the JSON API lives at `/v1`, not `/api`.
 - **crates/script-env** — the single source of truth for the Rhai language surface and sandbox limits, used by both the validator and the firmware.
-- **crates/validator** → **packages/validator-wasm** — `Engine::compile` plus [rhaiper](https://crates.io/crates/rhaiper), compiled to WASM. `POST /v1/script` rejects scripts that won't parse, with line/col errors, and minifies the rest before storing them.
+- **crates/validator** → **packages/validator-wasm** — `Engine::compile` plus lowering to the device artifact, compiled to WASM. `POST /v1/script` rejects scripts that won't parse, with line/col errors, and stores the rest as submitted alongside their artifact.
 - **packages/protocol** — zod schemas + constants for the wire protocol and Redis keys.
 - **firmware** — Rust (esp-idf) for an ESP32-WROOM-32E: wifi → SNTP → websocket, Rhai engine in a dedicated thread, three relay GPIOs (32/33/25 = R/Y/G).
 - **crates/audio-bridge** — Rust daemon on a host machine that captures the master output, estimates tempo with TempoCNN and sends the light a beat *prediction* over LAN UDP to `dmx_recv()`. Runs on macOS via a BlackHole clone, or on a Steam Deck off a Focusrite Scarlett — see `crates/audio-bridge/deck/`.
@@ -42,12 +42,10 @@ curl -X POST $BASE/v1/lock -H "$AUTH" -H "$JSON" -d '{"duration_s": 120}'
 curl -X POST $BASE/v1/lock -H "$AUTH" -H "$JSON" -d '{"duration_s": 60, "override": true}'
 
 # Run a script (must hold the lock; 256KB as sent; ≤20 submissions/min)
-# Optional "components": what rhai standard library your script needs — see below.
-# Omitted means all of it, which caps you at ~5KB of script.
 curl -X POST $BASE/v1/script -H "$AUTH" -H "$JSON" \
   -d '{"script": "loop { set_lights(true,false,false); sleep(500); set_lights(false,false,false); sleep(500); }"}'
-# → 202 {"jobId":..., "ttl_ms":..., "bytes":..., "raw_bytes":...}
-#   422 {"error":"Unexpected ...","line":1,"col":9} | 413 over either limit
+# → 202 {"jobId":..., "ttl_ms":..., "bytes":..., "artifact_bytes":..., "residual":0}
+#   422 {"error":"Unexpected ...","line":1,"col":9} | 413 script or artifact too large
 
 # Release early
 curl -X DELETE $BASE/v1/lock -H "$AUTH"
@@ -62,11 +60,11 @@ curl $BASE/v1/status
 
 ### Script environment
 
-Comment and indent freely. `POST /v1/script` minifies with
-[rhaiper](https://crates.io/crates/rhaiper) before storing, so the size limit measures the
-stripped text and the device never receives a comment — `scripts/pulse.rhai` goes 11182 → 3633
-bytes on whitespace alone. The source map stays server-side, so runtime errors in the dashboard
-still cite the line you wrote rather than a position in text nobody has seen.
+Comment and indent freely. `POST /v1/script` compiles your script and sends the light the
+lowered artifact, never the text, so comments cost the device nothing. The full Rhai standard
+library is available to every script with nothing to declare: its functions are loaded lazily,
+looked up the first time a script calls them, so an unused one costs no heap. The price is a
+slightly slower first call to each function in a run.
 
 Scripts are Rhai with `i64` integers and `f32` floats (no closures/modules/eval). Floats are
 single-precision deliberately: rhai's default `FLOAT` is `f64`, which the ESP32's
@@ -100,75 +98,6 @@ ESP32's allocator charges about 8 bytes of header on every one.
 limit is about. It also reports `residual`: anything the compiler could not lower stays a tree
 fragment and runs on rhai's walker at the old cost. It is zero for everything in this repo; if
 yours is not, that part of your script is paying for an interpreter it did not need.
-
-### Declaring components — how to get a bigger script
-
-The light is an ESP32 with about 140KB of usable heap, and three things compete for it: the
-interpreter, your script's compiled form, and the interpreter's stack. Rhai's standard library
-is most of the first, and **you pay for all of it whether you use it or not** — unless you say
-what you need.
-
-```sh
-curl -X POST $BASE/v1/script -H "$AUTH" -H "$JSON" -d '{
-  "script": "loop { set_lights(true,false,false); sleep(500); }",
-  "components": ["array", "math"]
-}'
-```
-
-Omit `components` and you get everything, which is what every script got before this existed.
-Declare, and the device leaves out the rest — and what it leaves out is heap your script gets
-instead:
-
-| you declare | interpreter costs | your script may be |
-|---|---|---|
-| nothing (the default: everything) | ~69KB | **~5KB** |
-| `["array"]` — what `pulse.rhai` needs | ~21KB | **~11KB** |
-| `[]` — arithmetic and comparison only | ~6KB | **~13KB** |
-
-Arithmetic, comparison and the traffic-light functions in the table above are always present.
-You never declare those.
-
-| component | what it gives you |
-|---|---|
-| `array` | arrays — literals, indexing, `len`, `push`, `pop`, and the rest |
-| `map` | map *functions*: `len`, `contains`, `keys`, `values`. **Reading a field needs nothing** — `dmx_recv`'s `p.ok` and `p.ch` work undeclared |
-| `string` | string methods (`sub_string`, `index_of`, `replace`, `pad`), **and `print`/`debug`**, which format their argument |
-| `math` | `sqrt`, `sin`, `cos`, `pow`, `floor`, `round` — **and `to_float`/`to_int`**, which is why a script doing no trigonometry still often needs this |
-| `iterator` | `for` loops and ranges (`0..10`) |
-| `blob` | byte blobs |
-| `bitfield` | `get_bit`, `set_bits`, and friends |
-| `core`, `functions` | rhai internals. Nothing in the documented surface was shown to need them; include them if something fails and nothing else explains it |
-
-This table is generated from probes, not from reading rhai's package list — several entries are
-not where they look like they should be. `crates/script-env` pins every row, so if a component
-stops providing what is claimed here, its tests fail.
-
-`scripts/pulse.rhai` declares `["array"]` and nothing else: the float work happens on the host
-that sends the beat block, so the light needs arrays and integer arithmetic only.
-
-#### The part that will bite you
-
-**Nothing checks your declaration.** Rhai resolves function calls when it reaches them, not
-when it compiles, so a script that calls `sqrt()` without declaring `math` compiles fine,
-validates fine, returns `202`, and then **fails on the light at the moment it first calls
-`sqrt`** — which may be an hour into a set, the first time some branch is taken.
-
-The failure is clean and legible, not a crash: the run ends and the dashboard shows
-`Function not found: sqrt (f32)`. The light returns to its idle script. But it *is* your
-script stopping, in front of people.
-
-So:
-
-- **If you are not sure, do not declare.** The default is everything and it is the safe answer.
-  Declaring buys heap; it is worth doing when your script is large enough to need it, and it is
-  not worth doing to save memory you were not going to use.
-- **Declare generously.** An unused component costs heap. A missing one costs your run.
-- **Exercise every branch before you rely on it.** The error only appears on the path that
-  makes the call, so a rarely-taken `if` is exactly where an under-declaration hides.
-- Unknown names are rejected at submit time with `400`, so a typo like `"maths"` fails
-  immediately rather than quietly dropping the component.
-
-If your script is under ~5KB you do not need any of this.
 
 Prefer `sleep_until` over `sleep` for anything rhythmic. A pattern built from relative sleeps
 adds on every delay the work between them cost, so its period drifts long and it slides off
@@ -221,7 +150,7 @@ The script is killed when your lock expires (blocking calls wake every 10ms to c
 
 The **idle script** (admin-set, runs when nobody holds a lock) has different semantics: it runs **once per idle transition** — a one-shot script sets a state and the lamps hold it; write your own `loop { … }` for an animation. If it errors, the fault signal shows once and the built-in cycle takes over, and it is retried on a 30s→300s ladder rather than left broken until someone saves again.
 
-The idle script declares its components the same way a job does, from the checkboxes in the admin panel — and for the same reason, priced by the same table under "Declaring components" above. Declaring nothing reserves the whole standard library, which for a one-call idle script is ~96KB against ~140KB free: enough that it can fail to start at all. A run that could not start is not a broken script, so it does not raise the fault; it retries on a 2s→60s ladder and reports itself as `idle: builtin` on the dashboard until it fits.
+An idle run that could not start for lack of heap is not a broken script, so it does not raise the fault; it retries on a 2s→60s ladder and reports itself as `idle: builtin` on the dashboard until it fits.
 
 Idle scripts (and only idle scripts) also get `get_last_holder()`, returning `#{ name, result, ended_ms_ago }` for the most recent job (`name: ""`, `ended_ms_ago: -1` if nobody has held the light since boot):
 

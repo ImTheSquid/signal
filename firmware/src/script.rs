@@ -44,44 +44,14 @@ pub type SharedLastHolder = Arc<Mutex<Option<LastHolderInfo>>>;
 /// script that just ran.
 const SCRIPT_STACK_BYTES: usize = 32 * 1024;
 
-/// Heap the full standard library needs, measured on the device by logging free
-/// heap either side of building it: 95872 bytes, or 68% of what is free before
-/// a script has done anything. What a run that declares nothing costs.
-///
-/// Halving the host figure gave 70KB and was 26KB optimistic — engine registries
-/// are pointer-dense but not entirely, and the real ratio is nearer 0.71.
-const ENGINE_HEAP_BYTES: usize = 96 * 1024;
-
-/// What one declared component costs, same measurement. Arithmetic and logic
-/// are not here: they are in every engine and are built once and shared, so
-/// they are not part of what a run has to find.
-fn component_heap_bytes(name: &str) -> usize {
-    match name {
-        "core" => 32 * 1024,
-        "string" => 20 * 1024,
-        "array" => 17 * 1024,
-        "map" | "iterator" | "blob" => 12 * 1024,
-        "math" => 10 * 1024,
-        "bitfield" | "functions" => 8 * 1024,
-        // Unknown names are rejected before a script runs, so this is only the
-        // arithmetic being conservative about a component added later.
-        _ => 16 * 1024,
-    }
-}
-
-/// What this run's engine will cost, given what it declared. Undeclared means
-/// the whole library.
-fn engine_heap_bytes(components: Option<&Vec<String>>) -> usize {
-    match components {
-        None => ENGINE_HEAP_BYTES,
-        Some(names) => names
-            .iter()
-            .map(|n| component_heap_bytes(n))
-            .sum::<usize>()
-            .min(ENGINE_HEAP_BYTES),
-    }
-}
-/// Heap per byte of minified source, from the device rather than from the host
+/// Heap the engine needs. The standard library is lazy, so this is the registry
+/// for the host API and the shared library handle rather than the ~96KB an eager
+/// library took. The host measures 584 bytes (about 4.4KB for the first engine,
+/// which builds the shared module); this is a deliberately generous round-up
+/// until the device has been measured — the `heap check` log line reports what
+/// each run actually decided on.
+const ENGINE_HEAP_BYTES: usize = 8 * 1024;
+/// Heap per byte of source, from the device rather than from the host
 /// measurement, which was far too kind.
 ///
 /// Observed: 5054 bytes of script, with a declared engine costing 16384 and a
@@ -131,15 +101,11 @@ fn log_heap(stage: &str) {
     }
 }
 
-fn heap_check(
-    weight: usize,
-    is_artifact: bool,
-    components: Option<&Vec<String>>,
-) -> Result<(), String> {
+fn heap_check(weight: usize, is_artifact: bool) -> Result<(), String> {
     let free = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() } as usize;
     let largest =
         unsafe { esp_idf_svc::sys::heap_caps_get_largest_free_block(esp_idf_svc::sys::MALLOC_CAP_8BIT) };
-    let engine = engine_heap_bytes(components);
+    let engine = ENGINE_HEAP_BYTES;
     // An artifact is loaded roughly as it lies, plus its pools; a source has to
     // be parsed into a tree that costs many times its own length. Measured on
     // pulse.rhai: 6476 artifact bytes become ~23KB loaded, where 3633 source
@@ -268,7 +234,6 @@ impl Runner {
         job_id: Option<String>,
         holder: Option<String>,
         script: String,
-        components: Option<Vec<String>>,
         // The compiled form, when the server sent one. Preferred over `script`.
         artifact: Option<Vec<u8>>,
         ttl: Option<Duration>,
@@ -285,7 +250,7 @@ impl Runner {
         // An artifact costs a fraction of what its source would as a tree, so
         // the check is sized against whichever one will actually be loaded.
         let weight = artifact.as_ref().map_or(script.len(), Vec::len);
-        heap_check(weight, artifact.is_some(), components.as_ref()).map_err(StartError::NoHeap)?;
+        heap_check(weight, artifact.is_some()).map_err(StartError::NoHeap)?;
 
         let handle = std::thread::Builder::new()
             .name("rhai".into())
@@ -295,7 +260,6 @@ impl Runner {
                 let outcome = run_script(
                     script,
                     artifact,
-                    components,
                     kind,
                     deadline,
                     &abort,
@@ -330,26 +294,14 @@ impl Runner {
 fn run_script(
     script: String,
     artifact: Option<Vec<u8>>,
-    components: Option<Vec<String>>,
     kind: RunKind,
     deadline: Option<Instant>,
     abort: &Arc<AtomicBool>,
     lights: &Arc<Lights>,
     last_holder: &SharedLastHolder,
 ) -> Outcome {
-    // What the submitter declared, or everything if they declared nothing —
-    // which is what every script got before declarations existed. Rhai resolves
-    // calls at run time, so an under-declared script fails at the call it cannot
-    // resolve; that is a reported run failure, not a crash.
-    let components = match components {
-        None => script_env::Components::all(),
-        Some(names) => match script_env::Components::from_names(&names) {
-            Ok(c) => c,
-            Err(e) => return Outcome::Error(e),
-        },
-    };
     log_heap("thread start");
-    let mut engine = script_env::new_engine(components);
+    let mut engine = script_env::new_engine();
     if kind == RunKind::Idle {
         script_env::register_idle_api(&mut engine, {
             let last_holder = last_holder.clone();

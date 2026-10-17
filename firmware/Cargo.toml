@@ -40,7 +40,7 @@ wsframe = { path = "../crates/wsframe" }
 # cargo unions features, so this applies to the firmware build and not to the
 # validator's. rhai's optimiser runs a whole pass over the tree after parsing,
 # and the peak during `compile` is what has to fit in the heap, not the AST it
-# finally keeps. The validator cannot drop it: rhaiper needs OptimizationLevel.
+# finally keeps.
 #
 # The cost is that constant folding no longer happens, so a script does slightly
 # more work at run time. On a board that reboots when compilation runs out of
@@ -68,7 +68,7 @@ rhai = { version = "1", features = ["no_optimize"] }
 # flags change what a `Dynamic` is — so two copies means two incompatible
 # `Dynamic` types either side of the artifact.
 [patch.crates-io]
-rhai = { git = "https://github.com/rhaiscript/rhai", rev = "72ad275f0db410120945d31fa686647135f1f99f" }
+rhai = { git = "https://github.com/rhaiscript/rhai", rev = "7ab3f68ab4c50bf06f23ff6ed3c253d490237ba8" }
 
 [build-dependencies]
 embuild = "0.33"

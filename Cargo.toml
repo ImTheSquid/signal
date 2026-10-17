@@ -35,7 +35,7 @@ exclude = [
 # Pinned to a git revision because the bytecode VM is on rhai's main branch and
 # not in a release yet. `grain` is what enables it; the crate calls it
 # experimental.
-rhai = { git = "https://github.com/rhaiscript/rhai", rev = "72ad275f0db410120945d31fa686647135f1f99f", features = [
+rhai = { git = "https://github.com/rhaiscript/rhai", rev = "7ab3f68ab4c50bf06f23ff6ed3c253d490237ba8", features = [
     "grain",
     "sync",
     "only_i64",
@@ -44,10 +44,3 @@ rhai = { git = "https://github.com/rhaiscript/rhai", rev = "72ad275f0db410120945
     "no_time",
     "f32_float",
 ] }
-
-# rhaiper resolves rhai from crates.io, which would put two copies of the crate
-# in the graph — and rhai's feature flags change what a `Dynamic` *is*, so two
-# copies means two incompatible `Dynamic` types flowing through the same
-# minifier. Point it at the same revision as everything else.
-[patch.crates-io]
-rhai = { git = "https://github.com/rhaiscript/rhai", rev = "72ad275f0db410120945d31fa686647135f1f99f" }

@@ -30,9 +30,6 @@ pub struct ServerMsgRaw {
     // job and idle both carry a script at the top level
     pub script: Option<String>,
     pub ttl_ms: Option<u64>,
-    /// Rhai components the submitter declared. Absent means all of them, so a
-    /// server that never sends this and this firmware still agree.
-    pub components: Option<Vec<String>>,
     /// The script already lowered to bytecode, base64'd because this frame is
     /// JSON. Present means run this instead of parsing `script`.
     pub artifact: Option<String>,
@@ -51,13 +48,11 @@ pub enum ServerMsg {
         holder: String,
         script: String,
         ttl_ms: u64,
-        components: Option<Vec<String>>,
         artifact: Option<Vec<u8>>,
     },
     Abort,
     Idle {
         script: String,
-        components: Option<Vec<String>>,
         artifact: Option<Vec<u8>>,
     },
     Reboot,
@@ -96,7 +91,6 @@ impl TryFrom<ServerMsgRaw> for ServerMsg {
                     holder: raw.holder.unwrap_or_default(),
                     script: script_or_artifact(raw.script, &artifact, "job")?,
                     ttl_ms: raw.ttl_ms.ok_or("job without ttl_ms")?,
-                    components: raw.components,
                     artifact,
                 })
             }
@@ -106,7 +100,6 @@ impl TryFrom<ServerMsgRaw> for ServerMsg {
                 let artifact = decode_artifact(raw.artifact)?;
                 Ok(ServerMsg::Idle {
                     script: script_or_artifact(raw.script, &artifact, "idle")?,
-                    components: raw.components,
                     artifact,
                 })
             }
@@ -142,8 +135,6 @@ pub struct JobPayload {
     pub script: Option<String>,
     pub ttl_ms: u64,
     #[serde(default)]
-    pub components: Option<Vec<String>>,
-    #[serde(default)]
     pub artifact: Option<String>,
 }
 
@@ -151,11 +142,6 @@ pub struct JobPayload {
 pub struct IdlePayload {
     #[serde(default)]
     pub script: Option<String>,
-    /// Absent means the whole standard library, which is what a record written
-    /// before idle could declare still says. Declaring narrows the engine from
-    /// ~96KB to what the script actually uses.
-    #[serde(default)]
-    pub components: Option<Vec<String>>,
     #[serde(default)]
     pub artifact: Option<String>,
 }

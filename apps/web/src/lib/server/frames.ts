@@ -27,8 +27,8 @@ function sourceUnlessLowered<T extends { script: string; artifact?: string }>(
 }
 
 /**
- * The device's view of a job, field by field so server-only fields (`map`,
- * `positions`, `keyId`) cannot ride along.
+ * The device's view of a job, field by field so server-only fields (`positions`,
+ * `keyId`) cannot ride along.
  *
  * `null` once the job has no time left, which is the caller's signal that there
  * is nothing to run rather than something to run for zero milliseconds.
@@ -41,10 +41,6 @@ export function jobFrameFields(job: Job, now: number): HelloJob {
 		holder: job.holder ?? '',
 		...sourceUnlessLowered(job),
 		ttl_ms,
-		// Without these a device that reconnects mid-job is handed the script with
-		// no declaration, so it rebuilds the whole standard library and can no
-		// longer fit what it was already running.
-		components: job.components,
 		artifact: job.artifact
 	};
 }

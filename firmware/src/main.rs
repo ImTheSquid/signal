@@ -234,10 +234,9 @@ struct App {
     run_gen: u64,
     running_id: Option<String>,
     idle_script: Option<String>,
-    /// Declared alongside the script and kept with it. Both outlive the frame
-    /// they arrived on: `start_idle` also runs after a job, after a fault clears
-    /// and off the retry timer, with no `hello` in sight.
-    idle_components: Option<Vec<String>>,
+    /// Kept with the script: both outlive the frame they arrived on, since
+    /// `start_idle` also runs after a job, after a fault clears and off the
+    /// retry timer, with no `hello` in sight.
     idle_artifact: Option<Vec<u8>>,
     /// Consecutive idle failures, driving the retry ladder.
     idle_fails: u32,
@@ -275,7 +274,6 @@ impl App {
         holder: String,
         script: String,
         ttl_ms: u64,
-        components: Option<Vec<String>>,
         artifact: Option<Vec<u8>>,
     ) {
         if self.running_id.as_deref() == Some(id.as_str()) {
@@ -290,7 +288,6 @@ impl App {
             Some(id.clone()),
             Some(holder.clone()),
             script,
-            components,
             artifact,
             Some(Duration::from_millis(ttl_ms)),
             self.lights.clone(),
@@ -342,7 +339,6 @@ impl App {
             None,
             None,
             script,
-            self.idle_components.clone(),
             self.idle_artifact.clone(),
             None,
             self.lights.clone(),
@@ -470,18 +466,11 @@ impl App {
         }
     }
 
-    /// The idle script and its declaration, which move as one — a restart that
+    /// The idle script and its artifact, which move as one — a restart that
     /// paired a new script with a stale artifact would run the wrong program.
-    fn set_idle(
-        &mut self,
-        script: String,
-        components: Option<Vec<String>>,
-        artifact: Option<Vec<u8>>,
-        pushed: bool,
-    ) {
+    fn set_idle(&mut self, script: String, artifact: Option<Vec<u8>>, pushed: bool) {
         let changed = self.idle_script.as_deref() != Some(script.as_str());
         self.idle_script = Some(script);
-        self.idle_components = components;
         self.idle_artifact = artifact;
 
         // A push is an admin acting now, so it restarts even when the text is
@@ -617,7 +606,6 @@ impl App {
                                 job.holder,
                                 script,
                                 job.ttl_ms,
-                                job.components,
                                 artifact,
                             ),
                             Err(e) => log::warn!("{e}"),
@@ -636,19 +624,14 @@ impl App {
                 holder,
                 script,
                 ttl_ms,
-                components,
                 artifact,
-            } => self.start_job(id, holder, script, ttl_ms, components, artifact),
+            } => self.start_job(id, holder, script, ttl_ms, artifact),
             ServerMsg::Abort => {
                 if self.running_id.is_some() {
                     self.runner.request_abort();
                 }
             }
-            ServerMsg::Idle {
-                script,
-                components,
-                artifact,
-            } => self.set_idle(script, components, artifact, true),
+            ServerMsg::Idle { script, artifact } => self.set_idle(script, artifact, true),
             // Not stored anywhere: pub/sub is fire-and-forget, so a reboot cannot
             // be replayed at the device once it comes back up.
             // The server heals any running job's history row once the device
@@ -665,7 +648,7 @@ impl App {
             None
         });
         match crate::wsproto::script_or_artifact(idle.script, &artifact, "idle") {
-            Ok(script) => self.set_idle(script, idle.components, artifact, pushed),
+            Ok(script) => self.set_idle(script, artifact, pushed),
             Err(e) => log::warn!("{e}"),
         }
     }
@@ -929,7 +912,6 @@ fn main() -> Result<()> {
         run_gen: 0,
         running_id: None,
         idle_script: None,
-        idle_components: None,
         idle_artifact: None,
         idle_fails: 0,
         idle_retry_after: None,
